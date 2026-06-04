@@ -1,0 +1,39 @@
+# ============================================================
+# SETUP (once, or after deleting build dir)
+# ============================================================
+# Always prepend Clang to PATH in a new terminal:
+$env:PATH = "C:\Program Files\LLVM\bin;" + $env:PATH
+
+# Configure (required before first build, or after deleting build dir):
+cmake --preset win-amd64-debug -DCMAKE_PREFIX_PATH="E:/Downloads/doa4/rexglue-sdk/out/install/win-amd64"
+
+# Full rebuild from scratch:
+Remove-Item -Recurse -Force out\build\win-amd64-debug
+cmake --preset win-amd64-debug -DCMAKE_PREFIX_PATH="E:/Downloads/doa4/rexglue-sdk/out/install/win-amd64"
+cmake --build --preset win-amd64-debug
+
+
+# ============================================================
+# ADDING A HINT (repeat for each unregistered function crash)
+# ============================================================
+# 1. Add the address to hints.toml under [functions]:
+#       0x82XXXXXX = {}
+#
+# 2. Re-run codegen:
+cmake --build --preset win-amd64-debug --target dead_or_alive_4_codegen
+#
+# 3. Reconfigure CMake (only needed if new .cpp files were generated):
+cmake --preset win-amd64-debug -DCMAKE_PREFIX_PATH="E:/Downloads/doa4/rexglue-sdk/out/install/win-amd64"
+#
+# 4. Rebuild:
+cmake --build --preset win-amd64-debug
+#
+# 5. Run and check logs\dead_or_alive_4_NNN.log for next crash address:
+.\out\build\win-amd64-debug\dead_or_alive_4.exe
+
+
+# ============================================================
+# CRASH LOG LOCATION
+# ============================================================
+# out\build\win-amd64-debug\logs\dead_or_alive_4_NNN.log
+# Look for: [FATAL] Call to invalid or unregistered function at guest address 0xXXXXXXXX

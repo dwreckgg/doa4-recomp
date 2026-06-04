@@ -1,0 +1,20 @@
+# Function hints for dead_or_alive_4
+# Addresses that were unresolved during codegen analysis.
+
+[functions]
+# UnresolvedCall: b 0x8296EAC8 from 0x82977704 - target not in any function
+0x8296EAC8 = {}
+# UnresolvedCall: b 0x82450CB0 from 0x82A393A0 - target not in any function
+0x82450CB0 = {}
+# UnresolvedCall: b 0x829CCF50 from 0x829C6B64 - target not in any function
+0x829CCF50 = {}
+# Call to invalid/unregistered function at runtime
+0x82B592E0 = {}
+# Call to invalid/unregistered function at runtime
+0x8296E898 = {}
+# Unresolved b target 0x82793F80 from 0x827925E8 (codegen warning)
+0x82793F80 = {}
+# Fiber-body indirect target via *(arg+12) in sub_824F3310; missed by analyzer
+0x829E2788 = {}
+# Call to invalid/unregistered function at runtime (log 099 t=33s, thread t57320)
+0x82550830 = {}
