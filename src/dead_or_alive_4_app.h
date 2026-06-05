@@ -57,8 +57,9 @@ class DeadOrAlive4App : public rex::ReXApp {
   // void OnLoadXexImage(std::string& xex_image) override {}
   void OnPostSetup() override {
     REXLOG_INFO("[doa4][LIFE] OnPostSetup: runtime ready");
-    REXCVAR_SET(log_noisy, true);
-    REXLOG_INFO("[doa4][LIFE] log_noisy=true (kernel import trace enabled)");
+    // NOTE: log_noisy intentionally left OFF. It was force-enabled during boot
+    // bring-up to trace kernel imports; that trace is hot-path spam now and is
+    // a no-op at the relwithdebinfo log level (info) anyway.
     MountDiscRoot();
     MountCacheDevice();
     StartThreadSnapshotter();
@@ -230,24 +231,53 @@ class DeadOrAlive4App : public rex::ReXApp {
         return fmt::format("{}+{:#x}", it->second, off);
       };
 
-      for (int round = 0; round < 60 && !snap_stop_.load(std::memory_order_acquire); ++round) {
+      // Steady state emits one summary line per round (main guest thread's
+      // PC + running count) — enough to spot a wedged main thread without the
+      // 39-line-per-round flood. The full per-thread dump runs ONCE on round 0
+      // to confirm every guest thread spun up, and again on demand when the
+      // running-thread count collapses (likely-hang signal).
+      size_t prev_running = 0;
+      for (int round = 0; round < 240 && !snap_stop_.load(std::memory_order_acquire); ++round) {
         auto* ks = rex::system::kernel_state();
         auto* ot = ks ? ks->object_table() : nullptr;
         if (!ot) { std::this_thread::sleep_for(5000ms); continue; }
         std::vector<rex::system::object_ref<rex::system::XThread>> threads;
         try { threads = ot->GetObjectsByType<rex::system::XThread>(); }
         catch (...) { std::this_thread::sleep_for(5000ms); continue; }
-        REXLOG_INFO("[doa4][SNAP] round {} threads={}", round, threads.size());
+
+        uint32_t main_lr = 0;
+        size_t guest_total = 0, guest_running = 0;
         for (auto& t : threads) {
           if (!t || !t->is_guest_thread()) continue;
-          auto* ts = t->thread_state();
-          auto* pctx = ts ? ts->context() : nullptr;
-          uint32_t lr = pctx ? (uint32_t)pctx->lr : 0u;
-          uint32_t r1 = pctx ? (uint32_t)pctx->r1.u64 : 0u;
-          REXLOG_INFO("[doa4][SNAP]  tid={:2} {}{} lr={} r1={:#x}",
-                      t->thread_id(), t->main_thread() ? "M" : " ",
-                      t->is_running() ? "R" : "-", symbolize(lr), r1);
+          ++guest_total;
+          if (t->is_running()) ++guest_running;
+          if (t->main_thread()) {
+            auto* ts = t->thread_state();
+            auto* pctx = ts ? ts->context() : nullptr;
+            if (pctx) main_lr = (uint32_t)pctx->lr;
+          }
         }
+
+        // Full dump only on first round or when running count drops sharply.
+        bool collapse = round > 0 && prev_running >= 2 && guest_running * 2 < prev_running;
+        if (round == 0 || collapse) {
+          REXLOG_INFO("[doa4][SNAP] full dump (round {}{}) guest={} running={}",
+                      round, collapse ? ", running collapsed" : "", guest_total, guest_running);
+          for (auto& t : threads) {
+            if (!t || !t->is_guest_thread()) continue;
+            auto* ts = t->thread_state();
+            auto* pctx = ts ? ts->context() : nullptr;
+            uint32_t lr = pctx ? (uint32_t)pctx->lr : 0u;
+            uint32_t r1 = pctx ? (uint32_t)pctx->r1.u64 : 0u;
+            REXLOG_INFO("[doa4][SNAP]  tid={:2} {}{} lr={} r1={:#x}",
+                        t->thread_id(), t->main_thread() ? "M" : " ",
+                        t->is_running() ? "R" : "-", symbolize(lr), r1);
+          }
+        } else {
+          REXLOG_INFO("[doa4][SNAP] guest run={}/{} main_lr={}",
+                      guest_running, guest_total, symbolize(main_lr));
+        }
+        prev_running = guest_running;
         std::this_thread::sleep_for(5000ms);
       }
     });

@@ -165,7 +165,7 @@ const float* ResolveMixHost() {
 
 // Attribute a buffer mutation (if any) to the outgoing fiber. Called from
 // doa4_record_fiber_swap_out with g_beat_mu NOT held.
-void NoteMixWriter(uint32_t out_buf, uint32_t lr, uint32_t r1, uint32_t host_tid) {
+[[maybe_unused]] void NoteMixWriter(uint32_t out_buf, uint32_t lr, uint32_t r1, uint32_t host_tid) {
   const float* mix = ResolveMixHost();
   if (!mix) return;
 
@@ -231,14 +231,33 @@ extern "C" void doa4_record_fiber_tick(uint32_t dst_buf, uint32_t entry_pc) {
   if (!b.entry) b.entry = entry_pc;
 }
 
+// Flags any fiber whose guest SP enters the Start-crash slot neighborhood
+// (~0x70937df0) at either swap-in or swap-out. The crash fiber is buf
+// 0x400e5400; if ANY OTHER buf appears here, a neighbor fiber's stack overlaps/
+// grows into the crash fiber's frame -> that's the corruptor. Callers hold
+// g_beat_mu, so the static set needs no extra locking.
+void doa4_note_stack_region(uint32_t buf, uint32_t r1, const char* where) {
+  if (r1 < 0x70935000u || r1 >= 0x7093a000u) return;
+  static std::vector<uint32_t> seen;  // bufs already reported in this region
+  for (uint32_t b : seen) if (b == buf) return;
+  seen.push_back(buf);
+  REXLOG_WARN("[doa4][StackProbe] buf={:#010x} sp={:#010x} ({}) in crash-slot region; "
+              "distinct bufs here so far={} (crash fiber=0x400e5400)",
+              buf, r1, where, seen.size());
+}
+
 extern "C" void doa4_record_fiber_swap_out(uint32_t out_buf, uint32_t lr, uint32_t r1,
                                            uint32_t r3, uint32_t host_tid) {
   if (!out_buf) return;
-  // Audio writer attribution -- run BEFORE acquiring g_beat_mu to avoid
-  // holding two locks at once.
-  NoteMixWriter(out_buf, lr, r1, host_tid);
+  // Audio writer attribution DISABLED: it hashed 6 KiB of guest memory on
+  // every swap-out from a host thread (~720/s) and emitted ~1 line/s of
+  // MixAttr spam. Audio is healthy now and this is the riskiest per-swap work
+  // (guest-memory read racing the guest); re-enable behind a sampling gate if
+  // a specific audio-writer question comes up again.
+  // NoteMixWriter(out_buf, lr, r1, host_tid);
   uint64_t now = NowMs();
   std::lock_guard<std::mutex> lk(g_beat_mu);
+  doa4_note_stack_region(out_buf, r1, "out");
   auto& b = g_beats[out_buf];
   b.last_lr = lr;
   b.last_r1 = r1;
@@ -300,6 +319,8 @@ extern "C" void doa4_record_fiber_swap_in(uint32_t dst_buf, uint32_t lr, uint32_
   b.swap_in_count++;
   b.last_swap_in_ms = now;
   b.running = true;
+
+  doa4_note_stack_region(dst_buf, r1, "in");
 }
 
 extern "C" void doa4_start_fiber_beat_thread() {
@@ -360,9 +381,11 @@ extern "C" void doa4_start_fiber_beat_thread() {
           if (age > 100) ++stalled_100;
           if (age > 500) ++stalled_500;
           if (age > worst_age) { worst_age = age; worst_buf = kv.first; }
-          // Snapshot any fiber that swapped in at least ~audio-rate-ish in
-          // this window; reset window stats.
-          if (kv.second.win_gap_count >= 30) {
+          // Only surface a fiber that actually hitched this window: a
+          // scheduling gap or a contiguous on-cpu run of >=50ms (~3 frames at
+          // 60Hz). Healthy steady-state fibers stay silent. Reset window stats
+          // regardless below.
+          if (kv.second.win_gap_max_ms >= 50 || kv.second.win_oncpu_max_ms >= 50) {
             snaps.push_back({kv.first, kv.second.swap_in_count,
                              kv.second.win_gap_count, kv.second.win_gap_total_ms,
                              kv.second.win_gap_max_ms, kv.second.win_last_r3_out,
@@ -521,6 +544,7 @@ REX_HOOK_RAW(sub_827925F8) {
 extern "C" {
 REX_EXTERN(__imp__sub_824F31E8);
 REX_EXTERN(__imp__sub_82792588);
+REX_EXTERN(__imp__sub_824F3448);
 }
 
 REX_HOOK_RAW(sub_824F31E8) {
@@ -548,32 +572,62 @@ REX_HOOK_RAW(sub_824F31E8) {
   (void)r25_in; (void)r26_in; (void)r27_in; (void)r29_in; (void)r31_in; (void)r1_in;
 }
 
+// sub_82792588 is fiber/thread TEARDOWN, not a swap: it does
+// MmDeleteKernelStack(*(r3+4), *(r3+12)) to free the kernel stack of the
+// thread object passed in r3. The Start-screen crash is a guest NULL store at
+// sub_82386440:59443 because r31 (a callee-saved global ptr) reads back as 0
+// after the call chain sub_82386440 -> sub_824F3448 -> sub_82792588. The old
+// watchdog only checked r25-r30 (never r31), so it missed it. Now we ALSO
+// check r31, and log the stack being freed vs the CURRENT guest SP (r1): if the
+// freed range contains r1, this is a "free the stack we're standing on" bug.
 REX_HOOK_RAW(sub_82792588) {
   static std::atomic<uint64_t> s_n{0};
   uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
-  uint32_t r25_in = (uint32_t)ctx.r25.u64;
-  uint32_t r26_in = (uint32_t)ctx.r26.u64;
-  uint32_t r27_in = (uint32_t)ctx.r27.u64;
-  uint32_t r28_in = (uint32_t)ctx.r28.u64;
-  uint32_t r29_in = (uint32_t)ctx.r29.u64;
-  uint32_t r30_in = (uint32_t)ctx.r30.u64;
-  // Only the clobber path below ever needs to log. Silence the per-call
-  // ENTER trace; FIX D is proven stable.
+  uint32_t r31_in = (uint32_t)ctx.r31.u64;
+  uint32_t r1_in  = (uint32_t)ctx.r1.u64;
+  uint32_t obj    = (uint32_t)ctx.r3.u64;  // thread/fiber object being torn down
+  uint32_t stk_base = obj ? rex::memory::load_and_swap<uint32_t>(base + obj + 4) : 0;
+  uint32_t stk_lim  = obj ? rex::memory::load_and_swap<uint32_t>(base + obj + 12) : 0;
   __imp__sub_82792588(ctx, base);
-  (void)n;
-  uint32_t r25_out = (uint32_t)ctx.r25.u64;
-  uint32_t r26_out = (uint32_t)ctx.r26.u64;
-  uint32_t r27_out = (uint32_t)ctx.r27.u64;
-  uint32_t r28_out = (uint32_t)ctx.r28.u64;
-  uint32_t r29_out = (uint32_t)ctx.r29.u64;
-  uint32_t r30_out = (uint32_t)ctx.r30.u64;
-  bool nv_changed = (r25_in != r25_out) || (r26_in != r26_out) ||
-                    (r27_in != r27_out) || (r28_in != r28_out) ||
-                    (r29_in != r29_out) || (r30_in != r30_out);
-  if (nv_changed) {
-    REXLOG_ERROR("[doa4][AV2] sub_82792588 NV CLOBBER #{} r25 {:#x}->{:#x} r26 {:#x}->{:#x} r27 {:#x}->{:#x} r28 {:#x}->{:#x} r29 {:#x}->{:#x} r30 {:#x}->{:#x}",
-                 n, r25_in, r25_out, r26_in, r26_out, r27_in, r27_out,
-                 r28_in, r28_out, r29_in, r29_out, r30_in, r30_out);
+  uint32_t r31_out = (uint32_t)ctx.r31.u64;
+  // Does the kernel stack being freed contain the SP we're currently on?
+  bool self_stack = stk_base && stk_lim &&
+                    r1_in > std::min(stk_base, stk_lim) &&
+                    r1_in <= std::max(stk_base, stk_lim);
+  if (r31_in != r31_out || self_stack) {
+    REXLOG_ERROR("[doa4][AV2] sub_82792588 #{} tid={} r31 {:#x}->{:#x} r1={:#x} "
+                 "obj={:#x} free_stack=[{:#x}..{:#x}] self_stack={}",
+                 n, Tid(), r31_in, r31_out, r1_in, obj, stk_base, stk_lim,
+                 self_stack ? "YES" : "no");
+  }
+}
+
+// sub_824F3448 is the scheduler helper that tail-calls sub_82792588. It is the
+// direct callee of sub_82386440 right before the faulting store, so confirming
+// r31 survives (or not) across it localises the clobber to this subtree.
+REX_HOOK_RAW(sub_824F3448) {
+  uint32_t r31_in = (uint32_t)ctx.r31.u64;
+  uint32_t r1_in  = (uint32_t)ctx.r1.u64;
+  uint32_t r3_in  = (uint32_t)ctx.r3.u64;
+  __imp__sub_824F3448(ctx, base);
+  uint32_t r31_out = (uint32_t)ctx.r31.u64;
+  if (r31_in != r31_out) {
+    static std::atomic<uint64_t> s_c{0};
+    REXLOG_ERROR("[doa4][AV2] sub_824F3448 R31 CLOBBER #{} tid={} r31 {:#x}->{:#x} r1={:#x} r3={:#x}",
+                 s_c.fetch_add(1, std::memory_order_relaxed), Tid(), r31_in, r31_out, r1_in, r3_in);
+    // Dump the guest stack window around the clobbered slot (r1_in-16). If ONLY
+    // the slot is zero and neighbours hold sane values -> a targeted wild store.
+    // If the whole window is zero -> the stack region was wiped (decommit/
+    // realloc). Decides which way to chase next.
+    uint32_t lo = (r1_in - 0x40) & ~0xFu;
+    for (uint32_t a = lo; a <= r1_in + 0x30; a += 16) {
+      uint32_t w0 = rex::memory::load_and_swap<uint32_t>(base + a + 0);
+      uint32_t w1 = rex::memory::load_and_swap<uint32_t>(base + a + 4);
+      uint32_t w2 = rex::memory::load_and_swap<uint32_t>(base + a + 8);
+      uint32_t w3 = rex::memory::load_and_swap<uint32_t>(base + a + 12);
+      REXLOG_ERROR("[doa4][AV2]   stack[{:#010x}] {:08x} {:08x} {:08x} {:08x}{}",
+                   a, w0, w1, w2, w3, (a <= r1_in - 16 && r1_in - 16 < a + 16) ? "  <-- r31 slot" : "");
+    }
   }
 }
 
@@ -790,19 +844,40 @@ LONG CALLBACK DoaFpVeh(PEXCEPTION_POINTERS ex_info) {
   static constexpr size_t kSeenCap = 64;
   static std::atomic<uint64_t> s_seen[kSeenCap]{};
   uint64_t pc = (uint64_t)ex_info->ExceptionRecord->ExceptionAddress;
+  // seen=true means "already logged this PC" OR "dedup table is full" — either
+  // way we suppress the full stack dump. Without the table-full case these
+  // masked-and-continued FP faults storm the log (tens of thousands/run) once
+  // 64 distinct PCs have been seen. We surface volume via the 1 Hz summary.
   bool seen = false;
+  bool recorded = false;
   for (size_t i = 0; i < kSeenCap; ++i) {
     uint64_t v = s_seen[i].load(std::memory_order_relaxed);
     if (v == pc) { seen = true; break; }
     if (v == 0) {
       uint64_t expected = 0;
       if (s_seen[i].compare_exchange_strong(expected, pc, std::memory_order_relaxed)) {
+        recorded = true;
         break;
       }
       if (s_seen[i].load(std::memory_order_relaxed) == pc) { seen = true; break; }
     }
   }
+  if (!seen && !recorded) seen = true;  // table full -> suppress, count only
   uint64_t total = s_total.fetch_add(1, std::memory_order_relaxed);
+
+  // 1 Hz rate summary so a storm is still visible without per-fault spam.
+  static std::atomic<uint64_t> s_last_report_ms{0};
+  static std::atomic<uint64_t> s_total_at_report{0};
+  uint64_t now_ms = NowMs();
+  uint64_t last_rep = s_last_report_ms.load(std::memory_order_relaxed);
+  if (now_ms - last_rep >= 1000 &&
+      s_last_report_ms.compare_exchange_strong(last_rep, now_ms, std::memory_order_relaxed)) {
+    uint64_t since = total - s_total_at_report.exchange(total, std::memory_order_relaxed);
+    if (since > 0) {
+      REXLOG_WARN("[doa4][FP] {} faults masked+continued in last ~1s (total={})",
+                  since, total);
+    }
+  }
 
   if (!seen) {
     HMODULE main_mod = GetModuleHandleW(nullptr);
@@ -818,14 +893,10 @@ LONG CALLBACK DoaFpVeh(PEXCEPTION_POINTERS ex_info) {
                    (uint32_t)pctx->r3.u64, (uint32_t)pctx->r4.u64,
                    (uint32_t)pctx->r31.u64);
     }
-    void* frames[12] = {};
-    USHORT n = CaptureStackBackTrace(0, 12, frames, nullptr);
-    HMODULE mm = GetModuleHandleW(nullptr);
-    for (USHORT i = 0; i < n; ++i) {
-      uint64_t fp = (uint64_t)frames[i];
-      REXLOG_ERROR("[doa4][FP]   stack[{}] pc={:#x} off=+{:#x}", i, fp,
-                   fp - (uint64_t)mm);
-    }
+    // Host backtrace dropped: 12 lines/fault of unsymbolized host PCs was the
+    // bulk of the FP spam and rarely actionable. The guest lr above plus the
+    // 1 Hz summary identify the offender; the unhandled-exception filter
+    // captures full host+guest state if a fault is ever actually fatal.
   }
 
   if (is_fp) {
@@ -853,6 +924,51 @@ struct FpVehInstaller {
   }
 };
 static FpVehInstaller s_fp_veh_installer;
+
+// ---------------------------------------------------------------------------
+// Last-chance crash logger. The SDK's VEH only *handles* AV / illegal-instr
+// when a registered handler claims them; a genuine bad guest access, a stack
+// overflow, or any other fatal code propagates unhandled and the process dies
+// with NO log (our DoaAvHandler deliberately ignores in-mapping faults to
+// avoid write-watch spam). SetUnhandledExceptionFilter fires ONLY on the
+// terminal, nobody-handled-it fault -- so it is spam-free and captures exactly
+// the crash we currently can't see. We log host + guest state, then let the
+// process die (EXECUTE_HANDLER) so behaviour is otherwise unchanged.
+LONG WINAPI DoaUnhandledFilter(PEXCEPTION_POINTERS ex_info) {
+  auto* er = ex_info->ExceptionRecord;
+  HMODULE main_mod = GetModuleHandleW(nullptr);
+  uint64_t pc = (uint64_t)er->ExceptionAddress;
+  REXLOG_CRITICAL("[doa4][CRASH] UNHANDLED code={:#x} tid={} host_pc={:#x} off=+{:#x}",
+                  (uint32_t)er->ExceptionCode, Tid(), pc, pc - (uint64_t)main_mod);
+  if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+    const char* op = er->ExceptionInformation[0] == 1 ? "write"
+                   : er->ExceptionInformation[0] == 8 ? "execute" : "read";
+    REXLOG_CRITICAL("[doa4][CRASH]   AV {} fault_addr={:#x}", op,
+                    (uint64_t)er->ExceptionInformation[1]);
+  }
+  if (auto* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+    auto* p = ts->context();
+    REXLOG_CRITICAL("[doa4][CRASH]   guest lr={:#x} r1={:#x} r3={:#x} r4={:#x} r11={:#x} r31={:#x}",
+                    (uint32_t)p->lr, (uint32_t)p->r1.u64, (uint32_t)p->r3.u64,
+                    (uint32_t)p->r4.u64, (uint32_t)p->r11.u64, (uint32_t)p->r31.u64);
+  }
+  void* frames[20] = {};
+  USHORT n = CaptureStackBackTrace(0, 20, frames, nullptr);
+  for (USHORT i = 0; i < n; ++i) {
+    REXLOG_CRITICAL("[doa4][CRASH]   stack[{}] off=+{:#x}", i,
+                    (uint64_t)frames[i] - (uint64_t)main_mod);
+  }
+  if (auto* l = ::rex::GetLoggerRaw(::rex::log::core())) l->flush();
+  return EXCEPTION_EXECUTE_HANDLER;  // let it terminate
+}
+
+struct UnhandledFilterInstaller {
+  UnhandledFilterInstaller() {
+    SetUnhandledExceptionFilter(DoaUnhandledFilter);
+    REXLOG_INFO("[doa4][CRASH] unhandled-exception filter installed");
+  }
+};
+static UnhandledFilterInstaller s_unhandled_filter_installer;
 #endif  // _WIN32
 
 }  // namespace

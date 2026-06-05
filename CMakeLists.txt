@@ -25,3 +25,14 @@ else()
 endif()
 
 rexglue_setup_target(dead_or_alive_4)
+
+# --- TEMPORARY crash-localization diagnostic ---------------------------------
+# The Start-screen crash is a guest NULL-pointer write inside sub_82386440
+# (generated/default/dead_or_alive_4_recomp.5.cpp). At -O2 the recompiler keeps
+# the guest PPC context in host registers, so the [doa4][CRASH] dump shows stale
+# r31/lr and only an approximate line. Building just this one TU at -O0 forces
+# every ctx.rN update to memory, so the crash dump reports the exact faulting
+# instruction and the real null register. Remove once the root cause is found.
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/dead_or_alive_4_recomp.5.cpp"
+    PROPERTIES COMPILE_OPTIONS "-O0")

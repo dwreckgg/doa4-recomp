@@ -179,6 +179,11 @@ struct GuestFiber {
   bool is_initial = false;     // true if this represents the host thread's
                                // original stack (no GuestFiberProc — we just
                                // SwitchToFiber back to its handle on resume).
+  bool dispatched = false;     // true once GuestFiberProc has dispatched the
+                               // entry on this host fiber. Used to detect the
+                               // guest reusing a save-buffer for a *fresh*
+                               // fiber while our host fiber is still parked in
+                               // the previous execution (see FIX 7).
 };
 
 std::mutex g_fiber_mu;
@@ -190,6 +195,10 @@ std::unordered_map<uint32_t, std::unique_ptr<GuestFiber>> g_fibers;
 // each successful fiber resume so it can update its per-fiber tables.
 extern "C" void doa4_record_fiber_tick(uint32_t dst_buf, uint32_t entry_pc);
 extern "C" void doa4_start_fiber_beat_thread();
+extern "C" void doa4_record_fiber_swap_out(uint32_t out_buf, uint32_t lr, uint32_t r1,
+                                           uint32_t r3, uint32_t host_tid);
+extern "C" void doa4_record_fiber_swap_in(uint32_t dst_buf, uint32_t lr, uint32_t r1,
+                                          uint32_t r3, uint32_t host_tid);
 
 namespace {
 
@@ -216,6 +225,35 @@ GuestFiber* GetOrCreateFiber(uint32_t buf, uint8_t* base) {
   g_fibers.emplace(buf, std::move(p));
   REXLOG_DEBUG("[doa4][Fiber] created fiber for buf={:#x} host={:p}", buf, raw->host_fiber);
   return raw;
+}
+
+// FIX 7 — recreate a stale host fiber when the guest re-dispatches its buffer.
+// The guest reuses a KiSwapContext save-buffer address for a brand-new fiber
+// (fresh stack top, bootstrap LR). Our host fiber for that buffer is still
+// parked deep in the PREVIOUS execution. SwitchToFiber-ing into it would resume
+// that old C++ call chain with the new (fresh) ctx.r1, so every guest epilogue
+// unwinds from the wrong stack pointer (observed: sub_824F3448 restores r31
+// from the wrong slot -> 0 -> null store crash on the title screen). Tear down
+// the parked host fiber and create a clean one so GuestFiberProc runs the new
+// entry from scratch. The abandoned execution's guest state was already
+// discarded by the guest when it reinitialised the buffer.
+void RecreateHostFiber(GuestFiber* fs) {
+  std::lock_guard<std::mutex> lk(g_fiber_mu);
+  void* old = fs->host_fiber;
+  void* fresh = CreateFiber(64 * 1024, &GuestFiberProc, fs);
+  if (!fresh) {
+    REXLOG_ERROR("[doa4][Fiber][FIX7] CreateFiber FAILED recreating buf={:#x}; keeping old", fs->buf);
+    return;
+  }
+  fs->host_fiber = fresh;
+  fs->dispatched = false;
+  if (old) DeleteFiber(old);  // old is parked (not current/running) -> safe
+  static std::atomic<uint64_t> s_n{0};
+  uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
+  if (n < 40 || (n % 200) == 0) {
+    REXLOG_INFO("[doa4][Fiber][FIX7] #{} recreated stale host fiber for buf={:#x} "
+                "(old={:p} new={:p})", n, fs->buf, old, fresh);
+  }
 }
 
 void EnsureInitialFiber(uint32_t out_buf, uint8_t* base) {
@@ -262,6 +300,14 @@ void DoFiberSwap(PPCContext& ctx, uint8_t* base) {
 
   GuestFiber* dst = GetOrCreateFiber(dst_buf, base);
 
+  // Record the outgoing fiber's last guest state BEFORE the swap overwrites
+  // ctx — this is what powers the freeze-dump / per-fiber gap diagnostics.
+  uint32_t host_tid = Tid();
+  uint32_t out_r1 = ctx.r1.u32;  // outgoing guest SP, before __imp__ mutates ctx
+  if (out_buf) {
+    doa4_record_fiber_swap_out(out_buf, (uint32_t)ctx.lr, ctx.r1.u32, ctx.r3.u32, host_tid);
+  }
+
   // Let the original swap do all the bookkeeping: save outgoing NV regs to
   // out_buf, load NV regs from dst_buf, update KPCR's current-fiber pointer
   // to dst_buf, and call KeSetCurrentStackPointers which sets ctx.r1 to
@@ -270,9 +316,34 @@ void DoFiberSwap(PPCContext& ctx, uint8_t* base) {
   __imp__sub_82793F80(ctx, base);
 
   doa4_record_fiber_tick(dst_buf, ctx.r31.u32);
+  doa4_record_fiber_swap_in(dst_buf, (uint32_t)ctx.lr, ctx.r1.u32, ctx.r3.u32, host_tid);
+
+  // FIX 7: the guest is dispatching this buffer FRESH (bootstrap LR) but our
+  // host fiber for it is still parked in a previous execution. Resuming it
+  // would run the old chain with the new stack pointer -> corruption. Recreate
+  // a clean host fiber so GuestFiberProc runs the new entry from scratch.
+  if ((uint32_t)ctx.lr == 0x82793F70u && dst->dispatched && !dst->is_initial &&
+      dst->host_fiber != GetCurrentFiber()) {
+    RecreateHostFiber(dst);
+  }
 
   // If destination is the fiber we're already running, nothing to do.
   if (!dst->host_fiber || dst->host_fiber == GetCurrentFiber()) {
+    // DIAGNOSTIC: the early-return assumes "we're already executing as dst", so
+    // ctx (incl. r1) staying in dst-state is correct ONLY for a true swap-to-
+    // self (dst_buf == out_buf). If dst_buf != out_buf here, __imp__ has loaded
+    // a DIFFERENT guest stack pointer (in_r1) while we keep running out_buf's
+    // recompiled call chain -> its epilogues read/write the wrong stack and NV
+    // regs read back as 0. Strong candidate for the Start-screen r31 clobber.
+    if (dst_buf != out_buf) {
+      static std::atomic<uint64_t> s_c{0};
+      uint64_t c = s_c.fetch_add(1, std::memory_order_relaxed);
+      if (c < 40 || (c % 500) == 0) {
+        REXLOG_WARN("[doa4][Fiber] EARLY-RET cross-fiber #{} out_buf={:#x} dst_buf={:#x} "
+                    "out_r1={:#x} in_r1={:#x} host_fiber={:p} (no SwitchToFiber; ctx now dst-state)",
+                    c, out_buf, dst_buf, out_r1, ctx.r1.u32, dst->host_fiber);
+      }
+    }
     return;
   }
 
@@ -304,6 +375,9 @@ static void WINAPI GuestFiberProc(void* param) {
     ctx.r3.s64 = (int32_t)arg;
     ctx.ctr.u64 = entry;
     ctx.lr = 0;
+    fs->dispatched = true;  // FIX 7: mark this host fiber as carrying a live
+                            // dispatch so a later fresh reuse of the buffer
+                            // recreates it instead of resuming this chain.
 
     REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
 
@@ -385,4 +459,35 @@ REX_HOOK_RAW(sub_82A04560) {
     return;
   }
   __imp__sub_82A04560(ctx, base);
+}
+
+// ===========================================================================
+// FIX 6 — Retain guest kernel stacks (don't decommit on MmDeleteKernelStack).
+//
+// Root cause of the title-screen-Start crash (a guest NULL store in
+// sub_82386440, reached via the job fiber sub_824F3310 -> ... -> sub_824F3448):
+// our cooperative scheduler reaps a fiber's kernel stack while that fiber is
+// merely YIELDED, not dead. The chain sub_824F3448 -> sub_824F33E0 ->
+// sub_827925E8 -> sub_82793F80 is a KiSwapContext yield; the fiber parks on its
+// stack in the 0x70000000 region. A reaper on another fiber then runs
+// sub_82792588 -> MmDeleteKernelStack, whose Release() DECOMMITS those pages.
+// When the scheduler later switches back to the yielded fiber, it resumes on a
+// now-zeroed stack: the saved non-volatile r31 reads back as 0 and the next
+// store dereferences guest address 0 -> AV at membase+0.
+//
+// The real fix is a clean fiber/thread lifetime model (a yielded fiber's stack
+// must not be reaped). As a pragmatic unblock we make stack teardown a no-op:
+// the pages stay committed, so a reaped-then-resumed fiber still reads valid
+// data. MmDeleteKernelStack is called from exactly one place (sub_82792588);
+// retaining leaks stacks from the 0x70000000-0x7F000000 heap, which is fine for
+// reaching gameplay. Returns X_STATUS_SUCCESS (0).
+// ===========================================================================
+REX_HOOK_RAW(MmDeleteKernelStack) {
+  static std::atomic<uint64_t> s_n{0};
+  uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
+  if (n < 8 || (n % 256) == 0) {
+    REXLOG_INFO("[doa4][FIX][Stack] MmDeleteKernelStack #{} retained base={:#x} end={:#x} (no decommit)",
+                n, (uint32_t)ctx.r3.u64, (uint32_t)ctx.r4.u64);
+  }
+  ctx.r3.s64 = 0;  // X_STATUS_SUCCESS, without releasing the pages
 }
