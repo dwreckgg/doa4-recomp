@@ -23,6 +23,7 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
+#include <rex/system/xmemory.h>  // Memory::LookupHeapByType + BaseHeap page counts (PhysMem watch)
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -231,33 +232,11 @@ extern "C" void doa4_record_fiber_tick(uint32_t dst_buf, uint32_t entry_pc) {
   if (!b.entry) b.entry = entry_pc;
 }
 
-// Flags any fiber whose guest SP enters the Start-crash slot neighborhood
-// (~0x70937df0) at either swap-in or swap-out. The crash fiber is buf
-// 0x400e5400; if ANY OTHER buf appears here, a neighbor fiber's stack overlaps/
-// grows into the crash fiber's frame -> that's the corruptor. Callers hold
-// g_beat_mu, so the static set needs no extra locking.
-void doa4_note_stack_region(uint32_t buf, uint32_t r1, const char* where) {
-  if (r1 < 0x70935000u || r1 >= 0x7093a000u) return;
-  static std::vector<uint32_t> seen;  // bufs already reported in this region
-  for (uint32_t b : seen) if (b == buf) return;
-  seen.push_back(buf);
-  REXLOG_WARN("[doa4][StackProbe] buf={:#010x} sp={:#010x} ({}) in crash-slot region; "
-              "distinct bufs here so far={} (crash fiber=0x400e5400)",
-              buf, r1, where, seen.size());
-}
-
 extern "C" void doa4_record_fiber_swap_out(uint32_t out_buf, uint32_t lr, uint32_t r1,
                                            uint32_t r3, uint32_t host_tid) {
   if (!out_buf) return;
-  // Audio writer attribution DISABLED: it hashed 6 KiB of guest memory on
-  // every swap-out from a host thread (~720/s) and emitted ~1 line/s of
-  // MixAttr spam. Audio is healthy now and this is the riskiest per-swap work
-  // (guest-memory read racing the guest); re-enable behind a sampling gate if
-  // a specific audio-writer question comes up again.
-  // NoteMixWriter(out_buf, lr, r1, host_tid);
   uint64_t now = NowMs();
   std::lock_guard<std::mutex> lk(g_beat_mu);
-  doa4_note_stack_region(out_buf, r1, "out");
   auto& b = g_beats[out_buf];
   b.last_lr = lr;
   b.last_r1 = r1;
@@ -319,8 +298,6 @@ extern "C" void doa4_record_fiber_swap_in(uint32_t dst_buf, uint32_t lr, uint32_
   b.swap_in_count++;
   b.last_swap_in_ms = now;
   b.running = true;
-
-  doa4_note_stack_region(dst_buf, r1, "in");
 }
 
 extern "C" void doa4_start_fiber_beat_thread() {
@@ -425,10 +402,34 @@ extern "C" void doa4_start_fiber_beat_thread() {
       g_prof_worst_age_ms.store(worst_age, std::memory_order_relaxed);
       g_prof_worst_buf.store(worst_buf, std::memory_order_relaxed);
 
-      REXLOG_INFO(
-          "[doa4][Prof] swaps/s={} dt_ms={} fibers={} stalled>100ms={} >500ms={} "
-          "worst_age={}ms worst_buf={:#010x}",
-          rate, dt, fiber_count, stalled_100, stalled_500, worst_age, worst_buf);
+      // The overlay reads the snapshot above every second; the log heartbeat is
+      // only for after-the-fact triage, so emit it every ~5s to cut spam.
+      static uint32_t s_prof_tick = 0;
+      if ((s_prof_tick++ % 5) == 0) {
+        REXLOG_INFO(
+            "[doa4][Prof] swaps/s={} dt_ms={} fibers={} stalled>100ms={} >500ms={} "
+            "worst_age={}ms worst_buf={:#010x}",
+            rate, dt, fiber_count, stalled_100, stalled_500, worst_age, worst_buf);
+
+        // PhysMem watch. Leak/exhaustion ruled out (4KB heap stable ~182MB
+        // free) yet MmAllocatePhysicalMemoryEx fails -> suspect per-page-size
+        // FRAGMENTATION. Physical RAM is split into 4KB/64KB/16MB page
+        // sub-heaps; a 64KB- or 16MB-page grow can fail with lots of 4KB-free
+        // if no contiguous aligned region remains. Report free space at each
+        // granularity: free_bytes = unreserved_pages * page_size.
+        if (auto* ks = rex::system::kernel_state()) {
+          if (auto* mem = ks->memory()) {
+            auto mb = [](auto* h, uint32_t psz) -> uint64_t {
+              return h ? (uint64_t)h->unreserved_page_count() * psz / (1024 * 1024) : 0;
+            };
+            auto* h4  = mem->LookupHeapByType(true, 4096);
+            auto* h64 = mem->LookupHeapByType(true, 64 * 1024);
+            auto* h16 = mem->LookupHeapByType(true, 16 * 1024 * 1024);
+            REXLOG_INFO("[doa4][PhysMem] free: 4KB-heap={}MB  64KB-heap={}MB  16MB-heap={}MB",
+                        mb(h4, 4096), mb(h64, 64 * 1024), mb(h16, 16 * 1024 * 1024));
+          }
+        }
+      }
       for (auto& s : snaps) {
         uint64_t avg = s.gap_count ? (s.gap_total_ms / s.gap_count) : 0;
         REXLOG_INFO(
@@ -439,13 +440,8 @@ extern "C" void doa4_start_fiber_beat_thread() {
             s.oncpu_max_ms, s.oncpu_total_ms,
             s.last_lr, s.last_r3_out, s.distinct_r3);
       }
-      for (auto& t : tid_snaps) {
-        uint64_t avg = t.off_count ? (t.off_total_ms / t.off_count) : 0;
-        REXLOG_INFO(
-            "[doa4][ProfHostTid] tid={} swaps={} off_avg={}ms off_max={}ms "
-            "off_total={}ms",
-            t.tid, t.off_count, avg, t.off_max_ms, t.off_total_ms);
-      }
+      (void)tid_snaps;  // host-tid off-cpu logging removed (host-blocking ruled
+                        // out long ago); snapshot still gathered cheaply above.
     }
   }).detach();
 
@@ -472,10 +468,16 @@ extern "C" void doa4_start_fiber_beat_thread() {
           if (age > worst_age) { worst_age = age; worst_buf = kv.first; }
         }
       }
-      // Loud warning only when something looks wedged; quiet heartbeat
-      // every 30 s so we can confirm the thread is alive.
-      if (worst_age > 500) {
-        REXLOG_WARN("[doa4][Beat] STALL fibers={} worst_buf={:#010x} age={}ms ticks_total={}",
+      // A high worst_age alone is NOT a freeze — idle/blocked worker fibers
+      // legitimately park for a long time while the rest of the game runs fine
+      // (that spammed the log every 3s). Only flag a REAL freeze: no fiber
+      // ticked at all since the last check (forward progress fully halted).
+      static uint64_t s_prev_ticks_total = 0;
+      bool progressing = total_ticks > s_prev_ticks_total;
+      s_prev_ticks_total = total_ticks;
+      // Loud warning only when truly wedged; quiet heartbeat every 30 s.
+      if (worst_age > 500 && !progressing) {
+        REXLOG_WARN("[doa4][Beat] FREEZE: no fiber progress; fibers={} worst_buf={:#010x} age={}ms ticks_total={}",
                     fiber_count, worst_buf, worst_age, total_ticks);
         // Dump per-fiber state once per freeze episode so we can see what
         // every fiber is blocked on. Cleared when forward progress resumes.
@@ -534,102 +536,49 @@ REX_HOOK_RAW(sub_827925F8) {
   ctx.r3.s64 = 0;
 }
 
+// NOTE: the AV2 instrumentation hooks (sub_824F31E8, sub_82792588, sub_824F3448
+// NV/r31 watchdogs + stack-window dump) were used to root-cause the Start-screen
+// r31 clobber. That bug is fixed (FIX 7 in app_hooks: stale host-fiber reuse),
+// so the probes were removed — those functions now run unhooked.
+
 // ---------------------------------------------------------------------------
-// AV2 trace: sub_824F31E8 is where the access violation manifests at
-// recomp.17.cpp:68570 (lwz r11,4556(r30)).  Root cause is that sub_82793F80
-// (KiSwapContext) was returning with a destination thread's r25-r30=0 register
-// snapshot grafted onto the C++ caller chain.  FIX 3 in app_hooks neutralises
-// the swapper; these traces are left in place to verify behaviour.
+// HeapDbg: the snapshot save-to-slot path bugchecks (STOP 0xF4) when the game's
+// allocator sub_827930E0 (r3=size, r4=flags) fails a ~24KB (0x5E20) request
+// with flags 0x40000000 and the failure path panics. This probe logs larger
+// allocations (>=0x2000) with their size/flags/caller and the result. The last
+// ENTER with no matching "->" before the [doa4][CRASH] is the failing alloc:
+// its caller_lr tells us WHAT needs the memory (device/slot list buffer? save
+// serialization?) and whether the flags/size are sane vs garbage. Whether a
+// flags-0x40000000 alloc EVER succeeds tells exhausted-vs-unprovisioned-pool.
+// Remove once root-caused.
 // ---------------------------------------------------------------------------
 extern "C" {
-REX_EXTERN(__imp__sub_824F31E8);
-REX_EXTERN(__imp__sub_82792588);
-REX_EXTERN(__imp__sub_824F3448);
+REX_EXTERN(__imp__sub_827930E0);
 }
-
-REX_HOOK_RAW(sub_824F31E8) {
-  static std::atomic<uint64_t> s_n{0};
-  uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
-  bool log = (n < 2) || ((n & 0xFFFF) == 0);
-  uint32_t r1_in = (uint32_t)ctx.r1.u64;
-  uint32_t r25_in = (uint32_t)ctx.r25.u64;
-  uint32_t r26_in = (uint32_t)ctx.r26.u64;
-  uint32_t r27_in = (uint32_t)ctx.r27.u64;
-  uint32_t r28_in = (uint32_t)ctx.r28.u64;
-  uint32_t r29_in = (uint32_t)ctx.r29.u64;
-  uint32_t r30_in = (uint32_t)ctx.r30.u64;
-  uint32_t r31_in = (uint32_t)ctx.r31.u64;
-  uint32_t lr_in = (uint32_t)ctx.lr;
-  if (log) {
-    REXLOG_DEBUG("[doa4][AV2] sub_824F31E8 ENTER #{} tid={} lr={:#x} r28={:#x} r30={:#x}",
-                 n, Tid(), lr_in, r28_in, r30_in);
+REX_HOOK_RAW(sub_827930E0) {
+  uint32_t size = (uint32_t)ctx.r3.u64;
+  uint32_t flags = (uint32_t)ctx.r4.u64;
+  uint32_t lr = (uint32_t)ctx.lr;
+  // Only large allocations (>=256KB: screenshot buffers, pool grows). The
+  // earlier `flags & 0x40000000` test matched almost everything (that bit is
+  // common) and flooded the log. The failing snapshot alloc shows as an ENTER
+  // with no matching result before [doa4][CRASH].
+  bool interesting = size >= 0x40000;
+  if (interesting) {
+    REXLOG_WARN("[doa4][HeapDbg] alloc ENTER size={:#x} flags={:#x} caller_lr={:#x} tid={}",
+                size, flags, lr, Tid());
   }
-  __imp__sub_824F31E8(ctx, base);
-  if (log) {
-    REXLOG_DEBUG("[doa4][AV2] sub_824F31E8 EXIT  #{} tid={} r28={:#x} r30={:#x}",
-                 n, Tid(), (uint32_t)ctx.r28.u64, (uint32_t)ctx.r30.u64);
-  }
-  (void)r25_in; (void)r26_in; (void)r27_in; (void)r29_in; (void)r31_in; (void)r1_in;
-}
-
-// sub_82792588 is fiber/thread TEARDOWN, not a swap: it does
-// MmDeleteKernelStack(*(r3+4), *(r3+12)) to free the kernel stack of the
-// thread object passed in r3. The Start-screen crash is a guest NULL store at
-// sub_82386440:59443 because r31 (a callee-saved global ptr) reads back as 0
-// after the call chain sub_82386440 -> sub_824F3448 -> sub_82792588. The old
-// watchdog only checked r25-r30 (never r31), so it missed it. Now we ALSO
-// check r31, and log the stack being freed vs the CURRENT guest SP (r1): if the
-// freed range contains r1, this is a "free the stack we're standing on" bug.
-REX_HOOK_RAW(sub_82792588) {
-  static std::atomic<uint64_t> s_n{0};
-  uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
-  uint32_t r31_in = (uint32_t)ctx.r31.u64;
-  uint32_t r1_in  = (uint32_t)ctx.r1.u64;
-  uint32_t obj    = (uint32_t)ctx.r3.u64;  // thread/fiber object being torn down
-  uint32_t stk_base = obj ? rex::memory::load_and_swap<uint32_t>(base + obj + 4) : 0;
-  uint32_t stk_lim  = obj ? rex::memory::load_and_swap<uint32_t>(base + obj + 12) : 0;
-  __imp__sub_82792588(ctx, base);
-  uint32_t r31_out = (uint32_t)ctx.r31.u64;
-  // Does the kernel stack being freed contain the SP we're currently on?
-  bool self_stack = stk_base && stk_lim &&
-                    r1_in > std::min(stk_base, stk_lim) &&
-                    r1_in <= std::max(stk_base, stk_lim);
-  if (r31_in != r31_out || self_stack) {
-    REXLOG_ERROR("[doa4][AV2] sub_82792588 #{} tid={} r31 {:#x}->{:#x} r1={:#x} "
-                 "obj={:#x} free_stack=[{:#x}..{:#x}] self_stack={}",
-                 n, Tid(), r31_in, r31_out, r1_in, obj, stk_base, stk_lim,
-                 self_stack ? "YES" : "no");
+  __imp__sub_827930E0(ctx, base);
+  if (interesting) {
+    REXLOG_WARN("[doa4][HeapDbg] alloc size={:#x} flags={:#x} -> result={:#x}",
+                size, flags, (uint32_t)ctx.r3.u64);
   }
 }
 
-// sub_824F3448 is the scheduler helper that tail-calls sub_82792588. It is the
-// direct callee of sub_82386440 right before the faulting store, so confirming
-// r31 survives (or not) across it localises the clobber to this subtree.
-REX_HOOK_RAW(sub_824F3448) {
-  uint32_t r31_in = (uint32_t)ctx.r31.u64;
-  uint32_t r1_in  = (uint32_t)ctx.r1.u64;
-  uint32_t r3_in  = (uint32_t)ctx.r3.u64;
-  __imp__sub_824F3448(ctx, base);
-  uint32_t r31_out = (uint32_t)ctx.r31.u64;
-  if (r31_in != r31_out) {
-    static std::atomic<uint64_t> s_c{0};
-    REXLOG_ERROR("[doa4][AV2] sub_824F3448 R31 CLOBBER #{} tid={} r31 {:#x}->{:#x} r1={:#x} r3={:#x}",
-                 s_c.fetch_add(1, std::memory_order_relaxed), Tid(), r31_in, r31_out, r1_in, r3_in);
-    // Dump the guest stack window around the clobbered slot (r1_in-16). If ONLY
-    // the slot is zero and neighbours hold sane values -> a targeted wild store.
-    // If the whole window is zero -> the stack region was wiped (decommit/
-    // realloc). Decides which way to chase next.
-    uint32_t lo = (r1_in - 0x40) & ~0xFu;
-    for (uint32_t a = lo; a <= r1_in + 0x30; a += 16) {
-      uint32_t w0 = rex::memory::load_and_swap<uint32_t>(base + a + 0);
-      uint32_t w1 = rex::memory::load_and_swap<uint32_t>(base + a + 4);
-      uint32_t w2 = rex::memory::load_and_swap<uint32_t>(base + a + 8);
-      uint32_t w3 = rex::memory::load_and_swap<uint32_t>(base + a + 12);
-      REXLOG_ERROR("[doa4][AV2]   stack[{:#010x}] {:08x} {:08x} {:08x} {:08x}{}",
-                   a, w0, w1, w2, w3, (a <= r1_in - 16 && r1_in - 16 < a + 16) ? "  <-- r31 slot" : "");
-    }
-  }
-}
+// NOTE: SaveDbg probe (on sub_827DD6D0) removed — it root-caused the snapshot
+// crash (valid object, NV/SP clobbered by sub_8279CDF8's missing epilogue, fixed
+// by FIX 8 in app_hooks). sub_827DD6D0 turned out to run very frequently, so the
+// probe was extremely noisy; it has served its purpose.
 
 // ---------------------------------------------------------------------------
 // SSM44 trace: sub_82897FB8 is the CompiledShader::SetBytecode setter paired
@@ -900,11 +849,21 @@ LONG CALLBACK DoaFpVeh(PEXCEPTION_POINTERS ex_info) {
   }
 
   if (is_fp) {
-    // Clear pending FP status and force all FP exceptions masked on this
-    // thread, then resume the faulting instruction. With masks set, the
-    // retry produces only the default IEEE result (NaN / inf / inexact)
-    // without raising.
-    ex_info->ContextRecord->MxCsr = 0x1F80;  // all exceptions masked
+    // Root fix for the FP-exception storm (was ~10k faults/s on the audio
+    // worker): the guest's FPSCR shadow (PPCContext.fpscr.csr) never had the
+    // x86 exception MASK bits (0x1F80) set — InitHost() apparently isn't
+    // applied to every guest thread — so every disableFlushMode()/storeFromGuest
+    // re-issues setcsr(csr) with masks CLEARED and the next inexact op faults.
+    // Patching only the hardware MxCsr here is futile (the next setcsr undoes
+    // it). Instead OR the mask bits into the guest SHADOW so all subsequent
+    // setcsr calls keep exceptions masked -> the storm self-corrects after ~one
+    // fault per thread. Preserve the guest's flush(FZ/DAZ)/round bits.
+    constexpr uint32_t kFpExcMask = 0x1F80;  // IM DM ZM OM UM PM
+    if (auto* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+      ts->context()->fpscr.csr |= kFpExcMask;
+    }
+    ex_info->ContextRecord->MxCsr =
+        (ex_info->ContextRecord->MxCsr | kFpExcMask) & ~0x3Fu;  // mask + clear sticky flags
     if ((ex_info->ContextRecord->ContextFlags & CONTEXT_FLOATING_POINT) ==
         CONTEXT_FLOATING_POINT) {
       ex_info->ContextRecord->FltSave.ControlWord = 0x027F;  // x87: mask all

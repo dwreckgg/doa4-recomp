@@ -8304,6 +8304,82 @@ loc_82568AC0:
 	goto loc_82568A48;
 }
 
+DEFINE_REX_FUNC(sub_82568AE0) {
+	REX_FUNC_PROLOGUE();
+	PPCRegister temp{};
+	// lis r11,-32059
+	ctx.r11.s64 = -2101018624;
+	// li r10,4
+	ctx.r10.s64 = 4;
+	// addi r11,r11,-12052
+	ctx.r11.s64 = ctx.r11.s64 + -12052;
+	// li r9,0
+	ctx.r9.s64 = 0;
+	// stw r10,588(r11)
+	REX_STORE_U32(ctx.r11.u32 + 588, ctx.r10.u32);
+	// lis r10,-32251
+	ctx.r10.s64 = -2113601536;
+	// stb r9,32(r11)
+	REX_STORE_U8(ctx.r11.u32 + 32, ctx.r9.u8);
+	// lis r9,-32233
+	ctx.r9.s64 = -2112421888;
+	// addi r10,r10,-400
+	ctx.r10.s64 = ctx.r10.s64 + -400;
+	// lfs f0,160(r10)
+	ctx.fpscr.disableFlushMode();
+	temp.u32 = REX_LOAD_U32(ctx.r10.u32 + 160);
+	ctx.f0.f64 = double(temp.f32);
+	// stfs f0,592(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + 592, temp.u32);
+	// lfs f0,0(r10)
+	temp.u32 = REX_LOAD_U32(ctx.r10.u32 + 0);
+	ctx.f0.f64 = double(temp.f32);
+	// li r10,0
+	ctx.r10.s64 = 0;
+	// stfs f0,596(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + 596, temp.u32);
+	// stb r10,620(r11)
+	REX_STORE_U8(ctx.r11.u32 + 620, ctx.r10.u8);
+	// lis r10,-32229
+	ctx.r10.s64 = -2112159744;
+	// addi r10,r10,28188
+	ctx.r10.s64 = ctx.r10.s64 + 28188;
+	// lfs f13,1276(r10)
+	temp.u32 = REX_LOAD_U32(ctx.r10.u32 + 1276);
+	ctx.f13.f64 = double(temp.f32);
+	// stfs f13,600(r11)
+	temp.f32 = float(ctx.f13.f64);
+	REX_STORE_U32(ctx.r11.u32 + 600, temp.u32);
+	// stfs f0,604(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + 604, temp.u32);
+	// lfs f0,10288(r9)
+	temp.u32 = REX_LOAD_U32(ctx.r9.u32 + 10288);
+	ctx.f0.f64 = double(temp.f32);
+	// stfs f0,608(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + 608, temp.u32);
+	// lfs f0,0(r10)
+	temp.u32 = REX_LOAD_U32(ctx.r10.u32 + 0);
+	ctx.f0.f64 = double(temp.f32);
+	// lis r10,-32225
+	ctx.r10.s64 = -2111897600;
+	// stfs f0,612(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + 612, temp.u32);
+	// lfs f0,-32604(r10)
+	temp.u32 = REX_LOAD_U32(ctx.r10.u32 + -32604);
+	ctx.f0.f64 = double(temp.f32);
+	// stfs f0,616(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + 616, temp.u32);
+	// b 0x824535f8
+	sub_824535F8(ctx, base);
+	return;
+}
+
 DEFINE_REX_FUNC(sub_82568B50) {
 	REX_FUNC_PROLOGUE();
 	// lis r11,-32025

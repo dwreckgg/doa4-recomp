@@ -32,6 +32,11 @@ uint32_t LoadU32(uint8_t* base, uint32_t guest_addr) {
   return rex::memory::load_and_swap<uint32_t>(base + guest_addr);
 }
 
+void StoreU32(uint8_t* base, uint32_t guest_addr, uint32_t value) {
+  if (guest_addr == 0) return;
+  rex::memory::store_and_swap<uint32_t>(base + guest_addr, value);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -303,7 +308,6 @@ void DoFiberSwap(PPCContext& ctx, uint8_t* base) {
   // Record the outgoing fiber's last guest state BEFORE the swap overwrites
   // ctx — this is what powers the freeze-dump / per-fiber gap diagnostics.
   uint32_t host_tid = Tid();
-  uint32_t out_r1 = ctx.r1.u32;  // outgoing guest SP, before __imp__ mutates ctx
   if (out_buf) {
     doa4_record_fiber_swap_out(out_buf, (uint32_t)ctx.lr, ctx.r1.u32, ctx.r3.u32, host_tid);
   }
@@ -329,21 +333,6 @@ void DoFiberSwap(PPCContext& ctx, uint8_t* base) {
 
   // If destination is the fiber we're already running, nothing to do.
   if (!dst->host_fiber || dst->host_fiber == GetCurrentFiber()) {
-    // DIAGNOSTIC: the early-return assumes "we're already executing as dst", so
-    // ctx (incl. r1) staying in dst-state is correct ONLY for a true swap-to-
-    // self (dst_buf == out_buf). If dst_buf != out_buf here, __imp__ has loaded
-    // a DIFFERENT guest stack pointer (in_r1) while we keep running out_buf's
-    // recompiled call chain -> its epilogues read/write the wrong stack and NV
-    // regs read back as 0. Strong candidate for the Start-screen r31 clobber.
-    if (dst_buf != out_buf) {
-      static std::atomic<uint64_t> s_c{0};
-      uint64_t c = s_c.fetch_add(1, std::memory_order_relaxed);
-      if (c < 40 || (c % 500) == 0) {
-        REXLOG_WARN("[doa4][Fiber] EARLY-RET cross-fiber #{} out_buf={:#x} dst_buf={:#x} "
-                    "out_r1={:#x} in_r1={:#x} host_fiber={:p} (no SwitchToFiber; ctx now dst-state)",
-                    c, out_buf, dst_buf, out_r1, ctx.r1.u32, dst->host_fiber);
-      }
-    }
     return;
   }
 
@@ -461,33 +450,111 @@ REX_HOOK_RAW(sub_82A04560) {
   __imp__sub_82A04560(ctx, base);
 }
 
+// NOTE: a former "FIX 6" hooked MmDeleteKernelStack to retain (never free)
+// kernel stacks, on the theory that the Start-screen crash was a reaped-while-
+// yielded stack. That theory was DISPROVEN (the stack was intact; the real bug
+// was stale host-fiber reuse, fixed in FIX 7 in this file). The retain hook
+// never fired before the crash and only risked leaking the 0x70000000 stack
+// heap over long sessions, so it has been removed — kernel stacks free normally.
+
 // ===========================================================================
-// FIX 6 — Retain guest kernel stacks (don't decommit on MmDeleteKernelStack).
+// FIX 8 — sub_8279CDF8 missing-epilogue ABI repair (snapshot-save crash).
 //
-// Root cause of the title-screen-Start crash (a guest NULL store in
-// sub_82386440, reached via the job fiber sub_824F3310 -> ... -> sub_824F3448):
-// our cooperative scheduler reaps a fiber's kernel stack while that fiber is
-// merely YIELDED, not dead. The chain sub_824F3448 -> sub_824F33E0 ->
-// sub_827925E8 -> sub_82793F80 is a KiSwapContext yield; the fiber parks on its
-// stack in the 0x70000000 region. A reaper on another fiber then runs
-// sub_82792588 -> MmDeleteKernelStack, whose Release() DECOMMITS those pages.
-// When the scheduler later switches back to the yielded fiber, it resumes on a
-// now-zeroed stack: the saved non-volatile r31 reads back as 0 and the next
-// store dereferences guest address 0 -> AV at membase+0.
+// sub_8279CDF8 (a vtable method used by the snapshot/photo save path) was
+// recompiled WITHOUT its function epilogue: it ends with `bl sub_82A04220` and
+// then returns, never restoring r1, r31, or lr (compare the very next function
+// sub_8279CE30, which restores them). sub_82A04220 is an ordinary function that
+// returns normally, so this is a genuine codegen miss, not a tail call. The
+// result: sub_8279CDF8 returns to its caller (sub_827DD6D0) with the stack
+// pointer and non-volatile registers clobbered. sub_827DD6D0 then does
+// `stw r29,420(r30)` with r30 no longer the object -> AV writing guest 0x1a4.
 //
-// The real fix is a clean fiber/thread lifetime model (a yielded fiber's stack
-// must not be reaped). As a pragmatic unblock we make stack teardown a no-op:
-// the pages stay committed, so a reaped-then-resumed fiber still reads valid
-// data. MmDeleteKernelStack is called from exactly one place (sub_82792588);
-// retaining leaks stacks from the 0x70000000-0x7F000000 heap, which is fine for
-// reaching gameplay. Returns X_STATUS_SUCCESS (0).
+// Per the PPC ABI a normal call must preserve r1, lr and the non-volatile GPRs
+// (r14-r31). We enforce exactly that: snapshot them on entry, run the (buggy)
+// recompiled body for its side effects, then restore them. r3 (return value) is
+// left as-is; the sole caller overwrites r3 immediately, so it doesn't matter.
 // ===========================================================================
-REX_HOOK_RAW(MmDeleteKernelStack) {
+extern "C" {
+REX_EXTERN(__imp__sub_8279CDF8);
+}
+
+REX_HOOK_RAW(sub_8279CDF8) {
+  const uint32_t s_r1 = ctx.r1.u32;
+  const uint64_t s_lr = ctx.lr;
+  const uint64_t s_r14 = ctx.r14.u64, s_r15 = ctx.r15.u64, s_r16 = ctx.r16.u64,
+                 s_r17 = ctx.r17.u64, s_r18 = ctx.r18.u64, s_r19 = ctx.r19.u64,
+                 s_r20 = ctx.r20.u64, s_r21 = ctx.r21.u64, s_r22 = ctx.r22.u64,
+                 s_r23 = ctx.r23.u64, s_r24 = ctx.r24.u64, s_r25 = ctx.r25.u64,
+                 s_r26 = ctx.r26.u64, s_r27 = ctx.r27.u64, s_r28 = ctx.r28.u64,
+                 s_r29 = ctx.r29.u64, s_r30 = ctx.r30.u64, s_r31 = ctx.r31.u64;
+
+  __imp__sub_8279CDF8(ctx, base);
+
+  ctx.r1.u32 = s_r1;  ctx.lr = s_lr;
+  ctx.r14.u64 = s_r14; ctx.r15.u64 = s_r15; ctx.r16.u64 = s_r16; ctx.r17.u64 = s_r17;
+  ctx.r18.u64 = s_r18; ctx.r19.u64 = s_r19; ctx.r20.u64 = s_r20; ctx.r21.u64 = s_r21;
+  ctx.r22.u64 = s_r22; ctx.r23.u64 = s_r23; ctx.r24.u64 = s_r24; ctx.r25.u64 = s_r25;
+  ctx.r26.u64 = s_r26; ctx.r27.u64 = s_r27; ctx.r28.u64 = s_r28; ctx.r29.u64 = s_r29;
+  ctx.r30.u64 = s_r30; ctx.r31.u64 = s_r31;
+
   static std::atomic<uint64_t> s_n{0};
   uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
-  if (n < 8 || (n % 256) == 0) {
-    REXLOG_INFO("[doa4][FIX][Stack] MmDeleteKernelStack #{} retained base={:#x} end={:#x} (no decommit)",
-                n, (uint32_t)ctx.r3.u64, (uint32_t)ctx.r4.u64);
+  if (n < 8) {
+    REXLOG_INFO("[doa4][FIX8] sub_8279CDF8 #{} NV/SP restored (r1={:#x} r30={:#x} r31={:#x})",
+                n, s_r1, (uint32_t)s_r30, (uint32_t)s_r31);
   }
-  ctx.r3.s64 = 0;  // X_STATUS_SUCCESS, without releasing the pages
+}
+
+// ===========================================================================
+// FIX 9 — process-restricted-heap assertion bypass (snapshot/photo save panic).
+//
+// sub_827962D0 is the title's pool allocator. Near entry it enforces a
+// "this heap may only be used from its owning process type" guard:
+//
+//     r11 = *(heap+0x14) & 0x40000;        // "process-restricted" flag bit
+//     if (!r11) goto alloc;                // unrestricted heap -> no check
+//     if (KeGetCurrentProcessType() == *(heap+0x17B)) goto alloc;  // type ok
+//     KeBugCheckEx(0xF4, heap, 1459, ...); // else PANIC (CRITICAL_OBJECT_TERMINATION)
+//
+// During the photo/snapshot save this fires: code=0xF4 at line 1459 (observed
+// as a STATUS_BREAKPOINT / guest KeBugCheck, NOT an allocation failure — every
+// alloc on the save path returns a valid pointer with ~180MB physical free).
+// The guard is a multi-process safety assertion that is meaningless in our
+// single-title recompilation; the save simply runs the allocation from a guest
+// thread whose reported process type doesn't equal the heap's owner byte.
+//
+// We satisfy the guard without altering allocation behavior: when the heap is
+// process-restricted we clear bit 0x40000 for the duration of the original
+// call so the first branch takes the "unrestricted" path (KeGetCurrentProcessType
+// is never consulted), then restore the original flags word immediately after.
+// Bit 0x40000 is read ONLY for this assertion inside sub_827962D0, so the carve
+// itself is identical; and because the guest runs cooperatively on one host
+// thread (with the heap's own critical section taken inside), no other thread
+// observes the transient clear.
+// ===========================================================================
+extern "C" {
+REX_EXTERN(__imp__sub_827962D0);
+}
+
+REX_HOOK_RAW(sub_827962D0) {
+  constexpr uint32_t kRestrictBit = 0x40000;  // *(heap+0x14) bit: process-restricted
+  const uint32_t heap = ctx.r3.u32;
+  const uint32_t flags = heap ? LoadU32(base, heap + 0x14) : 0;
+
+  if (flags & kRestrictBit) {
+    static std::atomic<uint64_t> s_n{0};
+    uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8) {
+      uint32_t owner = base ? base[heap + 0x17B] : 0;  // *(heap+0x17B), byte
+      REXLOG_INFO("[doa4][FIX9] restricted-heap guard bypassed #{} heap={:#x} "
+                  "flags={:#x} owner_type={} (lr={:#x})",
+                  n, heap, flags, owner, (uint32_t)ctx.lr);
+    }
+    StoreU32(base, heap + 0x14, flags & ~kRestrictBit);
+    __imp__sub_827962D0(ctx, base);
+    StoreU32(base, heap + 0x14, flags);  // restore exactly what was there
+    return;
+  }
+
+  __imp__sub_827962D0(ctx, base);
 }

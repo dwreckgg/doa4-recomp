@@ -18,3 +18,14 @@
 0x829E2788 = {}
 # Call to invalid/unregistered function at runtime (log 099 t=33s, thread t57320)
 0x82550830 = {}
+# Call to invalid/unregistered function at runtime (log 015, gameplay load after
+# character select)
+0x82568AE0 = {}
+# Call to invalid/unregistered function at runtime (log 020, after 2nd match)
+0x825B4A78 = {}
+# Call to invalid/unregistered function at runtime (log 021, during match)
+0x8257FDF0 = {}
+# Call to invalid/unregistered function at runtime (log 022, during match; adjacent to 0x8257FDF0)
+0x8257FE00 = {}
+# Call to invalid/unregistered function at runtime (log 023, on save to slot)
+0x827DE3C0 = {}

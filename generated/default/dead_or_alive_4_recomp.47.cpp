@@ -64852,6 +64852,22 @@ loc_827DE3A8:
 	goto loc_827DE390;
 }
 
+DEFINE_REX_FUNC(sub_827DE3C0) {
+	REX_FUNC_PROLOGUE();
+	// lwz r10,0(r3)
+	ctx.r10.u64 = REX_LOAD_U32(ctx.r3.u32 + 0);
+	// li r11,0
+	ctx.r11.s64 = 0;
+	// stw r11,108(r10)
+	REX_STORE_U32(ctx.r10.u32 + 108, ctx.r11.u32);
+	// lwz r9,0(r3)
+	ctx.r9.u64 = REX_LOAD_U32(ctx.r3.u32 + 0);
+	// stw r11,20(r9)
+	REX_STORE_U32(ctx.r9.u32 + 20, ctx.r11.u32);
+	// blr 
+	return;
+}
+
 DEFINE_REX_FUNC(sub_827DE3D8) {
 	REX_FUNC_PROLOGUE();
 	// lis r8,-32130

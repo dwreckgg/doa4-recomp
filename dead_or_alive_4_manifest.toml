@@ -3,9 +3,9 @@
 [project]
 name = "dead_or_alive_4"
 sdk_version = "0.8.1.4"
-game_root = "../../xex/doa4"
+game_root = "../xex/DOA4"
 
 [entrypoint]
-file_path = "../../xex/doa4/default.xex"
+file_path = "../xex/DOA4/default.xex"
 out_directory_path = "generated/default"
 includes = ["hints.toml"]
