@@ -14,6 +14,7 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 
@@ -30,11 +31,6 @@ uint32_t Tid() {
 uint32_t LoadU32(uint8_t* base, uint32_t guest_addr) {
   if (guest_addr == 0) return 0;
   return rex::memory::load_and_swap<uint32_t>(base + guest_addr);
-}
-
-void StoreU32(uint8_t* base, uint32_t guest_addr, uint32_t value) {
-  if (guest_addr == 0) return;
-  rex::memory::store_and_swap<uint32_t>(base + guest_addr, value);
 }
 
 }  // namespace
@@ -505,56 +501,133 @@ REX_HOOK_RAW(sub_8279CDF8) {
   }
 }
 
+// NOTE: a former "FIX 9" hooked the pool allocator sub_827962D0 to bypass its
+// per-heap process-type KeBugCheck(0xF4) guard by transiently clearing the
+// 0x40000 "process-restricted" flag bit. It was superseded by FIX 11 below,
+// which fixes the shared root (KeGetCurrentProcessType) and so covers ALL the
+// sibling allocators that carry the same guard. FIX 9 was removed to drop its
+// per-allocation overhead on that hot path.
+
 // ===========================================================================
-// FIX 9 — process-restricted-heap assertion bypass (snapshot/photo save panic).
+// FIX 10 — image decoder graceful-fail on format mismatch (snapshot save).
 //
-// sub_827962D0 is the title's pool allocator. Near entry it enforces a
-// "this heap may only be used from its owning process type" guard:
+// Saving a snapshot must decode the game's embedded 64x64 PNG save-icon. The
+// image loader sub_827A26F0 AUTO-DETECTS the format by trying each decoder in a
+// fixed order (format list {0,5,4,1,3,8,7,2,6}); a decoder that returns a
+// negative value means "not my format — try the next one".
 //
-//     r11 = *(heap+0x14) & 0x40000;        // "process-restricted" flag bit
-//     if (!r11) goto alloc;                // unrestricted heap -> no check
-//     if (KeGetCurrentProcessType() == *(heap+0x17B)) goto alloc;  // type ok
-//     KeBugCheckEx(0xF4, heap, 1459, ...); // else PANIC (CRITICAL_OBJECT_TERMINATION)
+// Format 1 in that list is sub_8279FAA8, the JPEG decoder. When handed the PNG
+// it correctly detects the mismatch and heads for its E_FAIL (0x80004005)
+// return — but on the way out its finalize step (sub_827DBB50 -> sub_827DB998)
+// UNCONDITIONALLY dereferences the decoder's output-stream object at
+// session+0x1A8 (offset 424). On an aborted/failed decode that object was never
+// created, so the field is NULL and sub_827DB998 faults (observed: AV read at
+// guest 0x0). That crash happens *instead of* the clean E_FAIL return, so the
+// auto-detect loop never advances to the PNG decoder later in the list.
 //
-// During the photo/snapshot save this fires: code=0xF4 at line 1459 (observed
-// as a STATUS_BREAKPOINT / guest KeBugCheck, NOT an allocation failure — every
-// alloc on the save path returns a valid pointer with ~180MB physical free).
-// The guard is a multi-process safety assertion that is meaningless in our
-// single-title recompilation; the save simply runs the allocation from a guest
-// thread whose reported process type doesn't equal the heap's owner byte.
+// (The earlier-tried decoders 0/5/4 already fail gracefully on the PNG — that's
+// how execution even reaches format 1 — so only the JPEG path is broken.)
 //
-// We satisfy the guard without altering allocation behavior: when the heap is
-// process-restricted we clear bit 0x40000 for the duration of the original
-// call so the first branch takes the "unrestricted" path (KeGetCurrentProcessType
-// is never consulted), then restore the original flags word immediately after.
-// Bit 0x40000 is read ONLY for this assertion inside sub_827962D0, so the carve
-// itself is identical; and because the guest runs cooperatively on one host
-// thread (with the heap's own critical section taken inside), no other thread
-// observes the transient clear.
+// sub_827DB998 exists solely to flush that output-stream object; when it is NULL
+// there is nothing to flush. Skip the whole function in that case, letting the
+// JPEG decoder return E_FAIL cleanly so format auto-detect proceeds to (and
+// succeeds with) the PNG decoder. The normal success path always has a valid
+// +424 object, so it is unaffected.
 // ===========================================================================
 extern "C" {
-REX_EXTERN(__imp__sub_827962D0);
+REX_EXTERN(__imp__sub_827DB998);
 }
 
-REX_HOOK_RAW(sub_827962D0) {
-  constexpr uint32_t kRestrictBit = 0x40000;  // *(heap+0x14) bit: process-restricted
-  const uint32_t heap = ctx.r3.u32;
-  const uint32_t flags = heap ? LoadU32(base, heap + 0x14) : 0;
-
-  if (flags & kRestrictBit) {
+REX_HOOK_RAW(sub_827DB998) {
+  const uint32_t session = ctx.r3.u32;
+  if (session && LoadU32(base, session + 424) == 0) {
     static std::atomic<uint64_t> s_n{0};
     uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
     if (n < 8) {
-      uint32_t owner = base ? base[heap + 0x17B] : 0;  // *(heap+0x17B), byte
-      REXLOG_INFO("[doa4][FIX9] restricted-heap guard bypassed #{} heap={:#x} "
-                  "flags={:#x} owner_type={} (lr={:#x})",
-                  n, heap, flags, owner, (uint32_t)ctx.lr);
+      REXLOG_INFO("[doa4][FIX10] sub_827DB998 skipped: session={:#x} +424 NULL "
+                  "(aborted decode, nothing to flush) (lr={:#x})",
+                  session, (uint32_t)ctx.lr);
     }
-    StoreU32(base, heap + 0x14, flags & ~kRestrictBit);
-    __imp__sub_827962D0(ctx, base);
-    StoreU32(base, heap + 0x14, flags);  // restore exactly what was there
-    return;
+    return;  // leave r3 as-is; caller ignores it and proceeds to E_FAIL return
   }
+  __imp__sub_827DB998(ctx, base);
+}
 
-  __imp__sub_827962D0(ctx, base);
+// ===========================================================================
+// FIX 11 — KeGetCurrentProcessType returns the title process type (generalizes
+// FIX 9).
+//
+// The title's pool-allocator family guards every "process-restricted" heap
+// (flag bit 0x40000 at heap+0x14) with:
+//     if (KeGetCurrentProcessType() != *(heap+0x17B)) KeBugCheckEx(0xF4, ...)
+// This guard appears in SEVERAL sibling allocators (recomp.45 has KeBugCheckEx
+// sites at ~0x827963xx [FIX 9's sub_827962D0], 0x82796C28, and more), so the
+// surgical per-function flag-clear in FIX 9 only covered one of them and the
+// snapshot save still bugchecked from a different allocator.
+//
+// All of the title's heaps are owned by the title process (observed owner type =
+// X_PROCTYPE_USER = 1). The panic happens only because rexglue's
+// KeGetCurrentProcessType reads the per-thread KTHREAD.process_type (or
+// processtype_value_in_dpc when a DPC/APC frame is active), which on the save
+// path doesn't equal the title type. In a single-title recompilation the
+// "current process" is ALWAYS the title, so the correct return is simply the
+// title process type. Overriding the import to return it satisfies every such
+// guard at once (and is what the per-thread value should already be).
+// ===========================================================================
+extern "C" {
+REX_EXTERN(__imp__KeGetCurrentProcessType);
+}
+
+REX_HOOK_RAW(KeGetCurrentProcessType) {
+  uint32_t pt = 1;  // X_PROCTYPE_USER (fallback if kernel state not ready)
+  if (auto* ks = rex::system::kernel_state()) {
+    pt = ks->process_type();
+  }
+  ctx.r3.u64 = pt;
+}
+
+// ===========================================================================
+// FIX 12 — JPEG decoder rejects non-JPEG input up front (snapshot save).
+//
+// Saving a snapshot decodes the game's embedded 64x64 PNG save-icon through an
+// auto-detect image loader (sub_827A26F0) that tries each decoder in turn and
+// expects a negative return to mean "not my format, try the next". Format 1 is
+// sub_8279FAA8, the JPEG decoder (r3=loader ctx, r4=input buffer, r5=size).
+//
+// On the PNG, sub_8279FAA8 does NOT bail at its `FF D8` SOI check — it keeps
+// going, interpreting PNG bytes as JPEG markers/segment-lengths. A segment
+// handler (sub_827DC5F0) then reads a bogus 16-bit length, walks off into a
+// wild pointer, and does an out-of-bounds store (observed: AV write at random
+// guest addresses; also previously a NULL deref in finalize, see FIX 10). So
+// the decoder crashes instead of returning its own E_FAIL, and auto-detect
+// never reaches the PNG decoder.
+//
+// A JPEG file ALWAYS begins with the SOI marker 0xFF 0xD8. Reject any input
+// that doesn't, returning sub_8279FAA8's own failure code (E_FAIL 0x80004005,
+// negative) so the loader advances to the next decoder (the PNG one). Genuine
+// JPEGs (0xFF 0xD8 ...) still run the real decoder unchanged.
+// ===========================================================================
+extern "C" {
+REX_EXTERN(__imp__sub_8279FAA8);
+}
+
+REX_HOOK_RAW(sub_8279FAA8) {
+  const uint32_t buf = ctx.r4.u32;
+  const uint32_t size = ctx.r5.u32;
+  if (buf && size >= 2) {
+    uint8_t b0 = base[buf];
+    uint8_t b1 = base[buf + 1];
+    if (!(b0 == 0xFF && b1 == 0xD8)) {  // not a JPEG (SOI marker missing)
+      static std::atomic<uint64_t> s_n{0};
+      uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
+      if (n < 8) {
+        REXLOG_INFO("[doa4][FIX12] sub_8279FAA8 not-a-JPEG (magic {:#04x} {:#04x}) -> "
+                    "E_FAIL so auto-detect tries next decoder (buf={:#x} size={:#x})",
+                    b0, b1, buf, size);
+      }
+      ctx.r3.u64 = 0x80004005;  // E_FAIL (negative) = "not my format, try next"
+      return;
+    }
+  }
+  __imp__sub_8279FAA8(ctx, base);
 }

@@ -29,3 +29,5 @@
 0x8257FE00 = {}
 # Call to invalid/unregistered function at runtime (log 023, on save to slot)
 0x827DE3C0 = {}
+# Call to invalid/unregistered function at runtime (log 042, ~4min into gameplay)
+0x823A7778 = {}

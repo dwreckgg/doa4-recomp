@@ -1469,6 +1469,7 @@ void dead_or_alive_4_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar
   registrar->SetFunction(0x823A7428, sub_823A7428);
   registrar->SetFunction(0x823A7430, sub_823A7430);
   registrar->SetFunction(0x823A7498, sub_823A7498);
+  registrar->SetFunction(0x823A7778, sub_823A7778);
   registrar->SetFunction(0x823A7790, sub_823A7790);
   registrar->SetFunction(0x823A7860, sub_823A7860);
   registrar->SetFunction(0x823A7920, sub_823A7920);

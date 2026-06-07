@@ -63,6 +63,26 @@ class DeadOrAlive4App : public rex::ReXApp {
     MountDiscRoot();
     MountCacheDevice();
     StartThreadSnapshotter();
+
+    // Photo/snapshot capture reads the rendered frame back from GUEST memory.
+    // rexglue's GPU defaults readback_resolve="none", so render-to-texture
+    // resolve results never get copied from the host GPU into guest RAM — the
+    // in-match photo buffer stays zeroed and saved photos come out solid black.
+    // Enable readback so the captured frame reaches CPU memory.
+    //
+    // Mode = "some": copy a resolve result to guest RAM only ON DEMAND (when the
+    // CPU/texture cache actually reads that region). "fast" (copy EVERY frame)
+    // also fixes the black photo but continuously overwrites the save-slot
+    // preview surfaces with the live capture, so every saved slot's thumbnail
+    // showed the most recent photo. "some" copies only when the save path reads
+    // the captured frame, which keeps photos working without that overwrite —
+    // and stays cheaper than "full" (per-resolve sync stall that hurts gameplay).
+    if (rex::cvar::SetFlagByName("readback_resolve", "some")) {
+      REXLOG_INFO("[doa4][GPU] readback_resolve=some (enables photo/snapshot "
+                  "framebuffer capture)");
+    } else {
+      REXLOG_WARN("[doa4][GPU] failed to set readback_resolve cvar");
+    }
   }
   void OnPostLoadXexImage() override {
     REXLOG_INFO("[doa4][LIFE] OnPostLoadXexImage: XEX mapped into guest memory");

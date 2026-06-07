@@ -73121,6 +73121,24 @@ loc_823A776C:
 	goto loc_823A75EC;
 }
 
+DEFINE_REX_FUNC(sub_823A7778) {
+	REX_FUNC_PROLOGUE();
+	PPCRegister temp{};
+	// lis r11,-31996
+	ctx.r11.s64 = -2096889856;
+	// lfs f0,16(r3)
+	ctx.fpscr.disableFlushMode();
+	temp.u32 = REX_LOAD_U32(ctx.r3.u32 + 16);
+	ctx.f0.f64 = double(temp.f32);
+	// li r3,1
+	ctx.r3.s64 = 1;
+	// stfs f0,-5388(r11)
+	temp.f32 = float(ctx.f0.f64);
+	REX_STORE_U32(ctx.r11.u32 + -5388, temp.u32);
+	// blr 
+	return;
+}
+
 DEFINE_REX_FUNC(sub_823A7790) {
 	REX_FUNC_PROLOGUE();
 	PPCRegister temp{};

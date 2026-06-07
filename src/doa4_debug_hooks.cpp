@@ -23,7 +23,7 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
-#include <rex/system/xmemory.h>  // Memory::LookupHeapByType + BaseHeap page counts (PhysMem watch)
+#include <rex/system/xmemory.h>  // rex::system::Memory (kernel_state()->memory())
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -410,25 +410,6 @@ extern "C" void doa4_start_fiber_beat_thread() {
             "[doa4][Prof] swaps/s={} dt_ms={} fibers={} stalled>100ms={} >500ms={} "
             "worst_age={}ms worst_buf={:#010x}",
             rate, dt, fiber_count, stalled_100, stalled_500, worst_age, worst_buf);
-
-        // PhysMem watch. Leak/exhaustion ruled out (4KB heap stable ~182MB
-        // free) yet MmAllocatePhysicalMemoryEx fails -> suspect per-page-size
-        // FRAGMENTATION. Physical RAM is split into 4KB/64KB/16MB page
-        // sub-heaps; a 64KB- or 16MB-page grow can fail with lots of 4KB-free
-        // if no contiguous aligned region remains. Report free space at each
-        // granularity: free_bytes = unreserved_pages * page_size.
-        if (auto* ks = rex::system::kernel_state()) {
-          if (auto* mem = ks->memory()) {
-            auto mb = [](auto* h, uint32_t psz) -> uint64_t {
-              return h ? (uint64_t)h->unreserved_page_count() * psz / (1024 * 1024) : 0;
-            };
-            auto* h4  = mem->LookupHeapByType(true, 4096);
-            auto* h64 = mem->LookupHeapByType(true, 64 * 1024);
-            auto* h16 = mem->LookupHeapByType(true, 16 * 1024 * 1024);
-            REXLOG_INFO("[doa4][PhysMem] free: 4KB-heap={}MB  64KB-heap={}MB  16MB-heap={}MB",
-                        mb(h4, 4096), mb(h64, 64 * 1024), mb(h16, 16 * 1024 * 1024));
-          }
-        }
       }
       for (auto& s : snaps) {
         uint64_t avg = s.gap_count ? (s.gap_total_ms / s.gap_count) : 0;
@@ -540,45 +521,6 @@ REX_HOOK_RAW(sub_827925F8) {
 // NV/r31 watchdogs + stack-window dump) were used to root-cause the Start-screen
 // r31 clobber. That bug is fixed (FIX 7 in app_hooks: stale host-fiber reuse),
 // so the probes were removed — those functions now run unhooked.
-
-// ---------------------------------------------------------------------------
-// HeapDbg: the snapshot save-to-slot path bugchecks (STOP 0xF4) when the game's
-// allocator sub_827930E0 (r3=size, r4=flags) fails a ~24KB (0x5E20) request
-// with flags 0x40000000 and the failure path panics. This probe logs larger
-// allocations (>=0x2000) with their size/flags/caller and the result. The last
-// ENTER with no matching "->" before the [doa4][CRASH] is the failing alloc:
-// its caller_lr tells us WHAT needs the memory (device/slot list buffer? save
-// serialization?) and whether the flags/size are sane vs garbage. Whether a
-// flags-0x40000000 alloc EVER succeeds tells exhausted-vs-unprovisioned-pool.
-// Remove once root-caused.
-// ---------------------------------------------------------------------------
-extern "C" {
-REX_EXTERN(__imp__sub_827930E0);
-}
-REX_HOOK_RAW(sub_827930E0) {
-  uint32_t size = (uint32_t)ctx.r3.u64;
-  uint32_t flags = (uint32_t)ctx.r4.u64;
-  uint32_t lr = (uint32_t)ctx.lr;
-  // Only large allocations (>=256KB: screenshot buffers, pool grows). The
-  // earlier `flags & 0x40000000` test matched almost everything (that bit is
-  // common) and flooded the log. The failing snapshot alloc shows as an ENTER
-  // with no matching result before [doa4][CRASH].
-  bool interesting = size >= 0x40000;
-  if (interesting) {
-    REXLOG_WARN("[doa4][HeapDbg] alloc ENTER size={:#x} flags={:#x} caller_lr={:#x} tid={}",
-                size, flags, lr, Tid());
-  }
-  __imp__sub_827930E0(ctx, base);
-  if (interesting) {
-    REXLOG_WARN("[doa4][HeapDbg] alloc size={:#x} flags={:#x} -> result={:#x}",
-                size, flags, (uint32_t)ctx.r3.u64);
-  }
-}
-
-// NOTE: SaveDbg probe (on sub_827DD6D0) removed — it root-caused the snapshot
-// crash (valid object, NV/SP clobbered by sub_8279CDF8's missing epilogue, fixed
-// by FIX 8 in app_hooks). sub_827DD6D0 turned out to run very frequently, so the
-// probe was extremely noisy; it has served its purpose.
 
 // ---------------------------------------------------------------------------
 // SSM44 trace: sub_82897FB8 is the CompiledShader::SetBytecode setter paired
