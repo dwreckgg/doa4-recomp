@@ -19,6 +19,7 @@ set(DEADORALIVE4_SOURCES
     src/doa4_config.cpp
     src/doa4_menu.cpp
     src/doa4_unlocks.cpp
+    src/doa4_tweaks.cpp
 )
 
 if(WIN32)
