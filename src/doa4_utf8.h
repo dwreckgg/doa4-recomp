@@ -8,12 +8,19 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace doa4 {
 
 inline std::string Utf8(const std::filesystem::path& path) {
   const std::u8string text = path.u8string();
   return std::string(text.begin(), text.end());
+}
+
+// The reverse: UTF-8 text (a TOML value, for example) as a path. Converting a
+// std::string straight to a path would read it in the ANSI code page.
+inline std::filesystem::path PathFromUtf8(std::string_view text) {
+  return std::filesystem::path(std::u8string(text.begin(), text.end()));
 }
 
 }  // namespace doa4

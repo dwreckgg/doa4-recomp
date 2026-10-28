@@ -313,6 +313,22 @@ static void TestFormatGB() {
   CHECK(FormatGB(0) == "0.0 GB");
 }
 
+static void TestParseTestScript() {
+  TestScript t = ParseTestScript(nullptr);
+  CHECK(!t.active());
+  t = ParseTestScript("");
+  CHECK(!t.active());
+  t = ParseTestScript("folder=C:/doa4/xex/DOA4");
+  CHECK(t.active() && t.folder == fs::path("C:/doa4/xex/DOA4") && !t.iso && !t.target);
+  t = ParseTestScript("iso=C:/s/game.iso|target=C:/s/out");
+  CHECK(t.active() && !t.folder && t.iso == fs::path("C:/s/game.iso") &&
+        t.target == fs::path("C:/s/out"));
+  // An image without a target, or an unknown key: not active.
+  CHECK(!ParseTestScript("iso=C:/s/game.iso").active());
+  CHECK(!ParseTestScript("disk=C:/x").active());
+  CHECK(!ParseTestScript("folder=").active());
+}
+
 int main() {
   TestImageHappyPath();
   TestImageRefusals();
@@ -324,6 +340,7 @@ int main() {
   TestExtractEndings();
   TestBack();
   TestFormatGB();
+  TestParseTestScript();
   if (g_failures) {
     std::printf("%d check(s) failed\n", g_failures);
     return 1;

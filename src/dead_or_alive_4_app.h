@@ -42,8 +42,10 @@
 #include <rex/system/util/object_table.h>
 #include <rex/system/xthread.h>
 
+#include "doa4_config.h"
 #include "doa4_diag_overlay.h"
 #include "doa4_extras.h"
+#include "doa4_gamefiles.h"
 #include "doa4_graphics.h"
 #include "doa4_photo_hook.h"
 #include "doa4_photo_notice.h"
@@ -51,8 +53,10 @@
 #include "doa4_photo_watch.h"
 #include "doa4_photo_win.h"
 #include "doa4_menu.h"
+#include "doa4_setup_dialog.h"
 #include "doa4_tweaks.h"
 #include "doa4_unlocks.h"
+#include "doa4_utf8.h"
 
 REXCVAR_DECLARE(bool, log_noisy);
 
@@ -69,10 +73,84 @@ class DeadOrAlive4App : public rex::ReXApp {
         PPCImageConfig));
   }
 
-  void OnConfigurePaths(rex::PathConfig& paths) override {
-    if (paths.game_data_root.empty()) {
-      paths.game_data_root = "E:/Downloads/doa4/xex/DOA4";
+  // Where the game files are: --game_data_root, else the folder the
+  // first-run setup saved (doa4_game_files), else the setup screen, which
+  // resumes start-up once the user has chosen. The SDK calls this after the
+  // window, the ImGui drawer and the toml exist, before the runtime. See
+  // notes/specs/2026-10-28-first-run-setup-design.md.
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+    const std::filesystem::path saved =
+        doa4::PathFromUtf8(rex::cvar::Query<std::string>("doa4_game_files"));
+    const doa4::gamefiles::StartChoice choice =
+        doa4::gamefiles::ChooseStartPath(defaults.game_data_root, saved, doa4::gamefiles::HasXex);
+    if (!choice.path.empty()) {
+      game_files_ = choice.path;
+      game_files_from_command_line_ = choice.from_command_line;
+      REXLOG_INFO("[doa4][SETUP] game files: {} ({})", doa4::Utf8(choice.path),
+                  choice.from_command_line ? "--game_data_root" : "saved by the setup");
+      rex::PathConfig paths = defaults;
+      paths.game_data_root = choice.path;
+      return paths;
     }
+    REXLOG_INFO("[doa4][SETUP] setup screen: {}",
+                choice.reason.empty() ? std::string("no game files configured") : choice.reason);
+    if (!drawer_) return defaults;  // no window to ask in: the SDK reports the missing path
+    OpenSetup(doa4::SetupHost::Mode::kFirstRun, choice.reason,
+              [this, defaults, resume](const std::filesystem::path& folder) {
+                SaveGameFiles(folder);
+                game_files_ = folder;
+                rex::PathConfig paths = defaults;
+                paths.game_data_root = folder;
+                app_context().CallInUIThreadDeferred([this, paths, resume] {
+                  setup_.reset();
+                  resume(paths);
+                });
+              });
+    return std::nullopt;
+  }
+
+  void OpenSetup(doa4::SetupHost::Mode mode, std::string reason,
+                 std::function<void(const std::filesystem::path&)> done) {
+    doa4::SetupHost host;
+    host.mode = mode;
+    auto* win32 = dynamic_cast<rex::ui::Win32Window*>(window());
+    host.hwnd = win32 ? win32->hwnd() : nullptr;
+    host.reason = std::move(reason);
+    host.current = game_files_;
+    host.defer = [this](std::function<void()> fn) {
+      app_context().CallInUIThreadDeferred(std::move(fn));
+    };
+    host.post = [this](std::function<void()> fn) { app_context().CallInUIThread(std::move(fn)); };
+    host.done = std::move(done);
+    host.close = [this, mode] {
+      if (mode == doa4::SetupHost::Mode::kFirstRun) {
+        REXLOG_INFO("[doa4][SETUP] quit from the setup screen");
+        app_context().QuitFromUIThread();
+      } else {
+        setup_.reset();
+      }
+    };
+    host.log = [](const std::string& line) { REXLOG_INFO("[doa4][SETUP] {}", line); };
+    setup_ = std::make_unique<doa4::SetupDialog>(drawer_, std::move(host));
+  }
+
+  // Saves the chosen folder as doa4_game_files. A failure is logged; the game
+  // still starts with the folder, and the setup screen opens again next time.
+  void SaveGameFiles(const std::filesystem::path& folder) {
+    const std::string error = doa4::SaveTomlKey(ConfigPath(), "doa4_game_files",
+                                                doa4::TomlString(doa4::Utf8(folder)));
+    if (error.empty()) {
+      REXLOG_INFO("[doa4][SETUP] saved doa4_game_files = {}", doa4::Utf8(folder));
+    } else {
+      REXLOG_WARN("[doa4][SETUP] could not save doa4_game_files ({}); the setup screen will "
+                  "open again next time",
+                  error);
+    }
+  }
+
+  std::filesystem::path ConfigPath() {
+    return rex::filesystem::GetExecutableFolder() / (GetName() + ".toml");
   }
 
   // Override virtual hooks for customization:
@@ -367,6 +445,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
 
   void ToggleMenu() {
+    if (setup_) return;  // the setup screen is up: nothing else to show yet
     if (menu_) {
       CloseMenu();
       return;
@@ -425,6 +504,11 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
 
  private:
+  // First-run setup (doa4_setup_dialog.h): the screen while it is open, and
+  // the folder the game started from.
+  std::unique_ptr<doa4::SetupDialog> setup_;
+  std::filesystem::path game_files_;
+  bool game_files_from_command_line_ = false;
   std::unique_ptr<doa4::DiagOverlayDialog> diag_overlay_;
   std::unique_ptr<doa4::MenuDialog> menu_;
   std::atomic<bool> menu_open_{false};

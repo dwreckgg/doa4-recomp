@@ -99,6 +99,14 @@ class Flow {
   gamefiles::Progress progress_;
 };
 
+// The DOA4_SETUP_TEST switch (see doa4_setup_dialog.h): "folder=<path>" or
+// "iso=<path>|target=<path>" (ASCII paths). Unset or malformed: nothing set.
+struct TestScript {
+  std::optional<std::filesystem::path> folder, iso, target;
+  bool active() const { return folder.has_value() || (iso.has_value() && target.has_value()); }
+};
+TestScript ParseTestScript(const char* value);
+
 // "7.5 GB" (GiB, one decimal).
 std::string FormatGB(uint64_t bytes);
 

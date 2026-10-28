@@ -30,6 +30,11 @@ set(DEADORALIVE4_SOURCES
     src/doa4_photo_notice.cpp
     src/doa4_photo_watch.cpp
     src/doa4_photo_hook.cpp
+    src/doa4_xdvdfs.cpp
+    src/doa4_gamefiles.cpp
+    src/doa4_setup_flow.cpp
+    src/doa4_setup_win.cpp
+    src/doa4_setup_dialog.cpp
 )
 
 if(WIN32)

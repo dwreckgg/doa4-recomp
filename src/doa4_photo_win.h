@@ -25,10 +25,12 @@ bool ReadImage(const std::filesystem::path& path, Image* image);
 // <the user's Pictures folder>\DOA4, or empty if Windows does not say.
 std::filesystem::path DefaultPhotoDir();
 
-// The Windows folder dialog, owned by `owner_hwnd` (may be null). Must be
-// called on the UI thread. nullopt when cancelled or on failure.
+// The Windows folder dialog, owned by `owner_hwnd` (may be null), titled
+// `title`. Must be called on the UI thread. nullopt when cancelled or on
+// failure.
 std::optional<std::filesystem::path> PickFolder(void* owner_hwnd,
-                                                const std::filesystem::path& start);
+                                                const std::filesystem::path& start,
+                                                const wchar_t* title = L"Folder for DOA4 photos");
 
 // Opens `dir` in Explorer.
 void OpenInExplorer(const std::filesystem::path& dir);

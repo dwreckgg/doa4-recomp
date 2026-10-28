@@ -2,6 +2,9 @@
 // Built and run by run_toml_upsert_test.bat.
 
 #include "../../src/doa4_config.h"
+#include "../../src/doa4_utf8.h"
+
+#include <toml++/toml.hpp>
 
 #include <cstdio>
 #include <filesystem>
@@ -120,12 +123,46 @@ static void TestSaveKeepsFileLoadable() {
   std::filesystem::remove_all(dir);
 }
 
+// The game-files folder saved by the first-run setup: written with
+// TomlString(Utf8(path)), read back by toml++ (as the SDK does) and turned
+// into a path with PathFromUtf8 - the same folder, backslashes and non-ANSI
+// names included.
+static void TestGameFilesPathRoundTrip() {
+  auto dir = std::filesystem::temp_directory_path() / "doa4_toml_upsert_test_data";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  auto path = dir / "dead_or_alive_4.toml";
+  const std::filesystem::path folders[] = {
+      std::filesystem::path(L"C:\\Users\\fsop1\\doa4\\xex\\DOA4"),
+      std::filesystem::path(u8"D:\\\u30b2\u30fc\u30e0\\DOA4 \"copy\""),
+  };
+  for (const auto& folder : folders) {
+    CHECK(SaveInto(path, "fullscreen = true\n", "doa4_game_files",
+                   doa4::TomlString(doa4::Utf8(folder)).c_str())
+              .empty());
+    toml::table table;
+    try {
+      table = toml::parse_file(path.u8string());
+    } catch (const toml::parse_error& e) {
+      std::printf("FAIL toml++ rejected the file: %s\n", e.what());
+      ++g_failures;
+      continue;
+    }
+    const auto value = table["doa4_game_files"].value<std::string>();
+    CHECK(value.has_value());
+    if (value) CHECK(doa4::PathFromUtf8(*value) == folder);
+    CHECK(table["fullscreen"].value<bool>() == true);
+  }
+  std::filesystem::remove_all(dir);
+}
+
 int main() {
   TestUpsert();
   TestTomlString();
   try {
     TestSave();
     TestSaveKeepsFileLoadable();
+    TestGameFilesPathRoundTrip();
   } catch (const std::exception& e) {
     std::printf("FAIL TestSave threw: %s\n", e.what());
     ++g_failures;

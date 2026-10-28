@@ -17,6 +17,31 @@ std::string FormatGB(uint64_t bytes) {
   return text;
 }
 
+TestScript ParseTestScript(const char* value) {
+  TestScript script;
+  if (!value) return script;
+  std::string_view rest(value);
+  while (!rest.empty()) {
+    const size_t bar = rest.find('|');
+    const std::string_view item = rest.substr(0, bar);
+    rest = bar == std::string_view::npos ? std::string_view() : rest.substr(bar + 1);
+    const size_t eq = item.find('=');
+    if (eq == std::string_view::npos || eq + 1 == item.size()) return {};
+    const std::string_view key = item.substr(0, eq);
+    const fs::path path(std::string(item.substr(eq + 1)));
+    if (key == "folder") {
+      script.folder = path;
+    } else if (key == "iso") {
+      script.iso = path;
+    } else if (key == "target") {
+      script.target = path;
+    } else {
+      return {};
+    }
+  }
+  return script;
+}
+
 std::string VerdictMessage(Verdict verdict, bool image) {
   switch (verdict) {
     case Verdict::kOk:

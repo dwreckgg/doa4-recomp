@@ -171,7 +171,8 @@ std::filesystem::path DefaultPhotoDir() {
 }
 
 std::optional<std::filesystem::path> PickFolder(void* owner_hwnd,
-                                                const std::filesystem::path& start) {
+                                                const std::filesystem::path& start,
+                                                const wchar_t* title) {
   ComScope com(COINIT_APARTMENTTHREADED);
   if (!com.ok()) return std::nullopt;
   ComPtr<IFileOpenDialog> dialog;
@@ -182,7 +183,7 @@ std::optional<std::filesystem::path> PickFolder(void* owner_hwnd,
   DWORD options = 0;
   dialog->GetOptions(&options);
   dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-  dialog->SetTitle(L"Folder for DOA4 photos");
+  dialog->SetTitle(title);
   std::error_code ec;
   if (!start.empty() && std::filesystem::is_directory(start, ec)) {
     ComPtr<IShellItem> folder;
