@@ -21,6 +21,8 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/input/input_system.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
@@ -35,10 +37,12 @@
 #include <rex/system/xthread.h>
 
 #include "doa4_diag_overlay.h"
+#include "doa4_menu.h"
 
 REXCVAR_DECLARE(bool, log_noisy);
 
-extern "C" void doa4_arm_shutdown_watchdog();  // doa4_app_hooks.cpp
+extern "C" void doa4_arm_shutdown_watchdog();       // doa4_app_hooks.cpp
+extern "C" void doa4_wait_for_previous_instance();  // doa4_app_hooks.cpp
 
 class DeadOrAlive4App : public rex::ReXApp {
  public:
@@ -58,7 +62,10 @@ class DeadOrAlive4App : public rex::ReXApp {
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}
-  // void OnPreSetup(rex::RuntimeConfig& config) override {}
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    (void)config;
+    doa4_wait_for_previous_instance();  // after "Restart now" in the menu
+  }
   // void OnLoadXexImage(std::string& xex_image) override {}
   void OnPostSetup() override {
     REXLOG_INFO("[doa4][LIFE] OnPostSetup: runtime ready");
@@ -106,6 +113,8 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
+    rex::ui::UnregisterBind("bind_doa4_menu");
+    menu_.reset();  // before the base app destroys the ImGui drawer
     rex::ui::UnregisterBind("bind_doa4_diag");
     diag_overlay_.reset();  // before the base app destroys the ImGui drawer
     snap_stop_.store(true, std::memory_order_release);
@@ -124,7 +133,58 @@ class DeadOrAlive4App : public rex::ReXApp {
                           [this, drawer] { ToggleDiagOverlay(drawer); });
     const char* env = std::getenv("DOA4_DIAG_OVERLAY");
     if (env && env[0] == '1') ToggleDiagOverlay(drawer);
+
+    // Escape opens the menu, so it cannot also be the keyboard's Start (the
+    // SDK default for keyboard-as-controller); applies whether or not
+    // mnk_mode is on, so turning keyboard play on later cannot clash.
+    if (rex::cvar::Query<std::string>("keybind_start") == "Escape" &&
+        rex::cvar::SetFlagByName("keybind_start", "Return")) {
+      REXLOG_INFO("[doa4][UI] keybind_start Escape -> Return (Escape opens the menu)");
+    }
+    drawer_ = drawer;
+    running_scale_ = rex::cvar::Query<int32_t>("resolution_scale");
+    REXLOG_INFO("[doa4][UI] resolution_scale {} fullscreen {}", running_scale_,
+                rex::cvar::Query<bool>("fullscreen"));
+    rex::ui::RegisterBind("bind_doa4_menu", "Escape", "Toggle DOA4 menu",
+                          [this] { ToggleMenu(); });
+    const char* menu_env = std::getenv("DOA4_MENU_OPEN");  // for tests
+    if (menu_env && menu_env[0] == '1') ToggleMenu();
   }
+
+  void ToggleMenu() {
+    if (menu_) {
+      CloseMenu();
+      return;
+    }
+    if (!drawer_ || !window()) return;
+    doa4::MenuHost host;
+    host.window = window();
+    host.config_path = rex::filesystem::GetExecutableFolder() / (GetName() + ".toml");
+    host.running_scale = running_scale_;
+    host.input = [this]() -> rex::input::InputSystem* {
+      rex::Runtime* rt = runtime();
+      return rt ? dynamic_cast<rex::input::InputSystem*>(rt->input_system()) : nullptr;
+    };
+    host.defer = [this](std::function<void()> fn) {
+      app_context().CallInUIThreadDeferred(std::move(fn));
+    };
+    host.close_menu = [this] { CloseMenu(); };
+    menu_ = std::make_unique<doa4::MenuDialog>(drawer_, std::move(host));
+    menu_open_.store(true, std::memory_order_release);
+    REXLOG_INFO("[doa4][UI] menu opened");
+  }
+
+  void CloseMenu() {
+    if (!menu_) return;
+    menu_open_.store(false, std::memory_order_release);
+    menu_.reset();
+    REXLOG_INFO("[doa4][UI] menu closed");
+  }
+
+  // The game sees an untouched controller and keyboard while the menu is open
+  // (the button pressed to remap something must not also act in the game).
+  // Called from the guest's input polls: reads only the atomic.
+  bool OnBlocksGuestInput() override { return menu_open_.load(std::memory_order_acquire); }
 
   void ToggleDiagOverlay(rex::ui::ImGuiDrawer* drawer) {
     if (diag_overlay_) {
@@ -138,6 +198,10 @@ class DeadOrAlive4App : public rex::ReXApp {
 
  private:
   std::unique_ptr<doa4::DiagOverlayDialog> diag_overlay_;
+  std::unique_ptr<doa4::MenuDialog> menu_;
+  std::atomic<bool> menu_open_{false};
+  rex::ui::ImGuiDrawer* drawer_ = nullptr;
+  int running_scale_ = 1;
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
 

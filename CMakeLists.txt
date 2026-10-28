@@ -17,6 +17,7 @@ set(DEADORALIVE4_SOURCES
     src/doa4_debug_hooks.cpp
     src/doa4_diag_overlay.cpp
     src/doa4_config.cpp
+    src/doa4_menu.cpp
 )
 
 if(WIN32)
