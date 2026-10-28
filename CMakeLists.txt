@@ -28,6 +28,8 @@ set(DEADORALIVE4_SOURCES
     src/doa4_photo_win.cpp
     src/doa4_photo_service.cpp
     src/doa4_photo_notice.cpp
+    src/doa4_photo_watch.cpp
+    src/doa4_photo_hook.cpp
 )
 
 if(WIN32)

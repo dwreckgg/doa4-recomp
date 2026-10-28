@@ -45,8 +45,10 @@
 #include "doa4_diag_overlay.h"
 #include "doa4_extras.h"
 #include "doa4_graphics.h"
+#include "doa4_photo_hook.h"
 #include "doa4_photo_notice.h"
 #include "doa4_photo_service.h"
+#include "doa4_photo_watch.h"
 #include "doa4_photo_win.h"
 #include "doa4_menu.h"
 #include "doa4_tweaks.h"
@@ -113,6 +115,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     REXLOG_INFO("[doa4][LIFE] OnPostLoadXexImage: XEX mapped into guest memory");
     DumpGuestStrings();
     SetUpExtras();  // before any guest code runs: the tweaks patch tables read at boot
+    SetUpSnapshotWatcher();  // before the first guest swap, so the swap counts start together
   }
   void OnPreLaunchModule() override {
     REXLOG_INFO("[doa4][LIFE] OnPreLaunchModule: about to spawn main guest thread");
@@ -130,6 +133,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     rex::ui::UnregisterBind("bind_doa4_menu");
     rex::ui::UnregisterBind("bind_doa4_photo");
     photo_closing_.store(true, std::memory_order_release);
+    doa4::photo::InstallSnapshotWatcher(nullptr);  // the watcher itself lives until exit
     photo_stop_.store(true, std::memory_order_release);
     if (photo_test_thread_.joinable()) photo_test_thread_.join();
     if (photo_) {
@@ -212,6 +216,39 @@ class DeadOrAlive4App : public rex::ReXApp {
     rex::ui::RegisterBind("bind_doa4_photo", "F12", "Save a full-quality photo",
                           [this] { TakePhoto(); });
     StartPhotoTest();
+  }
+
+  // Full-quality copies of in-game snapshots: the guest-swap hook
+  // (doa4_photo_hook.cpp) calls the watcher after every guest swap. Installed
+  // before the guest runs so its swap count matches the GPU's from the start.
+  void SetUpSnapshotWatcher() {
+    doa4::photo::SnapshotWatcher::Hooks hooks;
+    hooks.gpu_swaps = [this]() -> uint32_t {
+      rex::Runtime* rt = runtime();
+      auto* graphics = rt ? dynamic_cast<rex::graphics::GraphicsSystem*>(rt->graphics_system())
+                          : nullptr;
+      rex::graphics::CommandProcessor* processor =
+          graphics ? graphics->command_processor() : nullptr;
+      return processor ? processor->swap_count() : 0;
+    };
+    hooks.capture = [this](doa4::photo::Image* image) { return CaptureFrame(image); };
+    hooks.auto_enabled = [] { return rex::cvar::Query<bool>("doa4_photo_auto"); };
+    hooks.submit = [this](doa4::photo::Image image, doa4::photo::Source source,
+                          std::string suffix) {
+      if (photo_) photo_->SubmitCaptured(std::move(image), source, std::move(suffix));
+    };
+    hooks.log = [](const std::string& line) { REXLOG_INFO("[doa4][PHOTO] {}", line); };
+    hooks.sleep = [] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); };
+    hooks.now_ms = [] {
+      return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count());
+    };
+    const char* debug = std::getenv("DOA4_PHOTO_DEBUG");
+    hooks.debug = debug && debug[0] == '1';
+    if (hooks.debug) REXLOG_INFO("[doa4][PHOTO] snapshot debug on (DOA4_PHOTO_DEBUG=1)");
+    photo_watcher_ = std::make_unique<doa4::photo::SnapshotWatcher>(std::move(hooks));
+    doa4::photo::InstallSnapshotWatcher(photo_watcher_.get());
   }
 
   // F12: the current frame, saved by the worker.
@@ -410,6 +447,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::atomic<bool> photo_closing_{false};  // set at shutdown: no new notices
   std::atomic<bool> photo_stop_{false};
   std::thread photo_test_thread_;  // DOA4_PHOTO_TEST only
+  std::unique_ptr<doa4::photo::SnapshotWatcher> photo_watcher_;  // used by the swap hook
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
 
