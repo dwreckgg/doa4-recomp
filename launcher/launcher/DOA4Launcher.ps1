@@ -299,7 +299,7 @@ $bInstall.Add_Click({
         Start-Background 'plan' @{ ShortcutFolder = '' }
     })
 $bUpdate.Add_Click({
-        Show-Steps @('Tools', 'Local changes', 'Update', 'Build')
+        Show-Steps @('Tools', 'Sources', 'Local changes', 'Update', 'Build')
         Start-Background 'update' @{ ShortcutFolder = '' }
     })
 $bGameFiles.Add_Click({ [void](Invoke-ChangeGameFiles) })

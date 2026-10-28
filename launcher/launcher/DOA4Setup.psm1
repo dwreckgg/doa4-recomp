@@ -1339,6 +1339,20 @@ function Invoke-DOA4Update {
         Set-DOA4Step $Ctx $step 'done' 'present'
         $vs = Get-DOA4Tool $status 'vs'
 
+        # Install's rule: a folder builds the repository it was cloned from. A changed URL in
+        # config.ps1 is a new source, installed into a new DOA4 folder (never fetched here).
+        $step = 'Sources'
+        foreach ($repo in @(@{ Name = 'doa4-recomp'; Path = $Ctx.GamePath; Url = $c.GameRepoUrl }, @{ Name = 'rexglue-sdk'; Path = $Ctx.SdkPath; Url = $c.SdkRepoUrl })) {
+            $origin = Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $repo.Path, 'remote', 'get-url', 'origin')
+            $originUrl = [string](@($origin.Output) | Select-Object -First 1)
+            if ($origin.ExitCode -ne 0 -or -not $originUrl -or (ConvertTo-DOA4UrlKey $originUrl) -ne (ConvertTo-DOA4UrlKey ([string]$repo.Url))) {
+                $msg = ('Not updated: {0} is a clone of {1}, but config.ps1 names {2}. To build that source, unpack the launcher into a new DOA4 folder and run setup there; this folder keeps building {1}.' -f $repo.Name, $originUrl, $repo.Url)
+                Set-DOA4Step $Ctx $step 'failed' $msg
+                return New-DOA4StepResult $false $step $msg $Ctx
+            }
+        }
+        Set-DOA4Step $Ctx $step 'done' 'as in config.ps1'
+
         $step = 'Local changes'
         $blockers = Get-DOA4UpdateBlockers $Ctx
         if ($blockers.Foreign.Count -gt 0) {
