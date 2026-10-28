@@ -66,12 +66,6 @@ inline constexpr std::array<Choice, 3> kFormats = {{
     {"PNG, full render size", "png_full"},
     {"JPG, full render size", "jpg_full"},
 }};
-enum class Framing { kCrop, kFull, kBoth };
-inline constexpr std::array<Choice, 3> kFramings = {{
-    {"3:2, like the game's photo", "crop"},
-    {"16:9, the whole frame", "full"},
-    {"Both", "both"},
-}};
 // The row for a saved value; row 0 (the default) when unknown.
 int ChoiceIndex(const std::array<Choice, 3>& choices, std::string_view value);
 

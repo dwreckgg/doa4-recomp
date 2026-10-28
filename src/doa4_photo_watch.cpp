@@ -20,22 +20,26 @@ void SnapshotWatcher::OnSwap(uint32_t state) {
   }
   last_state_ = state;
 
-  if (debug_next_ != 0 && n == debug_next_) {
-    debug_next_ = 0;
+  // The swap after the edge shows the finished photo in the game's photo
+  // panel (the user's Watch Mode test: the edge frame's photo area is black).
+  if (photo_swap_ != 0 && n == photo_swap_) {
+    photo_swap_ = 0;
     Image frame;
-    if (WaitAndCapture(n, &frame)) hooks_.submit(std::move(frame), Source::kDebug, "n1");
+    if (WaitAndCapture(n, &frame)) {
+      if (hooks_.debug) hooks_.submit(photo_copy_ ? frame : std::move(frame), Source::kDebug, "n1");
+      if (photo_copy_) hooks_.submit(std::move(frame), Source::kSnapshot, "");
+    }
   }
 
   if (!edge_.OnSwap(state)) return;
   const bool copy = hooks_.auto_enabled();
   if (!copy && !hooks_.debug) return;
-  Image frame;
-  if (!WaitAndCapture(n, &frame)) return;
+  photo_copy_ = copy;
+  photo_swap_ = n + 1;
   if (hooks_.debug) {
-    hooks_.submit(copy ? frame : std::move(frame), Source::kDebug, "n");
-    debug_next_ = n + 1;
+    Image frame;
+    if (WaitAndCapture(n, &frame)) hooks_.submit(std::move(frame), Source::kDebug, "n");
   }
-  if (copy) hooks_.submit(std::move(frame), Source::kSnapshot, "");
 }
 
 bool SnapshotWatcher::WaitAndCapture(uint32_t n, Image* image) {

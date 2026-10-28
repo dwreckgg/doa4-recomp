@@ -24,13 +24,12 @@ namespace doa4::photo {
 
 struct Settings {
   Format format = Format::kPngMonitor;
-  Framing framing = Framing::kCrop;  // for copies of in-game snapshots
   std::filesystem::path dir;         // never empty when handed to the service
 };
 
 enum class Source {
   kHotkey,    // the whole 16:9 frame
-  kSnapshot,  // a copy of an in-game snapshot, framed by Settings::framing
+  kSnapshot,  // a copy of an in-game snapshot: the game's 3:2 photo area
   kDebug,     // DOA4_PHOTO_DEBUG frames: the whole frame, the given suffix
 };
 
@@ -42,7 +41,8 @@ struct Output {
 };
 
 // The files one captured frame becomes, by source and settings: the framing
-// (snapshot copies), then the format (png_monitor fits the image inside the
+// (snapshot copies: the game's 3:2 photo area; the rest of that frame is the
+// game's photo panel), then the format (png_monitor fits the image inside the
 // monitor without upscaling; *_full keep the captured size).
 std::vector<Output> PlanOutputs(const Image& frame, Source source, const std::string& suffix,
                                 const Settings& settings, Size monitor);

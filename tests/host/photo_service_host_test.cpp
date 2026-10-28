@@ -46,30 +46,18 @@ static void TestPlanOutputs() {
   s.format = Format::kJpgFull;
   out = PlanOutputs(frame, Source::kHotkey, "", s, monitor);
   CHECK(out[0].image.width == 1280 && out[0].type == FileType::kJpg);
-  // The hotkey ignores the snapshot framing.
-  s.framing = Framing::kBoth;
-  CHECK(PlanOutputs(frame, Source::kHotkey, "", s, monitor).size() == 1);
-
-  // Snapshot copies: the game's 3:2 crop (750x500 of 1280x720), then the format.
+  // Snapshot copies: always the game's 3:2 crop (750x500 of 1280x720), then
+  // the format.
   s.format = Format::kPngFull;
-  s.framing = Framing::kCrop;
   out = PlanOutputs(frame, Source::kSnapshot, "", s, monitor);
   CHECK(out.size() == 1 && out[0].suffix == "photo");
   CHECK(out[0].image.width == 750 && out[0].image.height == 500);
   s.format = Format::kPngMonitor;
   out = PlanOutputs(frame, Source::kSnapshot, "", s, monitor);
   CHECK(out[0].image.width == 540 && out[0].image.height == 360);  // 3:2 fitted to 640x360
-  s.framing = Framing::kFull;
-  out = PlanOutputs(frame, Source::kSnapshot, "", s, monitor);
-  CHECK(out.size() == 1 && out[0].suffix == "full" && out[0].image.width == 640);
-  s.framing = Framing::kBoth;
   s.format = Format::kJpgFull;
   out = PlanOutputs(frame, Source::kSnapshot, "", s, monitor);
-  CHECK(out.size() == 2);
-  if (out.size() == 2) {
-    CHECK(out[0].suffix == "photo" && out[0].image.width == 750 && out[0].type == FileType::kJpg);
-    CHECK(out[1].suffix == "full" && out[1].image.width == 1280);
-  }
+  CHECK(out.size() == 1 && out[0].type == FileType::kJpg && out[0].image.width == 750);
 
   // Debug frames: the whole frame with the given suffix, whatever the framing.
   out = PlanOutputs(frame, Source::kDebug, "n1", s, monitor);
@@ -158,11 +146,10 @@ static void TestServiceEndToEnd() {
     service.Flush();
     CHECK(fs::exists(h.dir / "photos" / "DOA4_2026-10-28_09-05-07_2.jpg"));
 
-    // An in-game snapshot copy, both framings: two files, the service does not
-    // capture again (the frame is handed over).
+    // An in-game snapshot copy: the 3:2 photo; the service does not capture
+    // again (the frame is handed over).
     {
       std::lock_guard<std::mutex> lock(h.mutex);
-      h.settings.framing = Framing::kBoth;
       h.settings.format = Format::kPngFull;
     }
     const int before = h.captures;
@@ -171,8 +158,7 @@ static void TestServiceEndToEnd() {
     CHECK(h.captures == before);
     CHECK(ReadImage(h.dir / "photos" / "DOA4_2026-10-28_09-05-07_photo.png", &back) &&
           back.width == 750 && back.height == 500);
-    CHECK(ReadImage(h.dir / "photos" / "DOA4_2026-10-28_09-05-07_full.png", &back) &&
-          back.width == 1280);
+    CHECK(!fs::exists(h.dir / "photos" / "DOA4_2026-10-28_09-05-07_full.png"));
 
     // A failed capture: an error result, no new file.
     h.capture_ok = false;

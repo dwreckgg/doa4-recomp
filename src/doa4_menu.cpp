@@ -467,7 +467,13 @@ void MenuDialog::DrawPhotoTab() {
   }
   ImGui::SameLine();
   if (ImGui::Button("Open folder")) {
-    photo::OpenInExplorer(folder);
+    // Close the menu first: while it is open the game is drawn from the UI
+    // thread, and with Explorer in front the picture stopped until the menu
+    // closed. After this frame, not inside the menu's drawing.
+    host_.defer([close = host_.close_menu, folder] {
+      if (close) close();
+      photo::OpenInExplorer(folder);
+    });
   }
   if (!custom.empty()) {
     ImGui::SameLine();
@@ -482,18 +488,7 @@ void MenuDialog::DrawPhotoTab() {
                       &auto_copy)) {
     SaveThenSet("doa4_photo_auto", auto_copy ? "true" : "false", false);
   }
-  ImGui::BeginDisabled(!auto_copy);
-  ImGui::PushID("photo_framing");
-  const int framing = photo::ChoiceIndex(
-      photo::kFramings, rex::cvar::Query<std::string>("doa4_photo_auto_framing"));
-  for (int i = 0; i < int(photo::kFramings.size()); ++i) {
-    if (ImGui::RadioButton(photo::kFramings[i].label, framing == i) && framing != i) {
-      SaveThenSet("doa4_photo_auto_framing", photo::kFramings[i].value, true);
-    }
-  }
-  ImGui::PopID();
-  ImGui::EndDisabled();
-  ImGui::TextDisabled("3:2 matches the photo the game keeps in its Album.");
+  ImGui::TextDisabled("The copy is the game's 3:2 photo, at the render scale's full quality.");
 
   if (host_.photo_result) {
     const photo::Result result = host_.photo_result();

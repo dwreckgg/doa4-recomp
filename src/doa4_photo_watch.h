@@ -3,10 +3,12 @@
 // doa4_photo_hook.cpp). No SDK headers: the app hands it the GPU's swap count,
 // the frame capture and the service, so a host test drives it.
 //
-// At the swap where the game's snapshot state turns from 1 to 2 (the frame
-// that shows the finished 30-frame photo), the guest thread is held until the
-// GPU has processed that swap, so the captured frame is that one and not the
-// next; then the frame goes to the service. The game is already in its slowed
+// The game's snapshot state turns from 1 to 2 at swap n, when its 30-frame
+// photo is finished; swap n still shows the photo area black, and swap n + 1
+// shows the finished photo in the game's photo panel (measured with
+// DOA4_PHOTO_DEBUG in Watch Mode). At swap n + 1 the guest thread is held
+// until the GPU has processed that swap, so the captured frame is that one and
+// not the next; then the frame goes to the service. The game is already in its slowed
 // snapshot moment, so the short hold is not felt.
 
 #pragma once
@@ -52,7 +54,8 @@ class SnapshotWatcher {
   SnapshotEdge edge_;
   uint32_t swaps_ = 0;
   uint32_t last_state_ = 0;
-  uint32_t debug_next_ = 0;  // swap whose frame the debug mode also saves (n + 1)
+  uint32_t photo_swap_ = 0;   // the swap that shows the finished photo (n + 1), or 0
+  bool photo_copy_ = false;   // whether that frame is copied (doa4_photo_auto at the edge)
 };
 
 }  // namespace doa4::photo

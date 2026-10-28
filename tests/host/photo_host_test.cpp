@@ -114,9 +114,6 @@ static void TestChoices() {
   CHECK(ChoiceIndex(kFormats, "png_monitor") == 0);
   CHECK(ChoiceIndex(kFormats, "jpg_full") == 2);
   CHECK(ChoiceIndex(kFormats, "bmp") == 0);
-  CHECK(ChoiceIndex(kFramings, "both") == 2);
-  CHECK(ChoiceIndex(kFramings, "") == 0);
-  CHECK(std::string(kFramings[0].value) == "crop");
 }
 
 static void TestSnapshotEdge() {

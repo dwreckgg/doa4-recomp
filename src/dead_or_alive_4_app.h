@@ -280,8 +280,6 @@ class DeadOrAlive4App : public rex::ReXApp {
     doa4::photo::Settings settings;
     settings.format = doa4::photo::Format(doa4::photo::ChoiceIndex(
         doa4::photo::kFormats, rex::cvar::Query<std::string>("doa4_photo_format")));
-    settings.framing = doa4::photo::Framing(doa4::photo::ChoiceIndex(
-        doa4::photo::kFramings, rex::cvar::Query<std::string>("doa4_photo_auto_framing")));
     const std::string dir = rex::cvar::Query<std::string>("doa4_photo_dir");
     settings.dir = dir.empty() ? doa4::photo::DefaultPhotoDir()
                                : std::filesystem::path(

@@ -19,6 +19,3 @@ REXCVAR_DEFINE_STRING(doa4_photo_dir, "", "DOA4",
                       "Folder for photos (empty: the Pictures folder's DOA4 folder)");
 REXCVAR_DEFINE_BOOL(doa4_photo_auto, false, "DOA4",
                     "Also save a full-quality copy when an in-game snapshot is taken");
-REXCVAR_DEFINE_STRING(doa4_photo_auto_framing, "crop", "DOA4",
-                      "Framing of in-game snapshot copies: crop (3:2), full (16:9) or both")
-    .allowed({"crop", "full", "both"});

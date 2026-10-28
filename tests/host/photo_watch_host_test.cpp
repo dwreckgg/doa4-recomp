@@ -69,17 +69,20 @@ static void TestCapturesTheFinishedFrame() {
   SnapshotWatcher w(rig.Hooks(false));
   for (int i = 0; i < 10; ++i) rig.Swap(w, 0);
   for (int i = 0; i < 30; ++i) rig.Swap(w, 1);  // the 30 blended frames
-  rig.Swap(w, 2);                                // swap 41: the finished photo
+  rig.Swap(w, 2);  // swap 41: the state turns to 2 (the photo area is still black)
+  CHECK(rig.submitted.empty());
+  rig.Swap(w, 2);  // swap 42: the finished photo is shown in the photo panel
   rig.Swap(w, 2);
   CHECK(rig.submitted.size() == 1);
   if (rig.submitted.size() == 1) {
-    // Captured after the GPU reached swap 41, and not later: frame 41 exactly.
-    CHECK(rig.submitted[0].first == 41);
+    // Captured after the GPU reached swap 42, and not later: frame 42 exactly
+    // (seen in the user's Watch Mode test: frame n is the black photo area).
+    CHECK(rig.submitted[0].first == 42);
     CHECK(rig.submitted[0].second.empty());
     CHECK(rig.sources[0] == Source::kSnapshot);
   }
   CHECK(rig.sleeps == 3);  // held while the GPU caught up the 3 swaps it lagged
-  CHECK(w.swaps() == 42);
+  CHECK(w.swaps() == 43);
 }
 
 static void TestOffMeansNoHold() {
@@ -98,6 +101,7 @@ static void TestTimeout() {
   SnapshotWatcher w(rig.Hooks(false));
   for (int i = 0; i < 5; ++i) rig.Swap(w, 1);
   rig.Swap(w, 2);
+  rig.Swap(w, 2);  // the photo frame: the wait for the GPU happens here
   CHECK(rig.submitted.empty());
   // Held no longer than the limit, and it says so.
   CHECK(rig.clock <= 501);  // the spec's 500 ms, not the code's own constant
@@ -135,11 +139,15 @@ static void TestDebugAndAutoShareOneCapture() {
   rig.Swap(w, 1);
   rig.Swap(w, 2);
   rig.Swap(w, 2);
-  // The photo frame goes to the service twice (copy + debug), the next once.
+  // The edge frame once (debug "n"); the photo frame twice (debug "n1" and
+  // the copy), from one capture.
   CHECK(rig.submitted.size() == 3);
   if (rig.submitted.size() == 3) {
-    CHECK(rig.submitted[0].first == 2 && rig.submitted[1].first == 2);
-    CHECK(rig.submitted[2].first == 3 && rig.submitted[2].second == "n1");
+    CHECK(rig.submitted[0].first == 2 && rig.submitted[0].second == "n");
+    CHECK(rig.submitted[1].first == 3 && rig.submitted[2].first == 3);
+    int copies = 0;
+    for (const Source s : rig.sources) copies += s == Source::kSnapshot;
+    CHECK(copies == 1);
   }
 }
 

@@ -40,10 +40,7 @@ std::vector<Output> PlanOutputs(const Image& frame, Source source, const std::st
       framed.emplace_back(frame, suffix);
       break;
     case Source::kSnapshot:
-      if (settings.framing != Framing::kFull) {
-        framed.emplace_back(Crop(frame, GameCropRect(frame.width, frame.height)), "photo");
-      }
-      if (settings.framing != Framing::kCrop) framed.emplace_back(frame, "full");
+      framed.emplace_back(Crop(frame, GameCropRect(frame.width, frame.height)), "photo");
       break;
   }
   // Then the format.
