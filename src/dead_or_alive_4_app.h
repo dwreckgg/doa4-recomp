@@ -7,8 +7,10 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <string>
@@ -24,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/rex_app.h>
+#include <rex/ui/keybinds.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
@@ -100,19 +103,37 @@ class DeadOrAlive4App : public rex::ReXApp {
                 thread ? thread->thread_id() : 0u);
   }
   void OnShutdown() override {
+    diag_overlay_.reset();  // before the base app destroys the ImGui drawer
     snap_stop_.store(true, std::memory_order_release);
     if (snap_thread_.joinable()) snap_thread_.join();
   }
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
 
+  // The diagnostics overlay is off until F6 (bind_doa4_diag) or
+  // DOA4_DIAG_OVERLAY=1 turns it on: while any ImGui dialog exists the
+  // presenter paints from the UI thread (every guest frame waits for a UI
+  // repaint, and the UI repaints continuously), instead of presenting each
+  // frame straight from the GPU thread.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     if (!drawer) return;
-    // Dialog retains itself on the drawer; raw new is the documented pattern.
-    new doa4::DiagOverlayDialog(drawer);
-    REXLOG_INFO("[doa4][UI] DiagOverlayDialog attached");
+    rex::ui::RegisterBind("bind_doa4_diag", "F6", "Toggle DOA4 diagnostics overlay",
+                          [this, drawer] { ToggleDiagOverlay(drawer); });
+    const char* env = std::getenv("DOA4_DIAG_OVERLAY");
+    if (env && env[0] == '1') ToggleDiagOverlay(drawer);
+  }
+
+  void ToggleDiagOverlay(rex::ui::ImGuiDrawer* drawer) {
+    if (diag_overlay_) {
+      diag_overlay_.reset();
+      REXLOG_INFO("[doa4][UI] DiagOverlayDialog closed");
+    } else {
+      diag_overlay_ = std::make_unique<doa4::DiagOverlayDialog>(drawer);
+      REXLOG_INFO("[doa4][UI] DiagOverlayDialog attached");
+    }
   }
 
  private:
+  std::unique_ptr<doa4::DiagOverlayDialog> diag_overlay_;
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
 
