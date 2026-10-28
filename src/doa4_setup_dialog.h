@@ -56,7 +56,11 @@ class SetupDialog : public rex::ui::ImGuiDialog {
   void LogStage();
 
   SetupHost host_;
-  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);  // guards posts
+  // Guards posts: the destructor resets alive_ on the UI thread while the
+  // worker may be posting, so the worker only ever copies alive_weak_, which
+  // is written once here and never again.
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+  const std::weak_ptr<bool> alive_weak_ = alive_;
   setup::Flow flow_;
   std::thread worker_;
   setup::TestScript test_;

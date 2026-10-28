@@ -11,6 +11,15 @@ namespace doa4::setup {
 namespace fs = std::filesystem;
 using gamefiles::Verdict;
 
+namespace {
+
+// The SDK's runtime cannot start from a path outside the Windows code page.
+constexpr const char* kPlainPathMessage =
+    "This path has characters that this build cannot use. Choose a folder whose path uses plain "
+    "letters and digits.";
+
+}  // namespace
+
 std::string FormatGB(uint64_t bytes) {
   char text[32];
   std::snprintf(text, sizeof(text), "%.1f GB", double(bytes) / double(1ull << 30));
@@ -61,6 +70,11 @@ std::string VerdictMessage(Verdict verdict, bool image) {
              ". The recompiled code matches that exact file; another version would crash.";
     case Verdict::kUnreadable:
       return image ? "The disc image could not be read." : "default.xex could not be read.";
+    case Verdict::kIncomplete:
+      return "This folder holds an unfinished extraction (a .part file). Delete the folder and "
+             "extract the disc image again.";
+    case Verdict::kPathUnsupported:
+      return kPlainPathMessage;
   }
   return {};
 }
@@ -121,11 +135,16 @@ void Flow::OnFolderChecked(const fs::path& dir, Verdict verdict) {
 void Flow::InspectTarget() {
   target_note_.clear();
   free_ = fx_.free_bytes(target_);
+  if (fx_.path_fits && !fx_.path_fits(target_)) {
+    target_note_ = kPlainPathMessage;
+    return;
+  }
   switch (fx_.inspect_target(target_)) {
     case gamefiles::TargetState::kNotEmpty:
       target_note_ =
           "This folder is not empty. Choose an empty or new folder, or go back and use "
-          "\"Choose extracted folder\" if the game is already there.";
+          "\"Choose extracted folder\" if the game is already there. An unfinished earlier "
+          "extraction must be deleted first.";
       return;
     case gamefiles::TargetState::kNotAFolder:
       target_note_ = "This is a file, not a folder. Choose another place.";

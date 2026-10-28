@@ -119,8 +119,18 @@ bool HasXex(const fs::path& dir) {
   return fs::is_regular_file(dir / kXexName, ec);
 }
 
+bool PathFitsCodePage(const fs::path& path) {
+  const std::wstring& text = path.native();
+  if (text.empty() || GetACP() == CP_UTF8) return true;  // UTF-8 code page: everything fits
+  BOOL lossy = FALSE;
+  const int n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, text.data(), int(text.size()),
+                                    nullptr, 0, nullptr, &lossy);
+  return n > 0 && !lossy;
+}
+
 StartChoice ChooseStartPath(const fs::path& command_line, const fs::path& saved,
-                            const std::function<bool(const fs::path&)>& has_xex) {
+                            const std::function<bool(const fs::path&)>& has_xex,
+                            const std::function<bool(const fs::path&)>& fits) {
   StartChoice choice;
   if (!command_line.empty()) {
     if (has_xex(command_line)) {
@@ -133,7 +143,11 @@ StartChoice ChooseStartPath(const fs::path& command_line, const fs::path& saved,
     return choice;
   }
   if (!saved.empty()) {
-    if (has_xex(saved)) {
+    if (fits && !fits(saved)) {
+      choice.reason = "The saved game folder " + Utf8(saved) +
+                      " has characters in its path that this build cannot use. Choose a folder "
+                      "whose path uses plain letters and digits.";
+    } else if (has_xex(saved)) {
       choice.path = saved;
     } else {
       choice.reason = "The game files were not found at " + Utf8(saved) + ".";
@@ -189,7 +203,14 @@ ImageCheck CheckImage(const fs::path& iso, std::string_view expected_sha1) {
 }
 
 Verdict CheckFolder(const fs::path& dir, std::string_view expected_sha1) {
+  if (!PathFitsCodePage(dir)) return Verdict::kPathUnsupported;
   if (!HasXex(dir)) return Verdict::kNoXex;
+  // An extraction that was killed (a crash, power loss) leaves .part files.
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(dir, ec); !ec && it != fs::recursive_directory_iterator();
+       it.increment(ec)) {
+    if (it->path().extension() == ".part") return Verdict::kIncomplete;
+  }
   const auto digest = Sha1OfFile(dir / kXexName);
   if (!digest) return Verdict::kUnreadable;
   return *digest == expected_sha1 ? Verdict::kOk : Verdict::kWrongVersion;
@@ -233,10 +254,20 @@ ExtractResult Extract(xdvdfs::Source& image, const xdvdfs::Volume& volume, const
   };
   if (!created.MakeFolders(target)) return fail("Could not create the folder " + Utf8(target) + ".");
 
+  // default.xex goes last: until every other file is complete the target
+  // holds no default.xex, so a killed extraction never looks like the game.
+  std::vector<const xdvdfs::Entry*> order;
+  const xdvdfs::Entry* xex = xdvdfs::FindFile(volume, kXexName);
+  for (const auto& entry : volume.entries) {
+    if (&entry != xex) order.push_back(&entry);
+  }
+  if (xex) order.push_back(xex);
+
   Progress p;
   p.total = volume.file_bytes;
   std::vector<char> buf;
-  for (const auto& entry : volume.entries) {
+  for (const xdvdfs::Entry* entry_ptr : order) {
+    const xdvdfs::Entry& entry = *entry_ptr;
     if (cancel.load()) return cancelled();
     fs::path out = target;
     for (size_t start = 0;;) {

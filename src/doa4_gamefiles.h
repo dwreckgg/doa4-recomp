@@ -51,10 +51,17 @@ struct StartChoice {
 
 // The command line's --game_data_root first (used when it holds default.xex;
 // otherwise the setup screen, naming it), then the saved doa4_game_files (the
-// same), then the setup screen.
+// same), then the setup screen. With `fits` (PathFitsCodePage in the game), a
+// saved folder it rejects opens the setup screen with that reason.
 StartChoice ChooseStartPath(const std::filesystem::path& command_line,
                             const std::filesystem::path& saved,
-                            const std::function<bool(const std::filesystem::path&)>& has_xex);
+                            const std::function<bool(const std::filesystem::path&)>& has_xex,
+                            const std::function<bool(const std::filesystem::path&)>& fits = {});
+
+// The path converts to the Windows ANSI code page without loss. The SDK's
+// runtime turns the game folder into ANSI text while it starts and throws
+// (ending the game) on a name it cannot convert, so such folders are refused.
+bool PathFitsCodePage(const std::filesystem::path& path);
 
 // What the Esc menu's Game tab shows: the folder in use, a note (UTF-8; empty
 // for none) and whether Change is offered. `saved` is doa4_game_files now
@@ -74,6 +81,8 @@ enum class Verdict {
   kNoXex,         // no default.xex in it
   kWrongVersion,  // default.xex is not the supported one
   kUnreadable,    // the file or folder could not be read
+  kIncomplete,    // a folder still holding a .part file (an interrupted extraction)
+  kPathUnsupported,  // a folder whose path PathFitsCodePage rejects
 };
 
 struct ImageCheck {

@@ -156,6 +156,32 @@ static void TestGameFilesPathRoundTrip() {
   std::filesystem::remove_all(dir);
 }
 
+// The SDK's F4 overlay "Save to config" writes string cvars as
+// `name = "<raw value>"` without escaping (rexglue-sdk cvar.cpp), and the
+// loader drops the WHOLE file on a parse error (final review M1). The game
+// folder is therefore saved in generic form (forward slashes): that raw line
+// must parse back to the same folder.
+static void TestGameFilesSurvivesTheSdkWriter() {
+  const std::filesystem::path folders[] = {
+      std::filesystem::path(L"C:\\Users\\fsop1\\doa4\\xex\\DOA4"),
+      std::filesystem::path(u8"D:\\\u30b2\u30fc\u30e0\\DOA4"),
+  };
+  for (const auto& folder : folders) {
+    const std::string text = doa4::Utf8Generic(folder);
+    CHECK(text.find('\\') == std::string::npos);
+    const std::string sdk_line = "doa4_game_files = \"" + text + "\"\n";
+    try {
+      toml::table table = toml::parse(sdk_line);
+      const auto value = table["doa4_game_files"].value<std::string>();
+      CHECK(value == text);
+      if (value) CHECK(doa4::PathFromUtf8(*value) == folder);
+    } catch (const toml::parse_error& e) {
+      std::printf("FAIL the SDK writer's line does not parse: %s\n", e.what());
+      ++g_failures;
+    }
+  }
+}
+
 int main() {
   TestUpsert();
   TestTomlString();
@@ -163,6 +189,7 @@ int main() {
     TestSave();
     TestSaveKeepsFileLoadable();
     TestGameFilesPathRoundTrip();
+    TestGameFilesSurvivesTheSdkWriter();
   } catch (const std::exception& e) {
     std::printf("FAIL TestSave threw: %s\n", e.what());
     ++g_failures;

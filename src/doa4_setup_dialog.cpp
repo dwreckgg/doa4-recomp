@@ -56,10 +56,12 @@ SetupDialog::SetupDialog(rex::ui::ImGuiDrawer* drawer, SetupHost host)
 }
 
 SetupDialog::~SetupDialog() {
+  const bool extracting = flow_.stage() == Stage::kExtracting;
   flow_.Cancel();
   *alive_ = false;
   alive_.reset();
-  if (worker_.joinable()) worker_.join();
+  if (worker_.joinable()) worker_.join();  // a cancelled copy has removed its files by now
+  if (extracting && host_.log) host_.log("closed while extracting: cancelled, partial copy removed");
 }
 
 setup::Effects SetupDialog::MakeEffects() {
@@ -77,7 +79,7 @@ setup::Effects SetupDialog::MakeEffects() {
     worker_ = std::thread(std::move(work));
   };
   fx.post = [this](std::function<void()> fn) {
-    std::weak_ptr<bool> alive = alive_;
+    std::weak_ptr<bool> alive = alive_weak_;
     host_.post([alive, fn = std::move(fn)] {
       if (auto a = alive.lock(); a && *a) fn();
     });
@@ -86,6 +88,7 @@ setup::Effects SetupDialog::MakeEffects() {
   fx.check_folder = [](const fs::path& dir) { return gamefiles::CheckFolder(dir); };
   fx.inspect_target = [](const fs::path& t) { return gamefiles::InspectTarget(t); };
   fx.free_bytes = [](const fs::path& t) { return setup::FreeBytes(t); };
+  fx.path_fits = [](const fs::path& t) { return gamefiles::PathFitsCodePage(t); };
   fx.extract = [](const fs::path& iso, const xdvdfs::Volume& volume, const fs::path& target,
                   const std::atomic<bool>& cancel,
                   const std::function<void(const gamefiles::Progress&)>& progress) {

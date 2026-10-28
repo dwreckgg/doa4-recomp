@@ -45,6 +45,8 @@ struct Effects {
   std::function<gamefiles::Verdict(const std::filesystem::path& dir)> check_folder;
   std::function<gamefiles::TargetState(const std::filesystem::path& target)> inspect_target;
   std::function<std::optional<uint64_t>(const std::filesystem::path& target)> free_bytes;
+  // The game can start from this path (gamefiles::PathFitsCodePage).
+  std::function<bool(const std::filesystem::path& target)> path_fits;
   std::function<gamefiles::ExtractResult(
       const std::filesystem::path& iso, const xdvdfs::Volume& volume,
       const std::filesystem::path& target, const std::atomic<bool>& cancel,

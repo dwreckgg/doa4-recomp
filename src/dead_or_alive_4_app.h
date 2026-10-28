@@ -83,7 +83,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     const std::filesystem::path saved =
         doa4::PathFromUtf8(rex::cvar::Query<std::string>("doa4_game_files"));
     const doa4::gamefiles::StartChoice choice =
-        doa4::gamefiles::ChooseStartPath(defaults.game_data_root, saved, doa4::gamefiles::HasXex);
+        doa4::gamefiles::ChooseStartPath(defaults.game_data_root, saved, doa4::gamefiles::HasXex,
+                                         doa4::gamefiles::PathFitsCodePage);
     if (!choice.path.empty()) {
       game_files_ = choice.path;
       game_files_from_command_line_ = choice.from_command_line;
@@ -155,13 +156,16 @@ class DeadOrAlive4App : public rex::ReXApp {
   // Saves the chosen folder as doa4_game_files (the file, then the cvar the
   // Game tab reads). Returns "" or the failure, which is also logged; after a
   // first-run failure the game still starts with the folder, and the setup
-  // screen opens again next time.
+  // screen opens again next time. Saved with forward slashes: the SDK's F4
+  // "Save to config" writes strings unescaped, and a backslash there would
+  // make the loader drop the whole file.
   std::string SaveGameFiles(const std::filesystem::path& folder) {
-    const std::string error = doa4::SaveTomlKey(ConfigPath(), "doa4_game_files",
-                                                doa4::TomlString(doa4::Utf8(folder)));
+    const std::string text = doa4::Utf8Generic(folder);
+    const std::string error =
+        doa4::SaveTomlKey(ConfigPath(), "doa4_game_files", doa4::TomlString(text));
     if (error.empty()) {
-      rex::cvar::SetFlagByName("doa4_game_files", doa4::Utf8(folder));
-      REXLOG_INFO("[doa4][SETUP] saved doa4_game_files = {}", doa4::Utf8(folder));
+      rex::cvar::SetFlagByName("doa4_game_files", text);
+      REXLOG_INFO("[doa4][SETUP] saved doa4_game_files = {}", text);
     } else {
       REXLOG_WARN("[doa4][SETUP] could not save doa4_game_files ({}); the setup screen will "
                   "open again next time",
@@ -243,6 +247,12 @@ class DeadOrAlive4App : public rex::ReXApp {
     if (photo_) {
       const size_t dropped = photo_->Stop();
       if (dropped) REXLOG_WARN("[doa4][PHOTO] {} queued photo(s) dropped at shutdown", dropped);
+    }
+    if (setup_) {
+      // Before the base app destroys the ImGui drawer; also cancels a running
+      // extraction and waits for its clean-up.
+      REXLOG_INFO("[doa4][SETUP] setup screen closed at shutdown");
+      CloseSetup();
     }
     photo_notice_.reset();  // before the base app destroys the ImGui drawer
     menu_.reset();  // before the base app destroys the ImGui drawer

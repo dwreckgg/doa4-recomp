@@ -4,6 +4,8 @@
 #include "../../src/doa4_gamefiles.h"
 #include "xdvdfs_fixtures.h"
 
+#include <windows.h>
+
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -320,7 +322,10 @@ static void TestNonAnsiTarget(const fs::path& dir) {
     ++g_failures;
   }
   CHECK(run.result.outcome == ExtractOutcome::kDone);
-  CHECK(CheckFolder(target, expected) == Verdict::kOk);
+  // The copy itself works under any name (Extract is path-agnostic); whether
+  // the game may use the folder depends on the code page (final review I2).
+  CHECK(CheckFolder(target, expected) ==
+        (PathFitsCodePage(target) ? Verdict::kOk : Verdict::kPathUnsupported));
   // Reasons naming such a path are UTF-8 and do not throw.
   StartChoice c = ChooseStartPath("", target / "gone", [](const fs::path&) { return false; });
   CHECK(c.reason.find("\xE3\x82\xB2") != std::string::npos);
@@ -348,6 +353,77 @@ static void TestGameTab() {
   CHECK(t.can_change && t.note.empty());
 }
 
+// The SDK's runtime turns the game folder into ANSI text (path::string())
+// while it starts; a name the Windows code page cannot represent throws there
+// and ends the game at every start (final review I2). Such paths are refused.
+static const fs::path kEmoji = fs::path(u8"DOA4 \U0001F600");  // in no ANSI code page
+
+static void TestPathFitsCodePage() {
+  CHECK(PathFitsCodePage(fs::path("C:/Games/DOA4")));
+  CHECK(PathFitsCodePage(fs::path()));
+  CHECK(!PathFitsCodePage(fs::path("C:/Games") / kEmoji));
+  if (GetACP() == 1252) {
+    CHECK(!PathFitsCodePage(fs::path(u8"C:/\u30b2\u30fc\u30e0/DOA4")));
+    CHECK(PathFitsCodePage(fs::path(u8"C:/Caf\u00e9/DOA4")));  // e-acute is in 1252
+  }
+}
+
+// A saved folder that cannot be used opens the setup screen with the reason
+// instead of starting the runtime (which would throw at every start).
+static void TestChooseStartPathRefusesUnrepresentable() {
+  const fs::path saved = fs::path("D:/") / kEmoji;
+  auto has = [](const fs::path&) { return true; };
+  StartChoice c = ChooseStartPath("", saved, has, PathFitsCodePage);
+  CHECK(c.path.empty());
+  CHECK(c.reason.find("plain") != std::string::npos);
+  // Control: a representable saved folder is used.
+  c = ChooseStartPath("", "D:/DOA4", has, PathFitsCodePage);
+  CHECK(c.path == fs::path("D:/DOA4"));
+  // Without the predicate (callers that do not care) nothing changes.
+  c = ChooseStartPath("", saved, has);
+  CHECK(c.path == saved);
+}
+
+// An extracted folder whose path cannot be used, or that still holds a .part
+// file from an interrupted extraction, is not accepted (final review I3).
+static void TestCheckFolderRefusesUnusable(const fs::path& dir) {
+  const std::string expected = Sha1Hex(kXex.data(), kXex.size());
+  WriteAll(dir / kEmoji / "default.xex", kXex);
+  CHECK(CheckFolder(dir / kEmoji, expected) == Verdict::kPathUnsupported);
+  WriteAll(dir / "half" / "default.xex", kXex);
+  WriteAll(dir / "half" / "movie" / "ayane.sfd.part", "partial");
+  CHECK(CheckFolder(dir / "half", expected) == Verdict::kIncomplete);
+  // Control: the same folder without the .part file is accepted.
+  fs::remove(dir / "half" / "movie" / "ayane.sfd.part");
+  CHECK(CheckFolder(dir / "half", expected) == Verdict::kOk);
+}
+
+// default.xex is written last: until every other file is complete there is
+// no default.xex in the target, so a killed extraction never leaves a folder
+// that looks like the game (final review I3).
+static void TestXexIsWrittenLast(const fs::path& dir) {
+  const std::string expected = Sha1Hex(kXex.data(), kXex.size());
+  const fs::path iso = WriteIso(dir, "last.iso", kGame);  // default.xex is the FIRST entry
+  const fs::path target = dir / "last_out";
+  bool xex_seen_early = false;
+  std::vector<std::string> order;
+  doa4::xdvdfs::FileSource src;
+  CHECK(src.Open(iso));
+  ImageCheck check = CheckImage(iso, expected);
+  std::atomic<bool> cancel{false};
+  ExtractResult r = Extract(src, check.volume, target, expected, cancel, [&](const Progress& p) {
+    if (order.empty() || order.back() != p.file) order.push_back(p.file);
+    if (p.file != "default.xex" && (fs::exists(target / "default.xex") ||
+                                    fs::exists(target / "default.xex.part"))) {
+      xex_seen_early = true;
+    }
+  });
+  CHECK(r.outcome == ExtractOutcome::kDone);
+  CHECK(!xex_seen_early);
+  CHECK(!order.empty() && order.back() == "default.xex");
+  CHECK(order.size() == 4);  // the four non-empty files, each once
+}
+
 int main() {
   const fs::path dir = fs::temp_directory_path() / "doa4_gamefiles_test_data";
   fs::remove_all(dir);
@@ -356,6 +432,10 @@ int main() {
     TestSha1();
     TestChooseStartPath();
     TestGameTab();
+    TestPathFitsCodePage();
+    TestChooseStartPathRefusesUnrepresentable();
+    TestCheckFolderRefusesUnusable(dir);
+    TestXexIsWrittenLast(dir);
     TestHasXex(dir);
     TestCheckImage(dir);
     TestCheckFolder(dir);

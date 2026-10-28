@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <set>
 
 static int g_failures = 0;
 #define CHECK(cond)                                               \
@@ -35,6 +36,7 @@ struct Fake {
   uint64_t image_bytes = 7 * kGB;
   std::map<fs::path, TargetState> targets;  // default kNew
   std::map<fs::path, uint64_t> free;        // default 100 GB
+  std::set<fs::path> unusable;              // paths PathFitsCodePage would reject
   ExtractResult extract_result{ExtractOutcome::kDone, ""};
   bool saw_cancel = false;
   int extracts = 0;
@@ -80,6 +82,7 @@ struct Fake {
     e.free_bytes = [this](const fs::path& t) -> std::optional<uint64_t> {
       return free.count(t) ? free[t] : 100 * kGB;
     };
+    e.path_fits = [this](const fs::path& t) { return !unusable.count(t); };
     e.extract = [this](const fs::path&, const doa4::xdvdfs::Volume& v, const fs::path&,
                        const std::atomic<bool>& cancel,
                        const std::function<void(const Progress&)>& progress) {
@@ -307,6 +310,34 @@ static void TestBack() {
   CHECK(flow.stage() == Stage::kChoose && f.done.empty());
 }
 
+// A target the game could not start from (final review I2) is refused before
+// anything is extracted; the refusals for unusable folders say what to do.
+static void TestUnusablePaths() {
+  Fake f;
+  const fs::path iso = "D:/isos/doa4.iso", target = "D:/isos/DOA4", plain = "E:/games";
+  f.isos = {iso};
+  f.unusable.insert(target);
+  f.targets[plain] = TargetState::kEmpty;
+  f.folders = {plain};
+  Flow flow(f.Make());
+  flow.ChooseImage();
+  CHECK(!flow.CanExtract() && flow.target_note().find("plain") != std::string::npos);
+  flow.Extract();
+  CHECK(f.extracts == 0);
+  flow.ChangeTarget();  // an empty, usable folder
+  CHECK(flow.target() == plain && flow.CanExtract());
+  CHECK(VerdictMessage(Verdict::kPathUnsupported, false).find("plain") != std::string::npos);
+  CHECK(VerdictMessage(Verdict::kIncomplete, false).find("unfinished") != std::string::npos);
+  // The not-empty note says what to do with an unfinished earlier attempt.
+  CHECK(flow.target_note().empty());
+  Fake g;
+  g.isos = {iso};
+  g.targets[target] = TargetState::kNotEmpty;
+  Flow flow2(g.Make());
+  flow2.ChooseImage();
+  CHECK(flow2.target_note().find("unfinished") != std::string::npos);
+}
+
 static void TestFormatGB() {
   CHECK(FormatGB(7 * kGB) == "7.0 GB");
   CHECK(FormatGB(7 * kGB + kGB / 2) == "7.5 GB");
@@ -340,6 +371,7 @@ int main() {
   TestExtractEndings();
   TestBack();
   TestFormatGB();
+  TestUnusablePaths();
   TestParseTestScript();
   if (g_failures) {
     std::printf("%d check(s) failed\n", g_failures);
