@@ -543,8 +543,6 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.game_files_from_command_line = game_files_from_command_line_;
     host.user_data = UserData();
     host.change_game_files = [this] { ChangeGameFiles(); };
-    host.running_alpha152 = running_alpha152_;
-    host.saved_alpha152 = &saved_alpha152_;
     menu_ = std::make_unique<doa4::MenuDialog>(drawer_, std::move(host));
     menu_open_.store(true, std::memory_order_release);
     REXLOG_INFO("[doa4][UI] menu opened");
@@ -595,8 +593,6 @@ class DeadOrAlive4App : public rex::ReXApp {
   doa4::tweaks::TweakPatcher patcher_;
   doa4::tweaks::ProtectFn protect_;
   doa4::ExtrasState extras_;
-  bool running_alpha152_ = false;
-  bool saved_alpha152_ = false;  // what the menu last saved for the next start
   std::atomic<bool> extras_stop_{false};
   std::thread extras_thread_;  // DOA4_EXTRAS_TEST only
   std::atomic<bool> gfx_stop_{false};
@@ -648,8 +644,6 @@ class DeadOrAlive4App : public rex::ReXApp {
                      error.empty() ? "no error" : error, in_memory);
       }
     }
-    running_alpha152_ = rex::cvar::Query<bool>("doa4_alpha152");
-    saved_alpha152_ = running_alpha152_;
     StartExtrasTestWatcher();
   }
 

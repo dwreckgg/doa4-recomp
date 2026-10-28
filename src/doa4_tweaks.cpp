@@ -26,37 +26,16 @@ std::vector<Patch> MpHiddenCharacterPatches() {
   return patches;
 }
 
-// Select entry 22 (Random) becomes Alpha-152; the 24th slot, which the game
-// fills at boot from 0x82C346D0, becomes Random; 0x821B52A7 enables the 24th
-// slot (READONLY_DATA).
-std::vector<Patch> Alpha152Patches() {
-  return {
-      {0x82F5F2A0,
-       {
-           0x10, 0x01, 0x01, 0x01, 0x00, 0x06, 0x00, 0x18, 0x00, 0x06,
-           0x00, 0x18, 0x00, 0x06, 0x00, 0x32, 0x00, 0x06, 0x00, 0x32,
-           0x00, 0x06, 0x00, 0xB9, 0x00, 0x06, 0x00, 0xB9, 0x00, 0x06,
-           0x00, 0x61, 0x00, 0x06, 0x00, 0x49, 0x00, 0x00, 0x00, 0x00,
-       }},
-      {0x821B52A7, {0x01}},
-      {0x82C346D0,
-       {
-           0xFF, 0x01, 0x01, 0x01, 0x00, 0x06, 0x00, 0x11, 0x00, 0x06,
-           0x00, 0x11, 0x00, 0x06, 0x00, 0x11, 0x00, 0x06, 0x00, 0x11,
-           0x00, 0x06, 0x00, 0xB8, 0x00, 0x06, 0x00, 0xB8, 0x00, 0x06,
-           0x00, 0x3E, 0x00, 0x06, 0x00, 0x6E, 0x00, 0x00, 0x00, 0x00,
-       }},
-  };
-}
-
 }  // namespace
 
-const std::array<Tweak, 3>& AllTweaks() {
-  static const std::array<Tweak, 3> tweaks = {{
-      {"doa4_tag_all_stages", "All stages in Tag battle", TagAllStagesPatches(), false},
+// Alpha-152 (a third patch) was removed on 2026-10-28: her character data
+// lacks the motions and script entries a player-controlled fighter needs, and
+// selecting her crashed in Survival, Time Attack and Versus.
+const std::array<Tweak, 2>& AllTweaks() {
+  static const std::array<Tweak, 2> tweaks = {{
+      {"doa4_tag_all_stages", "All stages in Tag battle", TagAllStagesPatches()},
       {"doa4_mp_hidden_characters", "Hidden characters in multiplayer select",
-       MpHiddenCharacterPatches(), false},
-      {"doa4_alpha152", "Alpha-152 playable (replaces the Random slot)", Alpha152Patches(), true},
+       MpHiddenCharacterPatches()},
   }};
   return tweaks;
 }

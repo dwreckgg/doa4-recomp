@@ -29,10 +29,8 @@ const std::vector<fx::FixturePatch>& FixtureFor(size_t tweak) {
   switch (tweak) {
     case kTagAllStages:
       return fx::kTagAllStages;
-    case kMpHiddenCharacters:
-      return fx::kMpHiddenCharacters;
     default:
-      return fx::kAlpha152;
+      return fx::kMpHiddenCharacters;
   }
 }
 
@@ -100,14 +98,15 @@ static void TestListsMatchThePatchFile() {
   }
   CHECK(std::string(AllTweaks()[kTagAllStages].cvar) == "doa4_tag_all_stages");
   CHECK(std::string(AllTweaks()[kMpHiddenCharacters].cvar) == "doa4_mp_hidden_characters");
-  CHECK(std::string(AllTweaks()[kAlpha152].cvar) == "doa4_alpha152");
-  CHECK(!AllTweaks()[kTagAllStages].needs_restart);
-  CHECK(!AllTweaks()[kMpHiddenCharacters].needs_restart);
-  CHECK(AllTweaks()[kAlpha152].needs_restart);
+  // Alpha-152 was removed (2026-10-28): her character data lacks the motions
+  // and script entries a player-controlled fighter needs, so selecting her
+  // crashed in every mode tested. Only the two live tweaks remain.
+  CHECK(AllTweaks().size() == 2);
+  for (const auto& tweak : AllTweaks()) CHECK(std::string(tweak.cvar) != "doa4_alpha152");
 }
 
 static void TestReadOnlyRanges() {
-  CHECK(IsReadOnly(0x821B52A7));  // the Alpha-152 slot byte
+  CHECK(IsReadOnly(0x821B52A7));  // an address in READONLY_DATA
   CHECK(IsReadOnly(0x82000000));
   CHECK(IsReadOnly(0x822EFFFF));
   CHECK(!IsReadOnly(0x822F0000));  // CODE starts: never patched here
@@ -141,37 +140,20 @@ static void TestOnThenOffRestoresEveryByte() {
   }
 }
 
-static void TestReadOnlyByteGoesThroughProtect() {
-  FakeGuest g;
-  TweakPatcher patcher;
-  patcher.CaptureOriginals(g.guest);
-  CHECK(patcher.Apply(g.guest, kAlpha152, true, g.protect).empty());
-  // Exactly one read-only patch: made writable, then read-only again.
-  CHECK(g.protect_calls.size() == 2);
-  if (g.protect_calls.size() == 2) {
-    CHECK(g.protect_calls[0] == std::make_pair(uint32_t(0x821B52A7), true));
-    CHECK(g.protect_calls[1] == std::make_pair(uint32_t(0x821B52A7), false));
+// The remaining tweaks patch DATA only: none needs a read-only page made
+// writable. (The read-only path stays in TweakPatcher for future tweaks; its
+// only user and its tests went with Alpha-152.)
+static void TestNoTweakTouchesReadOnlyData() {
+  for (size_t t = 0; t < AllTweaks().size(); ++t) {
+    for (const auto& p : AllTweaks()[t].patches) {
+      for (size_t i = 0; i < p.bytes.size(); ++i) CHECK(!IsReadOnly(p.address + uint32_t(i)));
+    }
+    FakeGuest g;
+    TweakPatcher patcher;
+    patcher.CaptureOriginals(g.guest);
+    CHECK(patcher.Apply(g.guest, t, true, g.protect).empty());
+    CHECK(g.protect_calls.empty());
   }
-  CHECK(g.bytes[0x821B52A7] == 0x01);
-  // DATA-only tweaks never call it.
-  FakeGuest g2;
-  TweakPatcher p2;
-  p2.CaptureOriginals(g2.guest);
-  CHECK(p2.Apply(g2.guest, kTagAllStages, true, g2.protect).empty());
-  CHECK(p2.Apply(g2.guest, kMpHiddenCharacters, true, g2.protect).empty());
-  CHECK(g2.protect_calls.empty());
-}
-
-static void TestFailedProtectWritesNothing() {
-  FakeGuest g;
-  g.protect_fails = true;
-  TweakPatcher patcher;
-  patcher.CaptureOriginals(g.guest);
-  std::string error = patcher.Apply(g.guest, kAlpha152, true, g.protect);
-  CHECK(!error.empty());
-  CHECK(g.writes == 0);
-  CHECK(g.faults == 0);
-  CHECK(g.Holds(fx::kAlpha152, false));
 }
 
 static void TestOffNeedsOriginals() {
@@ -183,7 +165,7 @@ static void TestOffNeedsOriginals() {
   CHECK(g.writes == 0);
   patcher.CaptureOriginals(g.guest);
   CHECK(patcher.captured());
-  CHECK(!patcher.Apply(g.guest, 3, true, g.protect).empty());  // no such tweak
+  CHECK(!patcher.Apply(g.guest, 2, true, g.protect).empty());  // no such tweak
 }
 
 // A second capture must not replace the originals with patched bytes.
@@ -201,8 +183,7 @@ int main() {
   TestListsMatchThePatchFile();
   TestReadOnlyRanges();
   TestOnThenOffRestoresEveryByte();
-  TestReadOnlyByteGoesThroughProtect();
-  TestFailedProtectWritesNothing();
+  TestNoTweakTouchesReadOnlyData();
   TestOffNeedsOriginals();
   TestCaptureOnlyOnce();
   if (g_failures) {

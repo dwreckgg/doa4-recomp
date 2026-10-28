@@ -7,9 +7,6 @@ REXCVAR_DEFINE_BOOL(doa4_tag_all_stages, false, "DOA4",
                     "All stages in Tag battle (Xenia patch by ryu_highabusa)");
 REXCVAR_DEFINE_BOOL(doa4_mp_hidden_characters, false, "DOA4",
                     "Hidden characters in multiplayer select (Xenia patch by ryu_highabusa)");
-REXCVAR_DEFINE_BOOL(doa4_alpha152, false, "DOA4",
-                    "Alpha-152 playable, replacing the Random slot (Xenia patch by ryu_highabusa)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // First-run setup (doa4_gamefiles.h): the folder the setup chose. The command
 // line's --game_data_root overrides it.

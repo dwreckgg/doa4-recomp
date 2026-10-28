@@ -413,22 +413,12 @@ void MenuDialog::DrawExtrasTab() {
   ImGui::SeparatorText("Game tweaks");
   for (size_t i = 0; i < tweaks::AllTweaks().size(); ++i) {
     const tweaks::Tweak& tweak = tweaks::AllTweaks()[i];
-    bool on = tweak.needs_restart ? *host_.saved_alpha152 : rex::cvar::Query<bool>(tweak.cvar);
-    // A live tweak needs guest memory; a restart tweak only saves.
-    ImGui::BeginDisabled(!tweak.needs_restart && !host_.guest);
+    bool on = rex::cvar::Query<bool>(tweak.cvar);
+    ImGui::BeginDisabled(!host_.guest);  // a tweak is applied to guest memory
     if (ImGui::Checkbox(tweak.label, &on)) {
       SetTweak(i, on);
     }
     ImGui::EndDisabled();
-  }
-  if (*host_.saved_alpha152 != host_.running_alpha152) {
-    ImGui::TextColored(kNoteColor, "Alpha-152 changes on the next start.");
-    if (ImGui::Button("Restart now##extras")) {
-      Restart();
-    }
-    if (const char* warning = UnsavedUnlocksWarning(state)) {
-      ImGui::TextColored(kErrorColor, "%s", warning);
-    }
   }
 }
 
@@ -547,11 +537,6 @@ void MenuDialog::SetTweak(size_t index, bool on) {
     return;
   }
   status_.clear();
-  if (tweak.needs_restart) {
-    *host_.saved_alpha152 = on;
-    REXLOG_INFO("[doa4][EXTRAS] {} = {} saved for the next start", tweak.cvar, value);
-    return;
-  }
   rex::cvar::SetFlagByName(tweak.cvar, value);
   std::string apply_error = host_.patcher->Apply(*host_.guest, index, on, host_.protect);
   if (!apply_error.empty()) {

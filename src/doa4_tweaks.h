@@ -27,13 +27,11 @@ struct Tweak {
   const char* cvar;
   const char* label;
   std::vector<Patch> patches;
-  bool needs_restart;  // the game reads it once at boot: applied only at load
 };
 
 inline constexpr size_t kTagAllStages = 0;
 inline constexpr size_t kMpHiddenCharacters = 1;
-inline constexpr size_t kAlpha152 = 2;
-const std::array<Tweak, 3>& AllTweaks();
+const std::array<Tweak, 2>& AllTweaks();
 
 // Whether the address is in one of the image's READONLY_DATA ranges (from the
 // XEX page descriptors: 0x82000000-0x822F0000 and 0x835B0000-0x83600000). The
