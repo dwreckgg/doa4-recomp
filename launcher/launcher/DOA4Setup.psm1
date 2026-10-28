@@ -1233,11 +1233,24 @@ function Remove-DOA4FixesForUpdate {
     if ($ch.Stubs.Count -gt 0) { Write-DOA4Log $Ctx ('  rexglue-sdk: {0} symlink copies restored to stubs for the update' -f $ch.Stubs.Count) }
 }
 
+# After a fetch: would updating move this repository (another commit, or another branch)?
+function Test-DOA4RepoWouldMove {
+    param([hashtable]$Ctx, [string]$Path, [string]$Ref)
+    if (-not (Test-DOA4CommitRef $Ref)) {
+        $cur = Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Path, 'symbolic-ref', '--short', '-q', 'HEAD')
+        if ([string](@($cur.Output) | Select-Object -First 1) -ne $Ref) { return $true }
+        $target = Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Path, 'rev-parse', '--verify', "origin/$Ref^{commit}")
+    } else {
+        $target = Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Path, 'rev-parse', '--verify', "$Ref^{commit}")
+    }
+    if ($target.ExitCode -ne 0) { return $true }
+    return ([string](@($target.Output) | Select-Object -First 1) -ne (Get-DOA4Head $Ctx.Cmd $Path))
+}
+
 function Update-DOA4RepoToRef {
     param([hashtable]$Ctx, [string]$Path, [string]$Ref, [string]$Name)
     $sink = Get-DOA4LogSink $Ctx
     $before = Get-DOA4Head $Ctx.Cmd $Path
-    Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Path, 'fetch', 'origin') -OnLine $sink -Check | Out-Null
     if (Test-DOA4CommitRef $Ref) {
         Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Path, 'checkout', '--detach', $Ref) -OnLine $sink -Check | Out-Null
     } else {
@@ -1286,24 +1299,35 @@ function Invoke-DOA4Update {
 
         $step = 'Update'
         Set-DOA4Step $Ctx $step 'running'
-        $updateError = $null
-        try {
-            Remove-DOA4FixesForUpdate $Ctx $blockers
-            Update-DOA4RepoToRef -Ctx $Ctx -Path $Ctx.GamePath -Ref $c.GameRef -Name 'doa4-recomp'
-            Update-DOA4RepoToRef -Ctx $Ctx -Path $Ctx.SdkPath -Ref $c.SdkRef -Name 'rexglue-sdk'
-            Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Ctx.SdkPath, 'submodule', 'update', '--init', '--recursive') -OnLine (Get-DOA4LogSink $Ctx) -Check | Out-Null
-        } catch {
-            $updateError = $_.Exception.Message
+        # Fetching changes no working-tree file; only when a repository would move are the
+        # fixes taken out (rewriting them unchanged would make CMake re-run and objects rebuild).
+        $sink = Get-DOA4LogSink $Ctx
+        Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Ctx.GamePath, 'fetch', 'origin') -OnLine $sink -Check | Out-Null
+        Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Ctx.SdkPath, 'fetch', 'origin') -OnLine $sink -Check | Out-Null
+        $moves = (Test-DOA4RepoWouldMove $Ctx $Ctx.GamePath $c.GameRef) -or (Test-DOA4RepoWouldMove $Ctx $Ctx.SdkPath $c.SdkRef) -or
+            ($blockers.Sdk.Moved.Count -gt 0)
+        if (-not $moves) {
+            Set-DOA4Step $Ctx $step 'done' 'nothing new: doa4-recomp and rexglue-sdk are at their configured versions'
+        } else {
+            $updateError = $null
+            try {
+                Remove-DOA4FixesForUpdate $Ctx $blockers
+                Update-DOA4RepoToRef -Ctx $Ctx -Path $Ctx.GamePath -Ref $c.GameRef -Name 'doa4-recomp'
+                Update-DOA4RepoToRef -Ctx $Ctx -Path $Ctx.SdkPath -Ref $c.SdkRef -Name 'rexglue-sdk'
+                Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Ctx.SdkPath, 'submodule', 'update', '--init', '--recursive') -OnLine $sink -Check | Out-Null
+            } catch {
+                $updateError = $_.Exception.Message
+            }
+            # The fixes go back whether or not the pull worked.
+            $stubs = Repair-DOA4SymlinkStubs -Cmd $Ctx.Cmd -RepoPath $Ctx.SdkPath
+            $cm = Add-DOA4CMakeIncludeFix -Path (Join-Path $Ctx.GamePath 'CMakeLists.txt')
+            Write-DOA4Log $Ctx ('  fixes re-applied: symlink stubs replaced: {0}; CMake include fix: {1}' -f $stubs.Fixed, $cm)
+            if ($updateError) {
+                Set-DOA4Step $Ctx $step 'failed' $updateError
+                return New-DOA4StepResult $false $step $updateError $Ctx
+            }
+            Set-DOA4Step $Ctx $step 'done'
         }
-        # The fixes go back whether or not the pull worked.
-        $stubs = Repair-DOA4SymlinkStubs -Cmd $Ctx.Cmd -RepoPath $Ctx.SdkPath
-        $cm = Add-DOA4CMakeIncludeFix -Path (Join-Path $Ctx.GamePath 'CMakeLists.txt')
-        Write-DOA4Log $Ctx ('  fixes re-applied: symlink stubs replaced: {0}; CMake include fix: {1}' -f $stubs.Fixed, $cm)
-        if ($updateError) {
-            Set-DOA4Step $Ctx $step 'failed' $updateError
-            return New-DOA4StepResult $false $step $updateError $Ctx
-        }
-        Set-DOA4Step $Ctx $step 'done'
 
         $step = 'Build'
         $avx = Test-DOA4Avx2 -Cmd $Ctx.Cmd

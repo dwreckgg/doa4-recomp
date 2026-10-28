@@ -111,6 +111,13 @@ Describe 'Update with nothing new' {
     $game = Join-Path $t.Root 'doa4-recomp'
     $sdk = Join-Path $t.Root 'rexglue-sdk'
     $headGame = @(Invoke-TGit $game @('rev-parse', 'HEAD'))[0]
+    # Touch times of the fixed files: with nothing new they must not be rewritten (a rewrite
+    # makes CMake re-run and objects rebuild, seen in the end-to-end run).
+    $cm = Join-Path $game 'CMakeLists.txt'
+    $stub = Join-Path $sdk 'thirdparty\lib\link\a.c'
+    $old = (Get-Date).AddHours(-1)
+    (Get-Item -LiteralPath $cm).LastWriteTime = $old
+    (Get-Item -LiteralPath $stub).LastWriteTime = $old
     $r = Invoke-DOA4Update -Ctx (New-TUpdateCtx $t)
 
     It 'succeeds' { $r.Message | Should Be 'Updated and rebuilt.' }
@@ -119,12 +126,12 @@ Describe 'Update with nothing new' {
         (Get-TStatus $sdk) -join '|' | Should Be ' M thirdparty/lib'
         @(Get-TStatus (Join-Path $sdk 'thirdparty\lib') | Sort-Object) -join '|' | Should Be ' D linkdir| M link/a.c| M link/b.h'
     }
-    It 'took the fixes out and put them back' {
+    It 'fetched, found nothing new, and left both fixes untouched (no rewrite, same times)' {
         $log = [IO.File]::ReadAllText($r.LogPath)
-        $log | Should Match 'build fix removed for the update'
-        $log | Should Match '3 symlink copies restored to stubs'
-        $log | Should Match 'fixes re-applied: symlink stubs replaced: 3; CMake include fix: added'
-        $log | Should Match 'doa4-recomp: already up to date'
+        $log | Should Match 'nothing new: doa4-recomp and rexglue-sdk are at their configured versions'
+        $log | Should Not Match 'build fix removed for the update'
+        (Get-Item -LiteralPath $cm).LastWriteTime | Should Be $old
+        (Get-Item -LiteralPath $stub).LastWriteTime | Should Be $old
     }
     It 'did not move HEAD, and built again' {
         @(Invoke-TGit $game @('rev-parse', 'HEAD'))[0] | Should Be $headGame
@@ -149,6 +156,13 @@ Describe 'Update with a new upstream commit' {
     }
     It 'has the CMake fix again' {
         (Get-TStatus $game) -join '|' | Should Be ' M CMakeLists.txt'
+    }
+    It 'took the fixes out for the pull and put them back' {
+        $log = [IO.File]::ReadAllText($r.LogPath)
+        $log | Should Match 'build fix removed for the update'
+        $log | Should Match '3 symlink copies restored to stubs'
+        $log | Should Match 'fixes re-applied: symlink stubs replaced: 3; CMake include fix: added'
+        $log | Should Match 'rexglue-sdk: already up to date'
     }
 }
 
@@ -215,14 +229,36 @@ Describe 'Update refuses foreign local changes' {
 }
 
 Describe 'Update when the fetch fails' {
-    It 'reports the failure and still puts both fixes back' {
+    It 'reports the failure and leaves both fixes as they were' {
         $t = New-TInstalled -Base (Join-Path $TestDrive 'f1')
+        $cm = Join-Path $t.Root 'doa4-recomp\CMakeLists.txt'
+        $cmBefore = Get-TBytesHash $cm
         Rename-Item -LiteralPath $t.Origins.Game -NewName 'origin-game-gone'
         $r = Invoke-DOA4Update -Ctx (New-TUpdateCtx $t)
         $r.Ok | Should Be $false
         $r.Step | Should Be 'Update'
         $r.Message | Should Match 'git -C .* fetch origin failed'
-        [IO.File]::ReadAllText((Join-Path $t.Root 'doa4-recomp\CMakeLists.txt')).Contains('rexglue-sdk/include') | Should Be $true
+        Get-TBytesHash $cm | Should Be $cmBefore
+        [IO.File]::ReadAllText((Join-Path $t.Root 'rexglue-sdk\thirdparty\lib\link\a.c')) | Should Be "int a;`r`n"
+        $t.Build.State.Calls.Count | Should Be 1
+    }
+}
+
+Describe 'Update when the fast-forward fails (local commit on the branch)' {
+    It 'reports the failure and still puts both fixes back' {
+        $t = New-TInstalled -Base (Join-Path $TestDrive 'f2')
+        $game = Join-Path $t.Root 'doa4-recomp'
+        Write-TFile (Join-Path $game 'src\local.cpp') "// local`n"
+        Invoke-TGit $game @('add', 'src/local.cpp') | Out-Null
+        Invoke-TGit $game @('commit', '-q', '-m', 'local commit') | Out-Null
+        Write-TFile (Join-Path $t.Origins.Game 'src\new.cpp') "// new`n"
+        Invoke-TGit $t.Origins.Game @('add', '-A') | Out-Null
+        Invoke-TGit $t.Origins.Game @('commit', '-q', '-m', 'new upstream') | Out-Null
+        $r = Invoke-DOA4Update -Ctx (New-TUpdateCtx $t)
+        $r.Ok | Should Be $false
+        $r.Step | Should Be 'Update'
+        $r.Message | Should Match 'merge --ff-only origin/main failed'
+        [IO.File]::ReadAllText((Join-Path $game 'CMakeLists.txt')).Contains('rexglue-sdk/include') | Should Be $true
         [IO.File]::ReadAllText((Join-Path $t.Root 'rexglue-sdk\thirdparty\lib\link\a.c')) | Should Be "int a;`r`n"
         $t.Build.State.Calls.Count | Should Be 1
     }
