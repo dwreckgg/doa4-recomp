@@ -1,4 +1,4 @@
-// In-game menu (Escape): Video and Controls tabs. See doa4_menu.h.
+// In-game menu (Escape): Video, Controls and Extras tabs. See doa4_menu.h.
 
 #include "doa4_menu.h"
 
@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cfloat>
+#include <optional>
 #include <string>
 
 #include <fmt/format.h>
@@ -28,6 +29,7 @@
 #include <windows.h>
 
 #include "doa4_config.h"
+#include "doa4_unlocks.h"
 
 namespace doa4 {
 
@@ -77,6 +79,19 @@ constexpr std::array<KeyRow, 21> kKeyRows = {{
 
 constexpr ImVec4 kErrorColor(1.0f, 0.45f, 0.4f, 1.0f);
 constexpr ImVec4 kNoteColor(1.0f, 0.85f, 0.4f, 1.0f);
+constexpr ImVec4 kDoneColor(0.45f, 0.9f, 0.5f, 1.0f);
+
+struct UnlockRow {
+  unlocks::Unlock what;
+  const char* label;
+};
+constexpr std::array<UnlockRow, 5> kUnlockRows = {{
+    {unlocks::Unlock::kCharacters, "Unlock all characters"},
+    {unlocks::Unlock::kCostumes, "Unlock all costumes"},
+    {unlocks::Unlock::kVoices, "Unlock all system voices"},
+    {unlocks::Unlock::kStages, "Unlock all stages"},
+    {unlocks::Unlock::kEverything, "Unlock everything"},
+}};
 
 uint32_t PressedControls(const rex::input::X_INPUT_GAMEPAD& pad) {
   uint32_t mask = 0;
@@ -118,6 +133,10 @@ void MenuDialog::OnDraw(ImGuiIO& io) {
         ImGui::EndTabItem();
       } else if (listen_ != Listen::kNone) {
         listen_ = Listen::kNone;  // left the tab while a row was listening
+      }
+      if (ImGui::BeginTabItem("Extras")) {
+        DrawExtrasTab();
+        ImGui::EndTabItem();
       }
       ImGui::EndTabBar();
     }
@@ -283,6 +302,108 @@ void MenuDialog::DrawKeyboardSection() {
       SetAndSave(kKeyRows[row].cvar, value, true);
     }
   }
+}
+
+void MenuDialog::DrawExtrasTab() {
+  ImGui::SeparatorText("Unlocks");
+  const std::optional<uint32_t> profile =
+      host_.guest ? unlocks::FindProfile(*host_.guest) : std::nullopt;
+  if (!profile) {
+    ImGui::TextDisabled("Load a profile first (reach the main menu).");
+  }
+  for (const UnlockRow& row : kUnlockRows) {
+    const bool done = profile && unlocks::IsUnlocked(*host_.guest, *profile, row.what);
+    ImGui::BeginDisabled(!profile || done);
+    if (ImGui::Button(row.label, ImVec2(220.0f, 0.0f))) {
+      std::string error;
+      if (UnlockWithBackup(*host_.guest, *profile, row.what, host_.save_dir, BackupStamp(),
+                           host_.extras, &error)) {
+        status_.clear();
+        REXLOG_INFO("[doa4][EXTRAS] {}: {}", row.label, host_.extras->last_change);
+      } else {
+        status_ = error;
+        REXLOG_ERROR("[doa4][EXTRAS] {}: {}", row.label, error);
+      }
+    }
+    ImGui::EndDisabled();
+    if (done) {
+      ImGui::SameLine();
+      ImGui::TextColored(kDoneColor, "Unlocked");
+    }
+    if (row.what == unlocks::Unlock::kStages) {
+      ImGui::Indent();
+      ImGui::TextWrapped(
+          "Also unlocks characters, costumes and voices, and records one Story clear for each "
+          "Story character (shown in Records).");
+      ImGui::Unindent();
+    }
+  }
+
+  ExtrasState& state = *host_.extras;
+  if (ImGui::GetTime() >= next_save_poll_) {
+    PollSaved(host_.save_dir, &state);
+    next_save_poll_ = ImGui::GetTime() + 1.0;
+  }
+  if (!state.last_change.empty()) {
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", state.last_change.c_str());
+  }
+  if (state.waiting_for_save) {
+    ImGui::TextColored(kNoteColor, "Waiting for the game to save...");
+    ImGui::TextWrapped(
+        "Change any Options setting, or finish a mode, to save now. Re-enter character or "
+        "stage select to see the change.");
+  } else if (state.saved) {
+    ImGui::TextColored(kDoneColor, "Saved.");
+  }
+  if (!state.backup.empty()) {
+    ImGui::TextWrapped("Backup of your save from before the first unlock: %s",
+                       state.backup.string().c_str());
+  } else if (!state.backup_note.empty()) {
+    ImGui::TextWrapped("%s", state.backup_note.c_str());
+  }
+
+  ImGui::SeparatorText("Game tweaks");
+  for (size_t i = 0; i < tweaks::AllTweaks().size(); ++i) {
+    const tweaks::Tweak& tweak = tweaks::AllTweaks()[i];
+    bool on = tweak.needs_restart ? *host_.saved_alpha152 : rex::cvar::Query<bool>(tweak.cvar);
+    // A live tweak needs guest memory; a restart tweak only saves.
+    ImGui::BeginDisabled(!tweak.needs_restart && !host_.guest);
+    if (ImGui::Checkbox(tweak.label, &on)) {
+      SetTweak(i, on);
+    }
+    ImGui::EndDisabled();
+  }
+  if (*host_.saved_alpha152 != host_.running_alpha152) {
+    ImGui::TextColored(kNoteColor, "Alpha-152 changes on the next start.");
+    if (ImGui::Button("Restart now##extras")) {
+      Restart();
+    }
+  }
+}
+
+void MenuDialog::SetTweak(size_t index, bool on) {
+  const tweaks::Tweak& tweak = tweaks::AllTweaks()[index];
+  const char* value = on ? "true" : "false";
+  // Saved first: when the save fails the running game keeps its state.
+  std::string error = SaveTomlKey(host_.config_path, tweak.cvar, value);
+  if (!error.empty()) {
+    status_ = "Could not save settings: " + error;
+    return;
+  }
+  status_.clear();
+  if (tweak.needs_restart) {
+    *host_.saved_alpha152 = on;
+    REXLOG_INFO("[doa4][EXTRAS] {} = {} saved for the next start", tweak.cvar, value);
+    return;
+  }
+  rex::cvar::SetFlagByName(tweak.cvar, value);
+  std::string apply_error = host_.patcher->Apply(*host_.guest, index, on, host_.protect);
+  if (!apply_error.empty()) {
+    status_ = fmt::format("{}: {}", tweak.label, apply_error);
+  }
+  REXLOG_INFO("[doa4][EXTRAS] {} = {}: {}", tweak.cvar, value,
+              apply_error.empty() ? "applied" : apply_error);
 }
 
 void MenuDialog::StartPadListen(size_t row, const rex::input::X_INPUT_GAMEPAD* pad) {

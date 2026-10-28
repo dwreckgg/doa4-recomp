@@ -12,8 +12,10 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -37,7 +39,10 @@
 #include <rex/system/xthread.h>
 
 #include "doa4_diag_overlay.h"
+#include "doa4_extras.h"
 #include "doa4_menu.h"
+#include "doa4_tweaks.h"
+#include "doa4_unlocks.h"
 
 REXCVAR_DECLARE(bool, log_noisy);
 
@@ -99,6 +104,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   void OnPostLoadXexImage() override {
     REXLOG_INFO("[doa4][LIFE] OnPostLoadXexImage: XEX mapped into guest memory");
     DumpGuestStrings();
+    SetUpExtras();  // before any guest code runs: the tweaks patch tables read at boot
   }
   void OnPreLaunchModule() override {
     REXLOG_INFO("[doa4][LIFE] OnPreLaunchModule: about to spawn main guest thread");
@@ -119,6 +125,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     diag_overlay_.reset();  // before the base app destroys the ImGui drawer
     snap_stop_.store(true, std::memory_order_release);
     if (snap_thread_.joinable()) snap_thread_.join();
+    extras_stop_.store(true, std::memory_order_release);
+    if (extras_thread_.joinable()) extras_thread_.join();
   }
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
 
@@ -171,6 +179,13 @@ class DeadOrAlive4App : public rex::ReXApp {
       app_context().CallInUIThreadDeferred(std::move(fn));
     };
     host.close_menu = [this] { CloseMenu(); };
+    host.guest = guest_ready_ ? &guest_ : nullptr;
+    host.patcher = &patcher_;
+    host.protect = protect_;
+    host.save_dir = SaveFolder();
+    host.extras = &extras_;
+    host.running_alpha152 = running_alpha152_;
+    host.saved_alpha152 = &saved_alpha152_;
     menu_ = std::make_unique<doa4::MenuDialog>(drawer_, std::move(host));
     menu_open_.store(true, std::memory_order_release);
     REXLOG_INFO("[doa4][UI] menu opened");
@@ -205,8 +220,128 @@ class DeadOrAlive4App : public rex::ReXApp {
   rex::ui::ImGuiDrawer* drawer_ = nullptr;
   int running_scale_ = 1;
   int saved_scale_ = 1;  // what the menu last saved for the next start
+  // Extras tab (doa4_unlocks.h, doa4_tweaks.h): set up at OnPostLoadXexImage.
+  doa4::GuestBytes guest_;
+  bool guest_ready_ = false;
+  doa4::tweaks::TweakPatcher patcher_;
+  doa4::tweaks::ProtectFn protect_;
+  doa4::ExtrasState extras_;
+  bool running_alpha152_ = false;
+  bool saved_alpha152_ = false;  // what the menu last saved for the next start
+  std::atomic<bool> extras_stop_{false};
+  std::thread extras_thread_;  // DOA4_EXTRAS_TEST only
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
+
+  // Guest memory access for the Extras tab, the game tweaks the config turns
+  // on (applied before any guest code runs, as Xenia applies patches), and the
+  // DOA4_EXTRAS_TEST watcher.
+  void SetUpExtras() {
+    rex::Runtime* rt = runtime();
+    rex::memory::Memory* memory = rt ? rt->memory() : nullptr;
+    if (!memory) {
+      REXLOG_WARN("[doa4][EXTRAS] no guest memory; Extras tab disabled");
+      return;
+    }
+    guest_.read = [memory](uint32_t address) {
+      return *memory->TranslateVirtual<uint8_t*>(address);
+    };
+    guest_.write = [memory](uint32_t address, uint8_t value) {
+      *memory->TranslateVirtual<uint8_t*>(address) = value;
+    };
+    protect_ = [memory](uint32_t address, uint32_t size, bool writable) {
+      rex::memory::BaseHeap* heap = memory->LookupHeap(address);
+      const uint32_t access =
+          writable ? (rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite)
+                   : rex::memory::kMemoryProtectRead;
+      return heap && heap->Protect(address, size, access);
+    };
+    patcher_.CaptureOriginals(guest_);
+    guest_ready_ = true;
+    const auto& tweaks = doa4::tweaks::AllTweaks();
+    for (size_t i = 0; i < tweaks.size(); ++i) {
+      if (!rex::cvar::Query<bool>(tweaks[i].cvar)) continue;
+      std::string error = patcher_.Apply(guest_, i, true, protect_);
+      const bool in_memory = doa4::tweaks::TweakPatcher::IsOn(guest_, i);
+      if (error.empty() && in_memory) {
+        REXLOG_INFO("[doa4][EXTRAS] {} applied at load", tweaks[i].cvar);
+      } else {
+        REXLOG_ERROR("[doa4][EXTRAS] {} at load: {} (bytes in memory: {})", tweaks[i].cvar,
+                     error.empty() ? "no error" : error, in_memory);
+      }
+    }
+    running_alpha152_ = rex::cvar::Query<bool>("doa4_alpha152");
+    saved_alpha152_ = running_alpha152_;
+    StartExtrasTestWatcher();
+  }
+
+  // <user_data_root>/<XUID>/544307D1/00000001/ups.dat, or empty before the
+  // kernel has a profile.
+  std::filesystem::path SaveFolder() const {
+    auto* ks = rex::system::kernel_state();
+    const uint64_t xuid = ks && ks->user_profile() ? ks->user_profile()->xuid() : 0;
+    return doa4::SaveDir(user_data_root(), xuid);
+  }
+
+  std::string DumpProfile(uint32_t profile) const {
+    std::string out;
+    for (uint32_t offset = doa4::unlocks::kFirstStoryClear; offset < 0x404C; ++offset) {
+      out += fmt::format("{:02x}", guest_.Read(profile + offset));
+    }
+    return out;
+  }
+
+  // DOA4_EXTRAS_TEST=<anything>: log every change of the profile pointer, slot
+  // and FindProfile's answer. =everything: also unlock everything once, with
+  // the backup, the first time a profile is found, and log the bytes before and
+  // after and when the game rewrites ups.dat. For runtime checks only.
+  void StartExtrasTestWatcher() {
+    const char* env = std::getenv("DOA4_EXTRAS_TEST");
+    if (!env || !env[0]) return;
+    const bool unlock_everything = std::string_view(env) == "everything";
+    REXLOG_INFO("[doa4][EXTRAS] test watcher on (DOA4_EXTRAS_TEST={})", env);
+    extras_thread_ = std::thread([this, unlock_everything] {
+      using namespace std::chrono_literals;
+      std::string last;
+      bool unlocked = false;
+      bool saved_logged = false;
+      doa4::ExtrasState state;  // its own: extras_ belongs to the UI thread
+      while (!extras_stop_.load(std::memory_order_acquire)) {
+        const uint32_t pointer = guest_.ReadBe32(doa4::unlocks::kProfilePointer);
+        const uint32_t slot = guest_.ReadBe32(doa4::unlocks::kProfileSlot);
+        const std::optional<uint32_t> profile = doa4::unlocks::FindProfile(guest_);
+        std::string now = fmt::format("profile pointer {:#010x} slot {} -> {}", pointer, slot,
+                                      profile ? fmt::format("{:#010x}", *profile) : "none");
+        if (now != last) {
+          REXLOG_INFO("[doa4][EXTRAS] {}", now);
+          last = std::move(now);
+        }
+        if (unlock_everything && !unlocked && profile) {
+          unlocked = true;
+          REXLOG_INFO("[doa4][EXTRAS] before {}", DumpProfile(*profile));
+          std::string error;
+          if (doa4::UnlockWithBackup(guest_, *profile, doa4::unlocks::Unlock::kEverything,
+                                     SaveFolder(), doa4::BackupStamp(), &state, &error)) {
+            REXLOG_INFO("[doa4][EXTRAS] test unlock: {} backup: {}", state.last_change,
+                        state.backup.empty() ? state.backup_note : state.backup.string());
+            REXLOG_INFO("[doa4][EXTRAS] after  {}", DumpProfile(*profile));
+          } else {
+            REXLOG_ERROR("[doa4][EXTRAS] test unlock: {}", error);
+          }
+        }
+        if (unlocked && !saved_logged) {
+          doa4::PollSaved(SaveFolder(), &state);
+          if (state.saved) {
+            saved_logged = true;
+            REXLOG_INFO("[doa4][EXTRAS] the game rewrote ups.dat");
+          }
+        }
+        for (int i = 0; i < 10 && !extras_stop_.load(std::memory_order_acquire); ++i) {
+          std::this_thread::sleep_for(100ms);
+        }
+      }
+    });
+  }
 
   // DOA4 accesses its data via paths like d:\chrone.afs, D:\Sound\... and
   // d:\dic\... where the disc root *is* the game data directory (NOT a

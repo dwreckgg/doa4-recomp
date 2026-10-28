@@ -1,8 +1,8 @@
 // In-game menu, opened and closed with Escape (bind_doa4_menu).
 //
-// Tabs: Video (display mode, render scale) and Controls (per-slot controller
-// remap, keyboard binds). Every change is applied to its cvar and saved to
-// dead_or_alive_4.toml with doa4::SaveTomlKey. The game keeps running while
+// Tabs: Video (display mode, render scale), Controls (per-slot controller
+// remap, keyboard binds) and Extras (unlocks, game tweaks). Every setting is
+// applied to its cvar and saved to dead_or_alive_4.toml with doa4::SaveTomlKey. The game keeps running while
 // the menu is open; its input is blocked (DeadOrAlive4App::OnBlocksGuestInput),
 // so the game sees an untouched controller and keyboard.
 //
@@ -20,6 +20,10 @@
 #include <rex/input/input.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/window_listener.h>
+
+#include "doa4_extras.h"
+#include "doa4_guest.h"
+#include "doa4_tweaks.h"
 
 namespace rex::input {
 class InputSystem;
@@ -45,6 +49,17 @@ struct MenuHost {
   std::function<void(std::function<void()> fn)> defer;
   // Destroys the menu (called through `defer`).
   std::function<void()> close_menu;
+
+  // Extras tab. `guest` is null until the XEX is loaded into guest memory.
+  const GuestBytes* guest = nullptr;
+  tweaks::TweakPatcher* patcher = nullptr;  // owned by the app
+  tweaks::ProtectFn protect;
+  std::filesystem::path save_dir;  // the ups.dat save package folder, or empty
+  ExtrasState* extras = nullptr;   // owned by the app: survives closing the menu
+  bool running_alpha152 = false;   // doa4_alpha152 the game started with
+  // doa4_alpha152 saved for the next start; owned by the app, changed only
+  // after a successful save.
+  bool* saved_alpha152 = nullptr;
 };
 
 class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListener {
@@ -68,6 +83,10 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void DrawControlsTab();
   void DrawPadSection();
   void DrawKeyboardSection();
+  void DrawExtrasTab();
+  // Saves the tweak's cvar; on success sets it and, for a live tweak, writes
+  // or reverts its bytes. Failures go to status_.
+  void SetTweak(size_t tweak, bool on);
   void StartPadListen(size_t row, const rex::input::X_INPUT_GAMEPAD* pad);
   void PollPadListen(const rex::input::X_INPUT_GAMEPAD& pad);
   void AssignPad(size_t target, size_t source);
@@ -83,6 +102,7 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   size_t listen_row_ = 0;
   uint32_t pad_held_ = 0;  // PadControl bits held since pad listening started
   bool pad_connected_ = false;  // last non-busy GetRawState answer for slot_
+  double next_save_poll_ = 0.0;  // ImGui time of the next "has the game saved?" check
   std::string status_;     // last error, shown in red
 };
 
