@@ -21,6 +21,8 @@
 #include <format>
 #include <system_error>
 
+#include "doa4_utf8.h"
+
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -110,7 +112,7 @@ std::string WriteImage(const Image& image, const std::filesystem::path& path, Fi
   }
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
-  if (ec) return "cannot create " + path.parent_path().string() + ": " + ec.message();
+  if (ec) return "cannot create " + Utf8(path.parent_path()) + ": " + ec.message();
   ComScope com(COINIT_MULTITHREADED);
   if (!com.ok()) return "Windows imaging is not available";
   std::filesystem::path tmp = path;
@@ -118,7 +120,7 @@ std::string WriteImage(const Image& image, const std::filesystem::path& path, Fi
   std::string error = Encode(image, tmp, type);
   if (error.empty()) {
     std::filesystem::rename(tmp, path, ec);
-    if (ec) error = "cannot write " + path.string() + ": " + ec.message();
+    if (ec) error = "cannot write " + Utf8(path) + ": " + ec.message();
   }
   if (!error.empty()) std::filesystem::remove(tmp, ec);
   return error;
@@ -155,6 +157,8 @@ bool ReadImage(const std::filesystem::path& path, Image* image) {
   }
   return true;
 }
+
+std::string PathText(const std::filesystem::path& path) { return Utf8(path); }
 
 std::filesystem::path DefaultPhotoDir() {
   PWSTR pictures = nullptr;

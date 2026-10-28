@@ -62,12 +62,17 @@ class Service {
     std::function<Settings()> settings;              // read when a request is made
     std::function<std::tm()> now;                    // local time, for file names
     std::function<void(const Result&)> on_result;    // called on the worker thread
+    std::function<uint64_t()> clock_ms;              // a steady clock (key-repeat rule)
   };
 
   explicit Service(Hooks hooks);
   ~Service();
 
-  // Captures the current frame on the worker and saves it (F12).
+  // A hotkey call within this long of the previous one is a key repeat.
+  static constexpr uint64_t kRepeatWindowMs = 400;
+
+  // Captures the current frame on the worker and saves it (F12). Key repeats
+  // of a held key are ignored (kRepeatWindowMs).
   void RequestHotkeyPhoto();
   // Saves a frame already captured (in-game snapshot copies, debug frames).
   void SubmitCaptured(Image frame, Source source, std::string suffix = "");
@@ -98,6 +103,8 @@ class Service {
   std::deque<Job> jobs_;
   bool busy_ = false;
   bool stop_ = false;
+  bool have_last_hotkey_ = false;
+  uint64_t last_hotkey_ms_ = 0;
   Result last_;
   std::thread worker_;
 };

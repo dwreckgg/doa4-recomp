@@ -4,6 +4,8 @@
 
 #include <system_error>
 
+#include "doa4_utf8.h"
+
 namespace doa4 {
 
 namespace {
@@ -27,10 +29,10 @@ BackupResult EnsureSaveBackup(const std::filesystem::path& save_dir,
     result.message = "No save existed yet, so there was nothing to back up.";
     return result;
   }
-  const std::string prefix = save_dir.filename().string() + ".backup-";
+  const std::u8string prefix = save_dir.filename().u8string() + u8".backup-";
   if (fs::is_directory(backup_root, ec)) {
     for (const auto& entry : fs::directory_iterator(backup_root, ec)) {
-      if (entry.is_directory(ec) && entry.path().filename().string().rfind(prefix, 0) == 0 &&
+      if (entry.is_directory(ec) && entry.path().filename().u8string().rfind(prefix, 0) == 0 &&
           HoldsCompleteSave(entry.path())) {
         result.ok = true;
         result.backup = entry.path();
@@ -38,7 +40,7 @@ BackupResult EnsureSaveBackup(const std::filesystem::path& save_dir,
       }
     }
     if (ec) {
-      result.message = "cannot list " + backup_root.string() + ": " + ec.message();
+      result.message = "cannot list " + Utf8(backup_root) + ": " + ec.message();
       return result;
     }
   }
@@ -47,15 +49,16 @@ BackupResult EnsureSaveBackup(const std::filesystem::path& save_dir,
         "the save file is incomplete (the game may be saving right now); try again in a moment";
     return result;
   }
-  const fs::path backup = backup_root / (prefix + std::string(stamp));
+  const fs::path backup =
+      backup_root / (prefix + std::u8string(stamp.begin(), stamp.end()));
   if (fs::exists(backup, ec)) {
-    result.message = "cannot back up the save: " + backup.string() + " is in the way";
+    result.message = "cannot back up the save: " + Utf8(backup) + " is in the way";
     return result;
   }
   fs::create_directories(backup_root, ec);
   if (!ec) fs::copy(save_dir, backup, fs::copy_options::recursive, ec);
   if (ec || !HoldsCompleteSave(backup)) {
-    result.message = "cannot back up the save to " + backup.string() +
+    result.message = "cannot back up the save to " + Utf8(backup) +
                      (ec ? ": " + ec.message() : ": the copy is incomplete");
     std::error_code ignored;
     fs::remove_all(backup, ignored);

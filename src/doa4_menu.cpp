@@ -32,6 +32,7 @@
 #include "doa4_config.h"
 #include "doa4_graphics.h"
 #include "doa4_photo_win.h"
+#include "doa4_utf8.h"
 #include "doa4_unlocks.h"
 
 namespace doa4 {
@@ -399,7 +400,7 @@ void MenuDialog::DrawExtrasTab() {
   }
   if (!state.backup.empty()) {
     ImGui::TextWrapped("Backup of your save from before the first unlock: %s",
-                       state.backup.string().c_str());
+                       Utf8(state.backup).c_str());
   } else if (!state.backup_note.empty()) {
     ImGui::TextWrapped("%s", state.backup_note.c_str());
   }

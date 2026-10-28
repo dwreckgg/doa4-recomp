@@ -208,7 +208,8 @@ class DeadOrAlive4App : public rex::ReXApp {
       if (result.error) {
         REXLOG_WARN("[doa4][PHOTO] {}", result.text);
       } else {
-        REXLOG_INFO("[doa4][PHOTO] {} ({})", result.text, result.path.parent_path().string());
+        REXLOG_INFO("[doa4][PHOTO] {} ({})", result.text,
+                    doa4::photo::PathText(result.path.parent_path()));
       }
       app_context().CallInUIThreadDeferred([this, result] { ShowPhotoNotice(result); });
     };

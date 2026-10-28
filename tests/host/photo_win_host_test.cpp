@@ -103,6 +103,28 @@ static void TestErrors(const fs::path& dir) {
   CHECK(!ReadImage(dir / "blocker", &nothing));
 }
 
+// A folder name outside the Windows ANSI code page (e.g. a Japanese profile
+// or a chosen folder in Chinese or Japanese): saving works, a failure is reported as text, and
+// nothing throws (path::string() throws for such names on MSVC's library).
+static void TestNonAnsiFolder(const fs::path& dir) {
+  const fs::path photos = dir / fs::path(u8"\u5199\u771F");  // two CJK characters
+  const Image image = Pattern(8, 8);
+  CHECK(WriteImage(image, photos / "a.png", FileType::kPng).empty());
+  CHECK(fs::exists(photos / "a.png"));
+  std::ofstream(photos / "blocker") << "x";
+  std::string error;
+  try {
+    error = WriteImage(image, photos / "blocker" / "c.png", FileType::kPng);
+  } catch (const std::exception& e) {
+    std::printf("FAIL WriteImage threw: %s\n", e.what());
+    ++g_failures;
+  }
+  CHECK(!error.empty());
+  // PathText gives the UTF-8 bytes, for logs and messages.
+  const std::string text = PathText(photos);
+  CHECK(text.size() >= 6 && text.substr(text.size() - 6) == "\xE5\x86\x99\xE7\x9C\x9F");
+}
+
 static void TestFolders() {
   const fs::path pictures = DefaultPhotoDir();
   CHECK(!pictures.empty());
@@ -118,6 +140,7 @@ int main() {
   try {
     TestRoundTrip(dir);
     TestErrors(dir);
+    TestNonAnsiFolder(dir);
     TestFolders();
   } catch (const std::exception& e) {
     std::printf("FAIL threw: %s\n", e.what());

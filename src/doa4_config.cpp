@@ -7,6 +7,8 @@
 
 #include <toml++/toml.hpp>
 
+#include "doa4_utf8.h"
+
 namespace doa4 {
 
 namespace {
@@ -102,7 +104,7 @@ std::string SaveTomlKey(const std::filesystem::path& path, std::string_view key,
     if (in) {
       text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     } else if (std::filesystem::exists(path)) {
-      return "cannot read " + path.string();
+      return "cannot read " + Utf8(path);
     }
   }
   std::string updated = UpsertTomlKey(text, key, value_literal);
@@ -113,15 +115,15 @@ std::string SaveTomlKey(const std::filesystem::path& path, std::string_view key,
   tmp += ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) return "cannot write " + tmp.string();
+    if (!out) return "cannot write " + Utf8(tmp);
     out << updated;
     out.flush();
-    if (!out) return "cannot write " + tmp.string();
+    if (!out) return "cannot write " + Utf8(tmp);
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
   if (ec) {
-    std::string error = "cannot replace " + path.string() + ": " + ec.message();
+    std::string error = "cannot replace " + Utf8(path) + ": " + ec.message();
     std::filesystem::remove(tmp, ec);
     return error;
   }

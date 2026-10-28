@@ -2,6 +2,8 @@
 
 #include "doa4_photo_service.h"
 
+#include <chrono>
+#include <exception>
 #include <utility>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -17,6 +19,12 @@ namespace doa4::photo {
 namespace {
 
 const char* Extension(FileType type) { return type == FileType::kPng ? "png" : "jpg"; }
+
+uint64_t SteadyMs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
 
 }  // namespace
 
@@ -59,6 +67,17 @@ Service::Service(Hooks hooks) : hooks_(std::move(hooks)), worker_([this] { Run()
 Service::~Service() { Stop(); }
 
 void Service::RequestHotkeyPhoto() {
+  {
+    // A held key repeats about every 33 ms: one photo per hold. Every call
+    // (taken or not) restarts the window, so only a release and a new press
+    // after kRepeatWindowMs makes another photo.
+    const uint64_t now = hooks_.clock_ms ? hooks_.clock_ms() : SteadyMs();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool repeat = have_last_hotkey_ && now - last_hotkey_ms_ < kRepeatWindowMs;
+    last_hotkey_ms_ = now;
+    have_last_hotkey_ = true;
+    if (repeat) return;
+  }
   Job job;
   job.capture = true;
   job.source = Source::kHotkey;
@@ -121,7 +140,14 @@ void Service::Run() {
       jobs_.pop_front();
       busy_ = true;
     }
-    Handle(job);
+    try {
+      Handle(job);
+    } catch (const std::exception& e) {
+      // Never let a failure on this thread end the game.
+      Report(true, std::string("Photo not saved: ") + e.what(), {});
+    } catch (...) {
+      Report(true, "Photo not saved.", {});
+    }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       busy_ = false;
@@ -151,7 +177,7 @@ void Service::Handle(Job& job) {
       Report(true, "Photo not saved: " + error, {});
       return;
     }
-    saved += (saved.empty() ? "" : ", ") + path.filename().string();
+    saved += (saved.empty() ? "" : ", ") + PathText(path.filename());
     last_path = path;
   }
   Report(false, "Saved " + saved, last_path);
@@ -167,7 +193,14 @@ void Service::Report(bool error, std::string text, std::filesystem::path path) {
     last_.path = std::move(path);
     result = last_;
   }
-  if (hooks_.on_result) hooks_.on_result(result);
+  if (hooks_.on_result) {
+    try {
+      hooks_.on_result(result);
+    } catch (...) {
+      // The result is still in last_result(); a failing logger or notice must
+      // not end the worker.
+    }
+  }
 }
 
 }  // namespace doa4::photo

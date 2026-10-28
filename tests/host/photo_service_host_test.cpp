@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <stdexcept>
 
 static int g_failures = 0;
 #define CHECK(cond)                                               \
@@ -87,6 +88,8 @@ struct Harness {
   Settings settings;
   std::mutex mutex;
   std::vector<Result> results;
+  uint64_t clock = 1000;  // ms, for the hotkey repeat rule
+  int throw_results = 0;  // on_result throws this many times
   Service::Hooks Hooks() {
     Service::Hooks h;
     h.capture = [this](Image* image) {
@@ -108,7 +111,12 @@ struct Harness {
     h.on_result = [this](const Result& r) {
       std::lock_guard<std::mutex> lock(mutex);
       results.push_back(r);
+      if (throw_results > 0) {
+        --throw_results;
+        throw std::runtime_error("a logger failed");
+      }
     };
+    h.clock_ms = [this] { return clock; };
     return h;
   }
 };
@@ -138,12 +146,14 @@ static void TestServiceEndToEnd() {
       std::lock_guard<std::mutex> lock(h.mutex);
       h.settings.format = Format::kJpgFull;
     }
+    h.clock += 1000;  // a new press, not a key repeat
     service.RequestHotkeyPhoto();
     service.Flush();
     const fs::path second = h.dir / "photos" / "DOA4_2026-10-28_09-05-07.jpg";
     CHECK(ReadImage(second, &back) && back.width == 64);
 
     // Same second, same name: the next file gets _2.
+    h.clock += 1000;  // a new press, not a key repeat
     service.RequestHotkeyPhoto();
     service.Flush();
     CHECK(fs::exists(h.dir / "photos" / "DOA4_2026-10-28_09-05-07_2.jpg"));
@@ -168,6 +178,7 @@ static void TestServiceEndToEnd() {
     h.capture_ok = false;
     const size_t files_before = size_t(std::distance(fs::directory_iterator(h.dir / "photos"),
                                                      fs::directory_iterator{}));
+    h.clock += 1000;  // a new press, not a key repeat
     service.RequestHotkeyPhoto();
     service.Flush();
     CHECK(service.last_result().error);
@@ -197,8 +208,59 @@ static void TestServiceEndToEnd() {
   fs::remove_all(h.dir);
 }
 
+// Holding F12 repeats the key about every 33 ms: one photo per hold, not one
+// per repeat. A new press after a short pause is a new photo.
+static void TestHotkeyRepeat() {
+  Harness h;
+  h.dir = fs::temp_directory_path() / "doa4_photo_service_repeat_data";
+  fs::remove_all(h.dir);
+  h.settings.dir = h.dir;
+  {
+    Service service(h.Hooks());
+    for (int i = 0; i < 30; ++i) {  // a 1 s hold
+      service.RequestHotkeyPhoto();
+      h.clock += 33;
+    }
+    service.Flush();
+    CHECK(h.captures == 1);
+    h.clock += 600;  // released, pressed again
+    service.RequestHotkeyPhoto();
+    service.Flush();
+    CHECK(h.captures == 2);
+  }
+  fs::remove_all(h.dir);
+}
+
+// A failure on the worker (here the result callback throws) is reported and
+// the worker keeps going; it never ends the process.
+static void TestWorkerSurvivesAThrow() {
+  Harness h;
+  h.dir = fs::temp_directory_path() / "doa4_photo_service_throw_data";
+  fs::remove_all(h.dir);
+  h.settings.dir = h.dir;
+  h.throw_results = 1;
+  {
+    Service service(h.Hooks());
+    service.RequestHotkeyPhoto();
+    service.Flush();
+    h.clock += 1000;
+    service.RequestHotkeyPhoto();
+    service.Flush();
+    CHECK(h.captures == 2);
+    CHECK(h.results.size() == 2);
+  }
+  fs::remove_all(h.dir);
+}
+
 int main() {
   TestPlanOutputs();
+  try {
+    TestHotkeyRepeat();
+    TestWorkerSurvivesAThrow();
+  } catch (const std::exception& e) {
+    std::printf("FAIL threw: %s\n", e.what());
+    ++g_failures;
+  }
   try {
     TestServiceEndToEnd();
   } catch (const std::exception& e) {

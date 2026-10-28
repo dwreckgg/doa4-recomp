@@ -33,6 +33,10 @@ std::optional<std::filesystem::path> PickFolder(void* owner_hwnd,
 // Opens `dir` in Explorer.
 void OpenInExplorer(const std::filesystem::path& dir);
 
+// A path as UTF-8 text, for logs and messages. (path::string() converts to
+// the ANSI code page and throws for characters it cannot hold.)
+std::string PathText(const std::filesystem::path& path);
+
 // The size of the monitor showing `hwnd` (the primary monitor when null).
 Size MonitorSize(void* hwnd);
 

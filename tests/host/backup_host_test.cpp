@@ -113,6 +113,25 @@ static void TestBackup() {
   CHECK(!blocked.message.empty());
   CHECK(fs::is_regular_file(backups3 / "ups.dat.backup-blocked"));
 
+  // A Windows profile or folder whose name is outside the ANSI code page:
+  // nothing throws (path::string() would), errors are reported as text.
+  const fs::path wide = root / fs::path(u8"\u5199\u771F");
+  const fs::path save4 = wide / "ups.dat";
+  fs::create_directories(save4);
+  WriteFile(save4 / "ups.dat", Save('5'));
+  const fs::path backups4 = wide / "b";
+  fs::create_directories(backups4 / fs::path(u8"\u5199\u771F"));  // a foreign entry in the folder
+  WriteFile(backups4 / "ups.dat.backup-x", "a file in the way");
+  try {
+    doa4::BackupResult r = doa4::EnsureSaveBackup(save4, backups4, "x");
+    CHECK(!r.ok && !r.message.empty());
+    doa4::BackupResult r2 = doa4::EnsureSaveBackup(save4, backups4, "y");
+    CHECK(r2.ok && fs::exists(r2.backup / "ups.dat"));
+  } catch (const std::exception& e) {
+    std::printf("FAIL EnsureSaveBackup threw: %s\n", e.what());
+    ++g_failures;
+  }
+
   fs::remove_all(root);
 }
 
