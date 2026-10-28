@@ -143,6 +143,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     }
     drawer_ = drawer;
     running_scale_ = rex::cvar::Query<int32_t>("resolution_scale");
+    saved_scale_ = running_scale_;
     REXLOG_INFO("[doa4][UI] resolution_scale {} fullscreen {}", running_scale_,
                 rex::cvar::Query<bool>("fullscreen"));
     rex::ui::RegisterBind("bind_doa4_menu", "Escape", "Toggle DOA4 menu",
@@ -161,6 +162,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.window = window();
     host.config_path = rex::filesystem::GetExecutableFolder() / (GetName() + ".toml");
     host.running_scale = running_scale_;
+    host.saved_scale = &saved_scale_;
     host.input = [this]() -> rex::input::InputSystem* {
       rex::Runtime* rt = runtime();
       return rt ? dynamic_cast<rex::input::InputSystem*>(rt->input_system()) : nullptr;
@@ -202,6 +204,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::atomic<bool> menu_open_{false};
   rex::ui::ImGuiDrawer* drawer_ = nullptr;
   int running_scale_ = 1;
+  int saved_scale_ = 1;  // what the menu last saved for the next start
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
 

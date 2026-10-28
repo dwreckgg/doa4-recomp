@@ -5,6 +5,8 @@
 #include <iterator>
 #include <system_error>
 
+#include <toml++/toml.hpp>
+
 namespace doa4 {
 
 namespace {
@@ -13,6 +15,25 @@ std::string_view Trim(std::string_view s) {
   while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
   while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
   return s;
+}
+
+constexpr std::string_view kUtf8Bom = "\xEF\xBB\xBF";
+
+// The SDK loads the config with toml++ and drops the WHOLE file on a parse
+// error (rex::cvar::LoadConfig), so `updated` must parse and must hold exactly
+// `key = value_literal`. Returns "" when it does, else why not.
+std::string CheckLoadable(const std::string& updated, std::string_view key,
+                          std::string_view value_literal) {
+  try {
+    toml::table expected = toml::parse(std::string(key) + " = " + std::string(value_literal));
+    toml::table table = toml::parse(updated);
+    if (table[key] != expected[key]) {
+      return "the file has a form the menu cannot edit (" + std::string(key) + ")";
+    }
+  } catch (const toml::parse_error& e) {
+    return "the file would not load (" + std::string(e.description()) + ")";
+  }
+  return {};
 }
 
 }  // namespace
@@ -28,6 +49,10 @@ std::string UpsertTomlKey(std::string_view text, std::string_view key,
   // so nothing inside a table is ever matched.
   bool done = false;
   size_t pos = 0;
+  if (text.substr(0, kUtf8Bom.size()) == kUtf8Bom) {
+    out += kUtf8Bom;  // kept, and not part of the first line's key
+    pos = kUtf8Bom.size();
+  }
   while (pos < text.size()) {
     size_t end = text.find('\n', pos);
     size_t next = end == std::string_view::npos ? text.size() : end + 1;
@@ -81,6 +106,9 @@ std::string SaveTomlKey(const std::filesystem::path& path, std::string_view key,
     }
   }
   std::string updated = UpsertTomlKey(text, key, value_literal);
+  if (std::string error = CheckLoadable(updated, key, value_literal); !error.empty()) {
+    return error + "; dead_or_alive_4.toml was left unchanged";
+  }
   std::filesystem::path tmp = path;
   tmp += ".tmp";
   {

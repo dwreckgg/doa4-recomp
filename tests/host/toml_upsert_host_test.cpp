@@ -80,11 +80,52 @@ static void TestSave() {
   std::filesystem::remove_all(dir);
 }
 
+// The SDK loads the file with toml++ and drops ALL of it on a parse error, so a
+// save must never leave a file that toml++ rejects or reads differently.
+static std::string SaveInto(const std::filesystem::path& path, const std::string& before,
+                            const char* key, const char* value) {
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << before;
+  }
+  return doa4::SaveTomlKey(path, key, value);
+}
+
+static void TestSaveKeepsFileLoadable() {
+  auto dir = std::filesystem::temp_directory_path() / "doa4_toml_upsert_test_data";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  auto path = dir / "dead_or_alive_4.toml";
+  // A UTF-8 BOM (some editors add one) is kept and the key after it is found.
+  const std::string bom = "\xEF\xBB\xBF";
+  CHECK(SaveInto(path, bom + "fullscreen = false\n", "fullscreen", "true").empty());
+  CHECK(ReadAll(path) == bom + "fullscreen = true\n");
+  // Shapes the line editor cannot handle are refused and the file is left untouched.
+  const std::string quoted = "\"fullscreen\" = false\n";
+  CHECK(!SaveInto(path, quoted, "fullscreen", "true").empty());
+  CHECK(ReadAll(path) == quoted);
+  const std::string array_with_bracket_line = "list = [\n  [1, 2],\n]\n";
+  CHECK(!SaveInto(path, array_with_bracket_line, "fullscreen", "true").empty());
+  CHECK(ReadAll(path) == array_with_bracket_line);
+  const std::string string_with_key_line = "note = \"\"\"\nfullscreen = 1\n\"\"\"\nfullscreen = false\n";
+  CHECK(!SaveInto(path, string_with_key_line, "fullscreen", "true").empty());
+  CHECK(ReadAll(path) == string_with_key_line);
+  // A file that is already broken is not made worse.
+  const std::string broken = "fullscreen = \n";
+  CHECK(!SaveInto(path, broken, "resolution_scale", "2").empty());
+  CHECK(ReadAll(path) == broken);
+  auto tmp = path;
+  tmp += ".tmp";
+  CHECK(!std::filesystem::exists(tmp));
+  std::filesystem::remove_all(dir);
+}
+
 int main() {
   TestUpsert();
   TestTomlString();
   try {
     TestSave();
+    TestSaveKeepsFileLoadable();
   } catch (const std::exception& e) {
     std::printf("FAIL TestSave threw: %s\n", e.what());
     ++g_failures;

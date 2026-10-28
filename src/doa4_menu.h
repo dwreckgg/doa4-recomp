@@ -35,6 +35,9 @@ struct MenuHost {
   rex::ui::Window* window = nullptr;
   std::filesystem::path config_path;  // <exe dir>/dead_or_alive_4.toml
   int running_scale = 1;              // resolution_scale the game started with
+  // resolution_scale saved for the next start; owned by the app so it survives
+  // the menu being closed and reopened. Changed only after a successful save.
+  int* saved_scale = nullptr;
   // The runtime's input system, or null (before the runtime exists).
   std::function<rex::input::InputSystem*()> input;
   // Runs `fn` on the UI thread after the current frame: window changes and
@@ -75,11 +78,11 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void SetAndSave(std::string_view name, std::string_view value, bool quote);
 
   MenuHost host_;
-  int pending_scale_;
   int slot_ = 0;  // controller slot shown in the Controls tab
   Listen listen_ = Listen::kNone;
   size_t listen_row_ = 0;
   uint32_t pad_held_ = 0;  // PadControl bits held since pad listening started
+  bool pad_connected_ = false;  // last non-busy GetRawState answer for slot_
   std::string status_;     // last error, shown in red
 };
 

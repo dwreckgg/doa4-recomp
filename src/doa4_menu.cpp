@@ -96,7 +96,6 @@ PadRemap CurrentRemap(int slot) {
 
 MenuDialog::MenuDialog(rex::ui::ImGuiDrawer* drawer, MenuHost host)
     : rex::ui::ImGuiDialog(drawer), host_(std::move(host)) {
-  pending_scale_ = rex::cvar::Query<int32_t>("resolution_scale");
   host_.window->AddInputListener(this, kInputZOrder);
 }
 
@@ -149,18 +148,23 @@ void MenuDialog::DrawVideoTab() {
   ImGui::SeparatorText("Render scale");
   static constexpr std::array<const char*, 3> kScaleLabels = {
       "x1 (1280x720)", "x2 (2560x1440)", "x3 (3840x2160)"};
+  int& saved_scale = *host_.saved_scale;
   for (int scale = 1; scale <= 3; ++scale) {
-    if (ImGui::RadioButton(kScaleLabels[scale - 1], pending_scale_ == scale) &&
-        pending_scale_ != scale) {
-      pending_scale_ = scale;
+    if (ImGui::RadioButton(kScaleLabels[scale - 1], saved_scale == scale) &&
+        saved_scale != scale) {
       // resolution_scale is read once at start-up: save it for the next start
       // without changing the running value.
       std::string error =
           SaveTomlKey(host_.config_path, "resolution_scale", std::to_string(scale));
-      status_ = error.empty() ? std::string() : "Could not save settings: " + error;
+      if (error.empty()) {
+        saved_scale = scale;
+        status_.clear();
+      } else {
+        status_ = "Could not save settings: " + error;
+      }
     }
   }
-  if (pending_scale_ != host_.running_scale) {
+  if (saved_scale != host_.running_scale) {
     ImGui::TextColored(kNoteColor, "Applies after a restart (running at x%d).",
                        host_.running_scale);
     if (ImGui::Button("Restart now")) {
@@ -182,6 +186,7 @@ void MenuDialog::DrawPadSection() {
     std::string label = fmt::format("Player {}", slot + 1);
     if (ImGui::RadioButton(label.c_str(), slot_ == slot) && slot_ != slot) {
       slot_ = slot;
+      pad_connected_ = false;
       if (listen_ == Listen::kPad) listen_ = Listen::kNone;
     }
   }
@@ -192,11 +197,16 @@ void MenuDialog::DrawPadSection() {
 
   rex::input::InputSystem* input = host_.input ? host_.input() : nullptr;
   rex::input::X_INPUT_STATE raw{};
-  const bool connected = input && input->GetRawState(slot_, &raw) == X_ERROR_SUCCESS;
-  if (!connected) {
+  const X_RESULT result = input ? input->GetRawState(slot_, &raw) : X_ERROR_DEVICE_NOT_CONNECTED;
+  if (result != X_ERROR_BUSY) {  // busy: keep last frame's answer
+    pad_connected_ = result == X_ERROR_SUCCESS;
+    if (pad_connected_ && listen_ == Listen::kPad) {
+      PollPadListen(raw.gamepad);
+    }
+  }
+  const bool connected = pad_connected_ && result == X_ERROR_SUCCESS;
+  if (!pad_connected_) {
     ImGui::TextDisabled("No controller in this slot.");
-  } else if (listen_ == Listen::kPad) {
-    PollPadListen(raw.gamepad);
   }
 
   const PadRemap remap = CurrentRemap(slot_);
