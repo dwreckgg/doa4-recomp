@@ -73,6 +73,7 @@ struct MenuHost {
   // to choose another (used from the next start).
   std::filesystem::path game_files;
   bool game_files_from_command_line = false;
+  std::filesystem::path user_data;  // saves and the shader cache (shown only)
   std::function<void()> change_game_files;
   bool running_alpha152 = false;   // doa4_alpha152 the game started with
   // doa4_alpha152 saved for the next start; owned by the app, changed only

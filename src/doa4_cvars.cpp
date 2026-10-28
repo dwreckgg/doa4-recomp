@@ -16,6 +16,11 @@ REXCVAR_DEFINE_BOOL(doa4_alpha152, false, "DOA4",
 REXCVAR_DEFINE_STRING(doa4_game_files, "", "DOA4",
                       "Folder holding the game files (default.xex), chosen by the first-run setup");
 
+// The save and shader-cache folder (doa4_gamefiles.h ChooseUserData); the
+// command line's --user_data_root overrides it. Empty: Documents\dead_or_alive_4.
+REXCVAR_DEFINE_STRING(doa4_user_data, "", "DOA4",
+                      "Folder for saves and the shader cache (empty: Documents/dead_or_alive_4)");
+
 // Photo tab: full-quality photos (doa4_photo_service.h).
 REXCVAR_DEFINE_STRING(doa4_photo_format, "png_monitor", "DOA4",
                       "Photo files: png_monitor, png_full or jpg_full")

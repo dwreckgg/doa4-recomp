@@ -119,6 +119,19 @@ bool HasXex(const fs::path& dir) {
   return fs::is_regular_file(dir / kXexName, ec);
 }
 
+UserDataChoice ChooseUserData(const fs::path& sdk_value, bool from_command_line,
+                              const fs::path& saved) {
+  if (from_command_line) return {sdk_value, UserDataSource::kCommandLine, ""};
+  if (!saved.empty()) {
+    if (PathFitsCodePage(saved)) return {saved, UserDataSource::kSaved, ""};
+    return {sdk_value, UserDataSource::kDefault,
+            "The saved data folder " + Utf8(saved) +
+                " has characters in its path that this build cannot use; using the default. Choose a "
+                "folder whose path uses plain letters and digits."};
+  }
+  return {sdk_value, UserDataSource::kDefault, ""};
+}
+
 bool PathFitsCodePage(const fs::path& path) {
   const std::wstring& text = path.native();
   if (text.empty() || GetACP() == CP_UTF8) return true;  // UTF-8 code page: everything fits

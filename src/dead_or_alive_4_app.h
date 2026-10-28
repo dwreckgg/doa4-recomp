@@ -79,7 +79,8 @@ class DeadOrAlive4App : public rex::ReXApp {
   // window, the ImGui drawer and the toml exist, before the runtime. See
   // notes/specs/2026-10-28-first-run-setup-design.md.
   std::optional<rex::PathConfig> OnFinalizePaths(
-      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override {
+      const rex::PathConfig& sdk_defaults, std::function<void(rex::PathConfig)> resume) override {
+    const rex::PathConfig defaults = WithUserData(sdk_defaults);
     const std::filesystem::path saved =
         doa4::PathFromUtf8(rex::cvar::Query<std::string>("doa4_game_files"));
     const doa4::gamefiles::StartChoice choice =
@@ -110,6 +111,34 @@ class DeadOrAlive4App : public rex::ReXApp {
                 return error;
               });
     return std::nullopt;
+  }
+
+  // The save and shader-cache folder: --user_data_root, else doa4_user_data,
+  // else the SDK's default (Documents\dead_or_alive_4). The SDK reads its own
+  // user_data_root before the toml is loaded, so a saved folder can only be
+  // applied here; the app's own readers use UserData(), never the base
+  // class's user_data_root(), which keeps the pre-hook value.
+  rex::PathConfig WithUserData(const rex::PathConfig& sdk) {
+    rex::PathConfig paths = sdk;
+    const doa4::gamefiles::UserDataChoice choice = doa4::gamefiles::ChooseUserData(
+        sdk.user_data_root, !rex::cvar::Query<std::string>("user_data_root").empty(),
+        doa4::PathFromUtf8(rex::cvar::Query<std::string>("doa4_user_data")));
+    if (!choice.note.empty()) REXLOG_WARN("[doa4][SETUP] {}", choice.note);
+    if (choice.source == doa4::gamefiles::UserDataSource::kSaved) {
+      paths.user_data_root = choice.path;
+      if (rex::cvar::Query<std::string>("cache_path").empty()) {
+        paths.cache_root = choice.path / "cache";  // the SDK's rule, re-applied
+      }
+    }
+    user_data_ = paths.user_data_root;
+    static constexpr const char* kSource[] = {"--user_data_root", "doa4_user_data", "default"};
+    REXLOG_INFO("[doa4][SETUP] user data: {} ({}), cache {}", doa4::Utf8(user_data_),
+                kSource[int(choice.source)], doa4::Utf8(paths.cache_root));
+    return paths;
+  }
+
+  const std::filesystem::path& UserData() const {
+    return user_data_.empty() ? user_data_root() : user_data_;
   }
 
   // Esc menu, Game tab: choose another location (used from the next start).
@@ -398,7 +427,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     settings.dir = dir.empty() ? doa4::photo::DefaultPhotoDir()
                                : std::filesystem::path(
                                      std::u8string(dir.begin(), dir.end()));
-    if (settings.dir.empty()) settings.dir = user_data_root() / "photos";
+    if (settings.dir.empty()) settings.dir = UserData() / "photos";
     return settings;
   }
 
@@ -503,7 +532,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.set_post_effect = [this](int index) { SetPostEffect(index); };
     host.photo_result = [this] { return photo_ ? photo_->last_result() : doa4::photo::Result{}; };
     host.photo_default_dir = doa4::photo::DefaultPhotoDir();
-    if (host.photo_default_dir.empty()) host.photo_default_dir = user_data_root() / "photos";
+    if (host.photo_default_dir.empty()) host.photo_default_dir = UserData() / "photos";
     host.guest = guest_ready_ ? &guest_ : nullptr;
     host.patcher = &patcher_;
     host.protect = protect_;
@@ -512,6 +541,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.extras = &extras_;
     host.game_files = game_files_;
     host.game_files_from_command_line = game_files_from_command_line_;
+    host.user_data = UserData();
     host.change_game_files = [this] { ChangeGameFiles(); };
     host.running_alpha152 = running_alpha152_;
     host.saved_alpha152 = &saved_alpha152_;
@@ -551,6 +581,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::unique_ptr<doa4::SetupDialog> setup_;
   std::atomic<bool> setup_open_{false};  // read by the guest's input polls
   std::filesystem::path game_files_;
+  std::filesystem::path user_data_;  // the resolved save folder (WithUserData)
   bool game_files_from_command_line_ = false;
   std::unique_ptr<doa4::DiagOverlayDialog> diag_overlay_;
   std::unique_ptr<doa4::MenuDialog> menu_;
@@ -627,14 +658,14 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::filesystem::path SaveFolder() const {
     auto* ks = rex::system::kernel_state();
     const uint64_t xuid = ks && ks->user_profile() ? ks->user_profile()->xuid() : 0;
-    return doa4::SaveDir(user_data_root(), xuid);
+    return doa4::SaveDir(UserData(), xuid);
   }
 
   // <user_data_root>/doa4_save_backups: outside the folder the game lists its
   // saves from (it would see a backup as a second save package).
   std::filesystem::path BackupFolder() const {
-    return user_data_root().empty() ? std::filesystem::path()
-                                    : user_data_root() / "doa4_save_backups";
+    return UserData().empty() ? std::filesystem::path()
+                                    : UserData() / "doa4_save_backups";
   }
 
   std::string DumpProfile(uint32_t profile) const {

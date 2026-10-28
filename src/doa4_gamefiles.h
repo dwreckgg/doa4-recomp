@@ -58,6 +58,19 @@ StartChoice ChooseStartPath(const std::filesystem::path& command_line,
                             const std::function<bool(const std::filesystem::path&)>& has_xex,
                             const std::function<bool(const std::filesystem::path&)>& fits = {});
 
+// The folder for saves and the shader cache. `sdk_value` is what the SDK
+// resolved (the command line's --user_data_root when `from_command_line`,
+// else its default); `saved` is doa4_user_data. Order: command line, saved
+// (when usable), default.
+enum class UserDataSource { kCommandLine, kSaved, kDefault };
+struct UserDataChoice {
+  std::filesystem::path path;
+  UserDataSource source = UserDataSource::kDefault;
+  std::string note;  // UTF-8; why a saved folder was not used, for the log
+};
+UserDataChoice ChooseUserData(const std::filesystem::path& sdk_value, bool from_command_line,
+                              const std::filesystem::path& saved);
+
 // The path converts to the Windows ANSI code page without loss. The SDK's
 // runtime turns the game folder into ANSI text while it starts and throws
 // (ending the game) on a name it cannot convert, so such folders are refused.

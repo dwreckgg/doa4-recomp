@@ -424,6 +424,24 @@ static void TestXexIsWrittenLast(const fs::path& dir) {
   CHECK(order.size() == 4);  // the four non-empty files, each once
 }
 
+// The save and shader-cache folder: --user_data_root wins, then the saved
+// doa4_user_data, then the SDK's default (Documents\dead_or_alive_4).
+static void TestChooseUserData() {
+  const fs::path sdk_default = "C:/Users/me/Documents/dead_or_alive_4";
+  const fs::path saved = "C:/doa4/userdata", cli = "D:/cli_userdata";
+  UserDataChoice c = ChooseUserData(cli, true, saved);
+  CHECK(c.path == cli && c.source == UserDataSource::kCommandLine && c.note.empty());
+  c = ChooseUserData(sdk_default, false, saved);
+  CHECK(c.path == saved && c.source == UserDataSource::kSaved);
+  c = ChooseUserData(sdk_default, false, "");
+  CHECK(c.path == sdk_default && c.source == UserDataSource::kDefault);
+  // A saved folder the runtime could not use falls back to the default, with
+  // a note for the log (the game must not fail to start over a save folder).
+  c = ChooseUserData(sdk_default, false, fs::path("D:/") / kEmoji);
+  CHECK(c.path == sdk_default && c.source == UserDataSource::kDefault);
+  CHECK(c.note.find("plain") != std::string::npos);
+}
+
 int main() {
   const fs::path dir = fs::temp_directory_path() / "doa4_gamefiles_test_data";
   fs::remove_all(dir);
@@ -433,6 +451,7 @@ int main() {
     TestChooseStartPath();
     TestGameTab();
     TestPathFitsCodePage();
+    TestChooseUserData();
     TestChooseStartPathRefusesUnrepresentable();
     TestCheckFolderRefusesUnusable(dir);
     TestXexIsWrittenLast(dir);

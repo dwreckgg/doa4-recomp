@@ -457,6 +457,8 @@ void MenuDialog::DrawGameTab() {
     });
   }
   ImGui::TextDisabled("A new location is used from the next start.");
+  ImGui::SeparatorText("Saves");
+  ImGui::TextWrapped("%s", Utf8(host_.user_data).c_str());
 }
 
 void MenuDialog::DrawPhotoTab() {
