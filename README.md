@@ -1,0 +1,236 @@
+# Dead or Alive 4 — PC recomp
+
+A native Windows build of **Dead or Alive 4** (Xbox 360), statically recompiled with the
+[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). The game's code is translated ahead of time
+into C++ (`generated/`); the SDK supplies the Xbox 360 runtime (kernel, GPU, audio, input). This
+repository contains **no game data**: you build it, then run it against files extracted from your
+own copy of the game.
+
+This checkout is [parkerallan/doa4-recomp](https://github.com/parkerallan/doa4-recomp) plus the local
+branch `perf-pacing` (frame pacing, Esc menu with Video / Controls / Extras / Photo tabs, graphics
+options, full-quality photos). It builds against a local `rexglue-sdk` branch, `doa4-perf`. Neither
+branch has been pushed anywhere; a fresh clone from GitHub gives the upstream versions without them
+(see [Building from a fresh GitHub clone](#building-from-a-fresh-github-clone)).
+
+## Contents
+
+1. [The game version](#1-the-game-version)
+2. [Tools](#2-tools)
+3. [Folder layout](#3-folder-layout)
+4. [Get the sources](#4-get-the-sources)
+5. [Extract the game files from the ISO](#5-extract-the-game-files-from-the-iso)
+6. [Build](#6-build)
+7. [Run](#7-run)
+8. [Regenerating the recompiled code](#8-regenerating-the-recompiled-code)
+9. [Host tests](#9-host-tests)
+10. [Troubleshooting](#10-troubleshooting)
+
+## 1. The game version
+
+The recompiled code matches one exact `default.xex`. Other regions or revisions will not work.
+
+| | |
+|---|---|
+| Disc image used | `Dead or Alive 4 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko) (Rev 1).iso` (Redump naming) |
+| Title ID | `544307D1` |
+| `default.xex` SHA-1 | `af8011945037b37c98fb8a78d5a4e844dd56c33f` |
+| `default.xex` MD5 | `b2eb9c5df1f2060ae9c616945450289f` |
+| Extracted size | about 6.8 GB |
+
+Make the image from a disc you own. After extracting (step 5), check the hash:
+
+```bat
+certutil -hashfile xex\DOA4\default.xex SHA1
+```
+
+## 2. Tools
+
+Versions are the ones this build was made with; nearby versions will probably work, but these are known
+to.
+
+| Tool | Version used | Where to get it |
+|---|---|---|
+| Windows 10/11, 64-bit, CPU with AVX2 (Intel Haswell / AMD Zen or newer) | Windows 11 | The build targets `x86-64-v3`. |
+| Git | any recent | <https://git-scm.com> or `winget install Git.Git` |
+| Visual Studio 2026 Build Tools (v18), workload **Desktop development with C++** | 18 | <https://visualstudio.microsoft.com/downloads/> — provides the Windows SDK, the MSVC libraries, **CMake 4.3.1** and **Ninja 1.13.2** (the build uses the bundled CMake and Ninja) |
+| LLVM / Clang (the compiler; MSVC's compiler is not used) | 23.1.4 | `winget install LLVM.LLVM` (installs to `C:\Program Files\LLVM`) |
+| Python 3 (for the ISO extractor and the symlink fix) | 3.14 | <https://www.python.org> or `winget install Python.Python.3.14` |
+
+Optional: [extract-xiso](https://github.com/XboxDev/extract-xiso) as an alternative ISO extractor
+(step 5).
+
+## 3. Folder layout
+
+Keep the three folders side by side. The code generator's manifest
+(`dead_or_alive_4_manifest.toml`) looks for the game at `../xex/DOA4`, so this layout matters when
+regenerating code (step 8); for building and running, any paths work.
+
+```
+doa4\
+  doa4-recomp\     this repository
+  rexglue-sdk\     the SDK, built from source together with the game
+  xex\DOA4\        the extracted game files (default.xex, *.afs, movie\, SOUND\, dic\)
+```
+
+## 4. Get the sources
+
+```bat
+mkdir C:\doa4
+cd /d C:\doa4
+git clone https://github.com/parkerallan/doa4-recomp doa4-recomp
+git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
+cd rexglue-sdk
+git checkout e8ce24f
+git submodule update --init --recursive
+git fetch --tags
+cd ..
+```
+
+`e8ce24f` is the SDK commit that generated this port's code (v0.8.x; the manifest names
+`0.8.1.4-dev.ge8ce24f`). `git fetch --tags` only silences a CMake version warning.
+
+On this PC the working branches are `perf-pacing` (this repository) and `doa4-perf` (the SDK):
+`git checkout perf-pacing` and `git -C ..\rexglue-sdk checkout doa4-perf`.
+
+### Fix the SDK's symlinks (Windows)
+
+Two SDK submodules (`libmspack`, `o1heap`) contain git symlinks. Unless symlinks are enabled
+(Windows Developer Mode plus `git config --global core.symlinks true` *before* cloning), git
+checks them out as small text files holding a path, and the build fails on them (for example
+errors in `thirdparty/libmspack/cabextract/mspack/lzxd.c`, whose content is just
+`../../libmspack/mspack/lzxd.c`). Replace them with real copies:
+
+```bat
+py -3 doa4-recomp\tools\fix_git_symlinks.py rexglue-sdk
+```
+
+It reports `replaced 16 symlink stub(s)` the first time and nothing afterwards; it is safe to run
+again. `git status` in the SDK then shows the two submodules as modified (` m`), which is expected.
+
+## 5. Extract the game files from the ISO
+
+The recomp reads the game's files from a folder, not from the disc image. Xbox 360 discs use the
+XDVDFS file system, which ordinary ISO tools cannot open. `tools/xdvdfs_extract.py` (a short Python
+script, no dependencies) is what this build used. It finds the game partition itself (DOA4 is an XGD2
+disc; its partition starts at byte `0xFD90000`).
+
+```bat
+cd /d C:\doa4
+py -3 doa4-recomp\tools\xdvdfs_extract.py "Dead or Alive 4 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko) (Rev 1).iso" xex\DOA4 --list
+py -3 doa4-recomp\tools\xdvdfs_extract.py "Dead or Alive 4 (USA, Europe) (En,Ja,Fr,De,Es,It,Zh,Ko) (Rev 1).iso" xex\DOA4
+```
+
+The first command only lists the contents (a quick check that the image is readable); the second
+extracts about 6.8 GB. Then check the `default.xex` hash (step 1). The ISO is not needed afterwards.
+
+**Alternative:** [extract-xiso](https://github.com/XboxDev/extract-xiso) (download
+`extract-xiso-Win64_Release.zip` from its releases) does the same job:
+`extract-xiso -x -d xex\DOA4 "<image>.iso"`. It was not the tool used for this build, so check its
+own help (`extract-xiso -h`) if that command line does not work.
+
+## 6. Build
+
+From a plain `cmd` window (not PowerShell), in `C:\doa4`:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+cd doa4-recomp
+
+rem Configure (once, or after deleting out\build):
+cmake --preset win-amd64-release -DREXSDK_DIR=C:/doa4/rexglue-sdk "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+
+rem Build (every time):
+cmake --build --preset win-amd64-release
+```
+
+- `VsDevCmd.bat` sets up the Windows SDK and puts Visual Studio's CMake and Ninja on `PATH`;
+  LLVM goes first on `PATH` so `clang` / `clang++` are found (the presets name them).
+- `REXSDK_DIR` builds the SDK from source alongside the game (no separate SDK install). Use forward
+  slashes.
+- The `-march=x86-64-v3` flags are required: the port's preset does not set a CPU level and the SDK
+  uses SSSE3/AVX intrinsics, which fail to compile without it.
+- The first build compiles the SDK and the large generated code and takes a while; later builds are
+  incremental.
+
+The result is in `out\build\win-amd64-release\`: `dead_or_alive_4.exe` with `rexruntime.dll` and
+`TracyClient.dll` beside it.
+
+## 7. Run
+
+The exe needs to be told where the game files are. Save this as `run_doa4.bat` next to
+`dead_or_alive_4.exe` and edit the two paths:
+
+```bat
+@echo off
+rem GAME = the extracted folder holding default.xex. USERDATA = saves and the shader cache.
+set GAME=C:\doa4\xex\DOA4
+set USERDATA=C:\doa4\userdata
+cd /d "%~dp0"
+start "" dead_or_alive_4.exe --game_data_root="%GAME%" --user_data_root="%USERDATA%"
+```
+
+Without `--user_data_root`, saves go to `Documents\dead_or_alive_4`. Keep it outside OneDrive if you
+can (OneDrive can lock files the game is writing).
+
+- Settings live in `dead_or_alive_4.toml` next to the exe; the **Esc** menu edits them.
+- **F12** saves a photo of the screen (format and folder in the Esc menu's Photo tab; default
+  `Pictures\DOA4`). With "Also save a full-quality copy…" ticked, saving a snapshot to the in-game
+  Album also writes a full-quality copy there.
+- **F6** shows a diagnostics overlay.
+- Logs: `out\build\win-amd64-release\logs\dead_or_alive_4_NNN.log`.
+
+## 8. Regenerating the recompiled code
+
+`generated/` is checked in, so a normal build does not need this. Only after adding a function
+address to `hints.toml` (for example after a log line
+`Call to invalid or unregistered function at guest address 0x...`):
+
+```bat
+cmake --build --preset win-amd64-release --target dead_or_alive_4_codegen
+cmake --preset win-amd64-release -DREXSDK_DIR=C:/doa4/rexglue-sdk "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+cmake --build --preset win-amd64-release
+```
+
+The generator reads `../xex/DOA4/default.xex` (the folder layout in step 3). Reconfiguring is needed
+only if new `.cpp` files were generated. `commands.txt` has the upstream author's notes on this loop.
+
+## 9. Host tests
+
+The mod code (unlocks, photo, graphics options, …) has small tests that build with `clang-cl` without
+CMake or the game:
+
+```bat
+tests\host\run_photo_test.bat
+```
+
+One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all checks passed`.
+
+## 10. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Compile errors in `thirdparty/libmspack/...` or `thirdparty/o1heap/...` | Symlink stubs: run `tools/fix_git_symlinks.py` (step 4). |
+| Errors about SSSE3 / AVX intrinsics (`_mm_...` functions) | Configure was run without the `-march=x86-64-v3` flags. Delete `out\build\win-amd64-release` and configure again. |
+| `imgui.h` or `rex/version.h` not found | The two include directories at the end of the `CMakeLists.txt` target setup are missing: they are local fixes in commit `6b95afc` on `perf-pacing`. |
+| `clang` not found / CMake picks the wrong compiler | LLVM's `bin` folder is not first on `PATH` in that window. |
+| CMake warning `no v* tag reachable from HEAD` | Harmless; `git fetch --tags` in `rexglue-sdk` removes it. |
+| `no XDVDFS volume found` from the extractor | The file is not an Xbox / Xbox 360 game image (or is damaged). |
+| The game does not start | Check the newest log in `logs\`. Most often `--game_data_root` does not point at the folder that holds `default.xex`. |
+
+## Building from a fresh GitHub clone
+
+The upstream repositories are at `parkerallan/doa4-recomp` `1d38c03` and `rexglue/rexglue-sdk`
+`e8ce24f`. The steps above work for them too, with one addition: upstream lacks the two include-
+directory fixes, so add these lines to `CMakeLists.txt` after `rexglue_setup_target(dead_or_alive_4)`:
+
+```cmake
+if(TARGET imgui)
+    target_include_directories(dead_or_alive_4 PRIVATE $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+if(REXSDK_DIR)
+    target_include_directories(dead_or_alive_4 PRIVATE ${CMAKE_BINARY_DIR}/rexglue-sdk/include)
+endif()
+```
+
+The upstream build has none of the `perf-pacing` features (Esc menu, pacing fixes, photos).
