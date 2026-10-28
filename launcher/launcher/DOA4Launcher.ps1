@@ -13,7 +13,6 @@
 param(
     [ValidateSet('', 'Install', 'Update', 'Play', 'SetGameFiles', 'Status', 'DryRun')]
     [string]$Action = '',
-    [switch]$Quiet,
     [switch]$DryRun,
     [string[]]$AssumeMissing = @(),
     [string]$ShortcutFolder = '',
@@ -27,6 +26,11 @@ $root = Split-Path -Parent $here
 Import-Module (Join-Path $here 'DOA4Setup.psm1') -Force -DisableNameChecking
 $config = & (Join-Path $here 'config.ps1')
 
+if ($DryRun -and $Action -and $Action -ne 'DryRun') {
+    # Never run a real action while the caller believes it is a dry run.
+    [Console]::Out.WriteLine("-DryRun cannot be combined with -Action $Action. Use -DryRun alone to see what Install would do.")
+    exit 1
+}
 if ($DryRun -and -not $Action) { $Action = 'DryRun' }
 # With -File, "-AssumeMissing git,llvm" arrives as one string.
 $AssumeMissing = @($AssumeMissing | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
