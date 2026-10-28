@@ -175,6 +175,7 @@ static void TestTargetRules() {
   const fs::path iso = "D:/isos/doa4.iso", full = "D:/isos/DOA4", other = "F:/games/DOA4";
   f.isos = {iso};
   f.targets[full] = TargetState::kNotEmpty;
+  f.targets[other] = TargetState::kEmpty;  // an empty folder the user picked: used as it is
   f.folders = {other};
   Flow flow(f.Make());
   flow.ChooseImage();
@@ -197,6 +198,33 @@ static void TestTargetRules() {
   Flow flow2(g.Make());
   flow2.ChooseImage();
   CHECK(!flow2.CanExtract() && !flow2.target_note().empty());
+}
+
+// The folder dialog can only pick existing folders: an empty one is the
+// target itself; any other gets a new DOA4 folder inside it.
+static void TestChangeTargetPicksOrNests() {
+  Fake f;
+  const fs::path iso = "D:/isos/doa4.iso", games = "F:/games", empty = "G:/new";
+  f.isos = {iso};
+  f.targets[games] = TargetState::kNotEmpty;
+  f.targets[empty] = TargetState::kEmpty;
+  f.folders = {games, empty};
+  Flow flow(f.Make());
+  flow.ChooseImage();
+  flow.ChangeTarget();
+  CHECK(flow.target() == games / "DOA4" && flow.CanExtract());
+  flow.ChangeTarget();
+  CHECK(flow.target() == empty && flow.CanExtract());
+  // A DOA4 folder inside the picked one that is itself not empty is refused.
+  Fake g;
+  g.isos = {iso};
+  g.targets[games] = TargetState::kNotEmpty;
+  g.targets[games / "DOA4"] = TargetState::kNotEmpty;
+  g.folders = {games};
+  Flow flow2(g.Make());
+  flow2.ChooseImage();
+  flow2.ChangeTarget();
+  CHECK(flow2.target() == games / "DOA4" && !flow2.CanExtract());
 }
 
 // Free space: the boundary is need_bytes(); one byte short refuses.
@@ -291,6 +319,7 @@ int main() {
   TestDialogCancelChangesNothing();
   TestFolderPath();
   TestTargetRules();
+  TestChangeTargetPicksOrNests();
   TestFreeSpace();
   TestExtractEndings();
   TestBack();

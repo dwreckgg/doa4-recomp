@@ -120,7 +120,9 @@ void Flow::ChangeTarget() {
   if (stage_ != Stage::kTarget) return;
   const auto dir = fx_.pick_folder(target_.parent_path());
   if (!dir) return;
-  target_ = *dir;
+  // The dialog picks existing folders only: an empty one is the target, any
+  // other gets a DOA4 folder inside it.
+  target_ = fx_.inspect_target(*dir) == gamefiles::TargetState::kEmpty ? *dir : *dir / "DOA4";
   message_.clear();
   InspectTarget();
 }

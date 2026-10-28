@@ -61,7 +61,9 @@ class Flow {
 
   void ChooseImage();   // file dialog, then check (async)
   void ChooseFolder();  // folder dialog, then check (async)
-  void ChangeTarget();  // folder dialog for the extraction target
+  // Folder dialog for the extraction target: an empty folder is used as it
+  // is; any other gets a new DOA4 folder inside it.
+  void ChangeTarget();
   void Extract();       // only when CanExtract()
   void Cancel();        // while extracting
   void Back();          // from the target stage to the start
