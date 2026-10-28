@@ -29,6 +29,8 @@
 #include <rex/filesystem/vfs.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/ui/presenter.h>
+#include <rex/ui/window_win.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/rex_app.h>
@@ -43,6 +45,9 @@
 #include "doa4_diag_overlay.h"
 #include "doa4_extras.h"
 #include "doa4_graphics.h"
+#include "doa4_photo_notice.h"
+#include "doa4_photo_service.h"
+#include "doa4_photo_win.h"
 #include "doa4_menu.h"
 #include "doa4_tweaks.h"
 #include "doa4_unlocks.h"
@@ -123,6 +128,15 @@ class DeadOrAlive4App : public rex::ReXApp {
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
     rex::ui::UnregisterBind("bind_doa4_menu");
+    rex::ui::UnregisterBind("bind_doa4_photo");
+    photo_closing_.store(true, std::memory_order_release);
+    photo_stop_.store(true, std::memory_order_release);
+    if (photo_test_thread_.joinable()) photo_test_thread_.join();
+    if (photo_) {
+      const size_t dropped = photo_->Stop();
+      if (dropped) REXLOG_WARN("[doa4][PHOTO] {} queued photo(s) dropped at shutdown", dropped);
+    }
+    photo_notice_.reset();  // before the base app destroys the ImGui drawer
     menu_.reset();  // before the base app destroys the ImGui drawer
     rex::ui::UnregisterBind("bind_doa4_diag");
     diag_overlay_.reset();  // before the base app destroys the ImGui drawer
@@ -167,6 +181,109 @@ class DeadOrAlive4App : public rex::ReXApp {
     const char* menu_env = std::getenv("DOA4_MENU_OPEN");  // for tests
     if (menu_env && menu_env[0] == '1') ToggleMenu();
     StartGfxTest();
+    SetUpPhotos();
+  }
+
+  // Full-quality photos: the service, F12, the notice. See
+  // notes/specs/2026-10-28-photo-mode-design.md.
+  void SetUpPhotos() {
+    doa4::photo::Service::Hooks hooks;
+    hooks.capture = [this](doa4::photo::Image* image) { return CaptureFrame(image); };
+    hooks.monitor = [this] {
+      auto* win32 = dynamic_cast<rex::ui::Win32Window*>(window());
+      return doa4::photo::MonitorSize(win32 ? win32->hwnd() : nullptr);
+    };
+    hooks.settings = [this] { return PhotoSettings(); };
+    hooks.now = [] {
+      const std::time_t now = std::time(nullptr);
+      std::tm local{};
+      localtime_s(&local, &now);
+      return local;
+    };
+    hooks.on_result = [this](const doa4::photo::Result& result) {
+      if (result.error) {
+        REXLOG_WARN("[doa4][PHOTO] {}", result.text);
+      } else {
+        REXLOG_INFO("[doa4][PHOTO] {} ({})", result.text, result.path.parent_path().string());
+      }
+      app_context().CallInUIThreadDeferred([this, result] { ShowPhotoNotice(result); });
+    };
+    photo_ = std::make_unique<doa4::photo::Service>(std::move(hooks));
+    rex::ui::RegisterBind("bind_doa4_photo", "F12", "Save a full-quality photo",
+                          [this] { TakePhoto(); });
+    StartPhotoTest();
+  }
+
+  // F12: the current frame, saved by the worker.
+  void TakePhoto() {
+    if (photo_) photo_->RequestHotkeyPhoto();
+  }
+
+  // The game's frame after the render scale and FXAA, before the window
+  // downscale and any overlay. Callable from any thread.
+  bool CaptureFrame(doa4::photo::Image* image) {
+    rex::Runtime* rt = runtime();
+    auto* graphics = rt ? dynamic_cast<rex::graphics::GraphicsSystem*>(rt->graphics_system())
+                        : nullptr;
+    rex::ui::Presenter* presenter = graphics ? graphics->presenter() : nullptr;
+    rex::ui::RawImage raw;
+    if (!presenter || !presenter->CaptureGuestOutput(raw)) return false;
+    if (raw.stride != size_t(raw.width) * 4 ||
+        raw.data.size() != size_t(raw.width) * raw.height * 4) {
+      return false;
+    }
+    image->width = raw.width;
+    image->height = raw.height;
+    image->rgbx = std::move(raw.data);
+    return true;
+  }
+
+  doa4::photo::Settings PhotoSettings() const {
+    doa4::photo::Settings settings;
+    settings.format = doa4::photo::Format(doa4::photo::ChoiceIndex(
+        doa4::photo::kFormats, rex::cvar::Query<std::string>("doa4_photo_format")));
+    settings.framing = doa4::photo::Framing(doa4::photo::ChoiceIndex(
+        doa4::photo::kFramings, rex::cvar::Query<std::string>("doa4_photo_auto_framing")));
+    const std::string dir = rex::cvar::Query<std::string>("doa4_photo_dir");
+    settings.dir = dir.empty() ? doa4::photo::DefaultPhotoDir()
+                               : std::filesystem::path(
+                                     std::u8string(dir.begin(), dir.end()));
+    if (settings.dir.empty()) settings.dir = user_data_root() / "photos";
+    return settings;
+  }
+
+  void ShowPhotoNotice(const doa4::photo::Result& result) {
+    if (photo_closing_.load(std::memory_order_acquire) || !drawer_) return;
+    photo_notice_.reset();
+    const uint64_t serial = result.serial;
+    photo_notice_ = std::make_unique<doa4::PhotoNotice>(
+        drawer_, result.text, result.error, [this, serial] {
+          app_context().CallInUIThreadDeferred([this, serial] {
+            // Only the notice this callback belongs to: a newer one may have
+            // replaced it.
+            if (photo_notice_serial_ == serial) photo_notice_.reset();
+          });
+        });
+    photo_notice_serial_ = serial;
+  }
+
+  // DOA4_PHOTO_TEST=hotkey: take a photo on the UI thread through TakePhoto,
+  // as F12 does, 20, 40, 60 and 80 s after start (the first seconds of attract
+  // mode are black logo screens). For runtime checks only.
+  void StartPhotoTest() {
+    const char* env = std::getenv("DOA4_PHOTO_TEST");
+    if (!env || std::string_view(env) != "hotkey") return;
+    REXLOG_INFO("[doa4][PHOTO] test: hotkey photos at 20, 40, 60 and 80 s");
+    photo_test_thread_ = std::thread([this] {
+      using namespace std::chrono_literals;
+      for (int shot = 0; shot < 4; ++shot) {
+        for (int i = 0; i < 200 && !photo_stop_.load(std::memory_order_acquire); ++i) {
+          std::this_thread::sleep_for(100ms);
+        }
+        if (photo_stop_.load(std::memory_order_acquire)) return;
+        app_context().CallInUIThreadDeferred([this] { TakePhoto(); });
+      }
+    });
   }
 
   // Live anti-aliasing switch, for the menu and DOA4_GFX_TEST: the SDK reads
@@ -287,6 +404,12 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::thread extras_thread_;  // DOA4_EXTRAS_TEST only
   std::atomic<bool> gfx_stop_{false};
   std::thread gfx_test_thread_;  // DOA4_GFX_TEST only
+  std::unique_ptr<doa4::photo::Service> photo_;
+  std::unique_ptr<doa4::PhotoNotice> photo_notice_;
+  uint64_t photo_notice_serial_ = 0;
+  std::atomic<bool> photo_closing_{false};  // set at shutdown: no new notices
+  std::atomic<bool> photo_stop_{false};
+  std::thread photo_test_thread_;  // DOA4_PHOTO_TEST only
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
 
