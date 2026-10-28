@@ -27,6 +27,8 @@
 #include <rex/input/input_system.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/rex_app.h>
@@ -40,6 +42,7 @@
 
 #include "doa4_diag_overlay.h"
 #include "doa4_extras.h"
+#include "doa4_graphics.h"
 #include "doa4_menu.h"
 #include "doa4_tweaks.h"
 #include "doa4_unlocks.h"
@@ -126,6 +129,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     snap_stop_.store(true, std::memory_order_release);
     if (snap_thread_.joinable()) snap_thread_.join();
     extras_stop_.store(true, std::memory_order_release);
+    gfx_stop_.store(true, std::memory_order_release);
+    if (gfx_test_thread_.joinable()) gfx_test_thread_.join();
     if (extras_thread_.joinable()) extras_thread_.join();
   }
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
@@ -152,12 +157,60 @@ class DeadOrAlive4App : public rex::ReXApp {
     drawer_ = drawer;
     running_scale_ = rex::cvar::Query<int32_t>("resolution_scale");
     saved_scale_ = running_scale_;
-    REXLOG_INFO("[doa4][UI] resolution_scale {} fullscreen {}", running_scale_,
-                rex::cvar::Query<bool>("fullscreen"));
+    REXLOG_INFO("[doa4][UI] resolution_scale {} fullscreen {} swap_post_effect {} "
+                "anisotropic_override {}",
+                running_scale_, rex::cvar::Query<bool>("fullscreen"),
+                rex::cvar::Query<std::string>("swap_post_effect"),
+                rex::cvar::Query<int32_t>("anisotropic_override"));
     rex::ui::RegisterBind("bind_doa4_menu", "Escape", "Toggle DOA4 menu",
                           [this] { ToggleMenu(); });
     const char* menu_env = std::getenv("DOA4_MENU_OPEN");  // for tests
     if (menu_env && menu_env[0] == '1') ToggleMenu();
+    StartGfxTest();
+  }
+
+  // Live anti-aliasing switch, for the menu and DOA4_GFX_TEST: the SDK reads
+  // swap_post_effect only at start, so hand the new value to the GPU thread
+  // (CommandProcessor::SetDesiredSwapPostEffect; applied at the next swap).
+  void SetPostEffect(int index) {
+    using Effect = rex::graphics::CommandProcessor::SwapPostEffect;
+    static constexpr Effect kEffects[] = {Effect::kNone, Effect::kFxaa, Effect::kFxaaExtreme};
+    if (index < 0 || index >= int(doa4::graphics::kAntiAliasing.size())) return;
+    const char* value = doa4::graphics::kAntiAliasing[index].value;
+    rex::Runtime* rt = runtime();
+    auto* graphics = rt ? dynamic_cast<rex::graphics::GraphicsSystem*>(rt->graphics_system())
+                        : nullptr;
+    rex::graphics::CommandProcessor* processor = graphics ? graphics->command_processor() : nullptr;
+    if (!processor) {
+      REXLOG_WARN("[doa4][GFX] post effect -> {}: no graphics system; applies at the next start",
+                  value);
+      return;
+    }
+    processor->SetDesiredSwapPostEffect(kEffects[index]);
+    REXLOG_INFO("[doa4][GFX] post effect -> {}", value);
+  }
+
+  // DOA4_GFX_TEST=cycle: 20 s after start, switch FXAA, FXAA Extreme, Off two
+  // seconds apart on the UI thread, through SetPostEffect as the menu does.
+  // For runtime checks only.
+  void StartGfxTest() {
+    const char* env = std::getenv("DOA4_GFX_TEST");
+    if (!env || std::string_view(env) != "cycle") return;
+    REXLOG_INFO("[doa4][GFX] test cycle on");
+    gfx_test_thread_ = std::thread([this] {
+      using namespace std::chrono_literals;
+      auto nap = [this](int tenths) {
+        for (int i = 0; i < tenths && !gfx_stop_.load(std::memory_order_acquire); ++i) {
+          std::this_thread::sleep_for(100ms);
+        }
+        return !gfx_stop_.load(std::memory_order_acquire);
+      };
+      if (!nap(200)) return;
+      for (int index : {1, 2, 0}) {
+        app_context().CallInUIThreadDeferred([this, index] { SetPostEffect(index); });
+        if (!nap(20)) return;
+      }
+    });
   }
 
   void ToggleMenu() {
@@ -179,6 +232,7 @@ class DeadOrAlive4App : public rex::ReXApp {
       app_context().CallInUIThreadDeferred(std::move(fn));
     };
     host.close_menu = [this] { CloseMenu(); };
+    host.set_post_effect = [this](int index) { SetPostEffect(index); };
     host.guest = guest_ready_ ? &guest_ : nullptr;
     host.patcher = &patcher_;
     host.protect = protect_;
@@ -231,6 +285,8 @@ class DeadOrAlive4App : public rex::ReXApp {
   bool saved_alpha152_ = false;  // what the menu last saved for the next start
   std::atomic<bool> extras_stop_{false};
   std::thread extras_thread_;  // DOA4_EXTRAS_TEST only
+  std::atomic<bool> gfx_stop_{false};
+  std::thread gfx_test_thread_;  // DOA4_GFX_TEST only
   std::atomic<bool> snap_stop_{false};
   std::thread snap_thread_;
 

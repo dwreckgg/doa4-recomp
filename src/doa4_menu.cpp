@@ -29,6 +29,7 @@
 #include <windows.h>
 
 #include "doa4_config.h"
+#include "doa4_graphics.h"
 #include "doa4_unlocks.h"
 
 namespace doa4 {
@@ -165,11 +166,9 @@ void MenuDialog::DrawVideoTab() {
   }
 
   ImGui::SeparatorText("Render scale");
-  static constexpr std::array<const char*, 3> kScaleLabels = {
-      "x1 (1280x720)", "x2 (2560x1440)", "x3 (3840x2160)"};
   int& saved_scale = *host_.saved_scale;
-  for (int scale = 1; scale <= 3; ++scale) {
-    if (ImGui::RadioButton(kScaleLabels[scale - 1], saved_scale == scale) &&
+  for (int scale = 1; scale <= int(graphics::kRenderScales.size()); ++scale) {
+    if (ImGui::RadioButton(graphics::kRenderScales[scale - 1], saved_scale == scale) &&
         saved_scale != scale) {
       // resolution_scale is read once at start-up: save it for the next start
       // without changing the running value.
@@ -193,6 +192,39 @@ void MenuDialog::DrawVideoTab() {
       ImGui::TextColored(kErrorColor, "%s", warning);
     }
   }
+
+  ImGui::SeparatorText("Anti-aliasing");
+  ImGui::PushID("aa");
+  const int aa = graphics::AntiAliasingIndex(rex::cvar::Query<std::string>("swap_post_effect"));
+  for (int i = 0; i < int(graphics::kAntiAliasing.size()); ++i) {
+    if (i) ImGui::SameLine();
+    if (ImGui::RadioButton(graphics::kAntiAliasing[i].label, aa == i) && aa != i &&
+        SaveThenSet("swap_post_effect", graphics::kAntiAliasing[i].value, true) &&
+        host_.set_post_effect) {
+      host_.set_post_effect(i);
+    }
+  }
+  ImGui::PopID();
+  ImGui::TextDisabled("The game uses 2x MSAA; FXAA Extreme suits it best. FXAA also softens");
+  ImGui::TextDisabled("text a little.");
+
+  ImGui::SeparatorText("Texture filtering");
+  ImGui::PushID("aniso");
+  const int32_t aniso = rex::cvar::Query<int32_t>("anisotropic_override");
+  const int row = graphics::TextureFilteringIndex(aniso);
+  for (int i = 0; i < int(graphics::kTextureFiltering.size()); ++i) {
+    if (i) ImGui::SameLine();
+    if (ImGui::RadioButton(graphics::kTextureFiltering[i].label, row == i) && row != i) {
+      // Read by the SDK each time a texture is bound: no further call needed.
+      SaveThenSet("anisotropic_override", graphics::kTextureFiltering[i].value, false);
+    }
+  }
+  ImGui::PopID();
+  if (row < 0) {
+    ImGui::TextColored(kNoteColor, "Custom (%d) set in dead_or_alive_4.toml.", aniso);
+  }
+  ImGui::TextDisabled("Applies to textures as the game draws them; you may see it after the");
+  ImGui::TextDisabled("next screen loads.");
 }
 
 void MenuDialog::DrawControlsTab() {
@@ -518,6 +550,22 @@ void MenuDialog::Restart() {
   CloseHandle(process.hProcess);
   rex::ui::Window* window = host_.window;
   host_.defer([window] { window->RequestClose(); });
+}
+
+bool MenuDialog::SaveThenSet(std::string_view name, std::string_view value, bool quote) {
+  std::string error =
+      SaveTomlKey(host_.config_path, name, quote ? TomlString(value) : std::string(value));
+  if (!error.empty()) {
+    status_ = "Could not save settings: " + error;
+    return false;
+  }
+  status_.clear();
+  if (!rex::cvar::SetFlagByName(name, value)) {
+    status_ = fmt::format("Could not set {} to {}.", name, value);
+    return false;
+  }
+  REXLOG_INFO("[doa4][GFX] {} = {} saved", name, value);
+  return true;
 }
 
 void MenuDialog::SetAndSave(std::string_view name, std::string_view value, bool quote) {

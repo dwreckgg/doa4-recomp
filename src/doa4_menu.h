@@ -49,6 +49,9 @@ struct MenuHost {
   std::function<void(std::function<void()> fn)> defer;
   // Destroys the menu (called through `defer`).
   std::function<void()> close_menu;
+  // Switches the running game's anti-aliasing to graphics::kAntiAliasing[index]
+  // (the SDK reads swap_post_effect only at start).
+  std::function<void(int index)> set_post_effect;
 
   // Extras tab. `guest` is null until the XEX is loaded into guest memory.
   const GuestBytes* guest = nullptr;
@@ -90,6 +93,9 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   // Saves the tweak's cvar; on success sets it and, for a live tweak, writes
   // or reverts its bytes. Failures go to status_.
   void SetTweak(size_t tweak, bool on);
+  // Saves `name` first; only on success sets the cvar. Failures go to
+  // status_ and leave the running game as it was. Returns whether it saved.
+  bool SaveThenSet(std::string_view name, std::string_view value, bool quote);
   void StartPadListen(size_t row, const rex::input::X_INPUT_GAMEPAD* pad);
   void PollPadListen(const rex::input::X_INPUT_GAMEPAD& pad);
   void AssignPad(size_t target, size_t source);
