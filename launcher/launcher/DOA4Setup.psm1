@@ -427,7 +427,10 @@ function Sync-DOA4Repo {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Ref,
-        [scriptblock]$OnLine
+        [scriptblock]$OnLine,
+        # Which of the launcher's own fixes a reused clone may carry: the CMake block
+        # ('game'), the symlink copies ('sdk'), or none ('plain').
+        [ValidateSet('game', 'sdk', 'plain')][string]$Kind = 'plain'
     )
     $isCommit = Test-DOA4CommitRef $Ref
     $empty = -not (Test-Path -LiteralPath $Path)
@@ -458,6 +461,16 @@ function Sync-DOA4Repo {
     $originUrl = (@($origin.Output) | Select-Object -First 1)
     if ($origin.ExitCode -ne 0 -or -not $originUrl -or (ConvertTo-DOA4UrlKey $originUrl) -ne (ConvertTo-DOA4UrlKey $Url)) {
         throw "The folder $Path is a clone of $originUrl, not of $Url (config.ps1). Move it away, or change config.ps1."
+    }
+    # A clone killed during checkout has a HEAD but missing files (or no index); git also
+    # keeps the folder after "Clone succeeded, but checkout failed". Reused only when its
+    # tracked files match HEAD apart from the launcher's own fixes.
+    $changes = Get-DOA4ForeignChanges -Cmd $Cmd -Path $Path -Kind $Kind
+    if ($changes.Foreign.Count -gt 0) {
+        $list = @($changes.Foreign | Select-Object -First 5) -join ', '
+        if ($changes.Foreign.Count -gt 5) { $list += (', and {0} more' -f ($changes.Foreign.Count - 5)) }
+        throw ("The folder $Path does not match its last commit (an unfinished clone, or local changes): $list. " +
+            'If it is an unfinished clone, delete the folder and run Install again; if the changes are yours, move them out first.')
     }
     if ($isCommit) {
         $want = Invoke-DOA4Git -Cmd $Cmd -Arguments @('-C', $Path, 'rev-parse', '--verify', "$Ref^{commit}")
@@ -1177,9 +1190,9 @@ function Invoke-DOA4Install {
         $step = 'Code'
         Set-DOA4Step $Ctx $step 'running' 'the first clone downloads about 2 GB and takes several minutes'
         $sink = Get-DOA4LogSink $Ctx
-        $g = Sync-DOA4Repo -Cmd $Ctx.Cmd -Path $Ctx.GamePath -Url $c.GameRepoUrl -Ref $c.GameRef -OnLine $sink
+        $g = Sync-DOA4Repo -Cmd $Ctx.Cmd -Path $Ctx.GamePath -Url $c.GameRepoUrl -Ref $c.GameRef -OnLine $sink -Kind 'game'
         Write-DOA4Log $Ctx "  doa4-recomp: $g"
-        $s = Sync-DOA4Repo -Cmd $Ctx.Cmd -Path $Ctx.SdkPath -Url $c.SdkRepoUrl -Ref $c.SdkRef -OnLine $sink
+        $s = Sync-DOA4Repo -Cmd $Ctx.Cmd -Path $Ctx.SdkPath -Url $c.SdkRepoUrl -Ref $c.SdkRef -OnLine $sink -Kind 'sdk'
         Write-DOA4Log $Ctx "  rexglue-sdk: $s"
         Invoke-DOA4Git -Cmd $Ctx.Cmd -Arguments @('-C', $Ctx.SdkPath, 'submodule', 'update', '--init', '--recursive') -OnLine $sink -Check | Out-Null
         if (-not (Test-Path -LiteralPath $Ctx.UserData)) { [void](New-Item -ItemType Directory -Path $Ctx.UserData) }
@@ -1216,23 +1229,38 @@ function Invoke-DOA4Install {
 # Every local change in both repositories, without changing anything. Allowed are only the
 # launcher's own fixes: the CMake block in doa4-recomp (CMakeFix) and the symlink copies in
 # rexglue-sdk (Sdk.Stubs). Everything else is in Foreign, and then the update writes nothing.
-function Get-DOA4UpdateBlockers {
-    param([hashtable]$Ctx)
+# The tracked changes in one repository that are not the launcher's own fixes (no writes).
+# Kind 'game': the CMake block is allowed (CMakeFix tells whether it is there); 'sdk': the
+# symlink copies are allowed (Sdk holds Get-DOA4StubChanges' answer); 'plain': nothing is.
+function Get-DOA4ForeignChanges {
+    param([hashtable]$Cmd, [string]$Path, [ValidateSet('game', 'sdk', 'plain')][string]$Kind = 'plain')
+    if ($Kind -eq 'sdk') {
+        $sdk = Get-DOA4StubChanges -Cmd $Cmd -RepoPath $Path
+        return [pscustomobject]@{ Foreign = @($sdk.Foreign); CMakeFix = $false; Sdk = $sdk }
+    }
     $foreign = New-Object System.Collections.Generic.List[string]
     $cmakeChanged = $false
-    foreach ($e in (Get-DOA4StatusEntries -Cmd $Ctx.Cmd -RepoPath $Ctx.GamePath)) {
-        if ($e.Type -eq '1' -and $e.XY -eq '.M' -and $e.Sub.StartsWith('N') -and $e.Path -eq 'CMakeLists.txt') { $cmakeChanged = $true; continue }
-        $foreign.Add('doa4-recomp/' + $e.Path)
+    foreach ($e in (Get-DOA4StatusEntries -Cmd $Cmd -RepoPath $Path)) {
+        if ($Kind -eq 'game' -and $e.Type -eq '1' -and $e.XY -eq '.M' -and $e.Sub.StartsWith('N') -and $e.Path -eq 'CMakeLists.txt') { $cmakeChanged = $true; continue }
+        $foreign.Add($e.Path)
     }
     $cmakeFix = $false
     if ($cmakeChanged) {
-        $r = Remove-DOA4CMakeIncludeFix -Cmd $Ctx.Cmd -RepoPath $Ctx.GamePath -CheckOnly
-        if ($r -eq 'removable') { $cmakeFix = $true }
-        else { $foreign.Add("doa4-recomp/CMakeLists.txt (changes besides the launcher's build fix)") }
+        if ((Remove-DOA4CMakeIncludeFix -Cmd $Cmd -RepoPath $Path -CheckOnly) -eq 'removable') { $cmakeFix = $true }
+        else { $foreign.Add("CMakeLists.txt (changes besides the launcher's build fix)") }
     }
-    $sdk = Get-DOA4StubChanges -Cmd $Ctx.Cmd -RepoPath $Ctx.SdkPath
-    foreach ($x in $sdk.Foreign) { $foreign.Add('rexglue-sdk/' + $x) }
-    [pscustomobject]@{ Foreign = $foreign.ToArray(); CMakeFix = $cmakeFix; Sdk = $sdk }
+    [pscustomobject]@{ Foreign = $foreign.ToArray(); CMakeFix = $cmakeFix; Sdk = $null }
+}
+
+# Every local change in both repositories, without changing anything. Allowed are only the
+# launcher's own fixes: the CMake block in doa4-recomp (CMakeFix) and the symlink copies in
+# rexglue-sdk (Sdk.Stubs). Everything else is in Foreign, and then the update writes nothing.
+function Get-DOA4UpdateBlockers {
+    param([hashtable]$Ctx)
+    $game = Get-DOA4ForeignChanges -Cmd $Ctx.Cmd -Path $Ctx.GamePath -Kind 'game'
+    $sdk = Get-DOA4ForeignChanges -Cmd $Ctx.Cmd -Path $Ctx.SdkPath -Kind 'sdk'
+    $foreign = @($game.Foreign | ForEach-Object { 'doa4-recomp/' + $_ }) + @($sdk.Foreign | ForEach-Object { 'rexglue-sdk/' + $_ })
+    [pscustomobject]@{ Foreign = $foreign; CMakeFix = $game.CMakeFix; Sdk = $sdk.Sdk }
 }
 
 # Takes the launcher's two fixes out (only ever called after Get-DOA4UpdateBlockers found

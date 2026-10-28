@@ -35,7 +35,8 @@ Describe 'Sync-DOA4Repo with a fake git' {
         $git = New-FakeCommand 'git' @(
             @{ Match = 'rev-parse --show-toplevel'; Output = @($p.Replace('\', '/')) },
             @{ Match = 'rev-parse --verify HEAD'; Output = @('1d38c03ee363968594cbe6d5d46d28381b88d7fc') },
-            @{ Match = 'remote get-url origin'; Output = @('https://GitHub.com/parkerallan/doa4-recomp.git') })
+            @{ Match = 'remote get-url origin'; Output = @('https://GitHub.com/parkerallan/doa4-recomp.git') },
+            @{ Match = 'status --porcelain=v2 --untracked-files=no$'; Output = @() })   # clean (review I2)
         Sync-DOA4Repo -Cmd @{ git = $git.Invoke } -Path $p -Url 'https://github.com/parkerallan/doa4-recomp' -Ref 'main' | Should Be 'reused'
         @($git.State.Calls | Where-Object { $_ -like 'clone*' }).Count | Should Be 0
     }
