@@ -25,6 +25,7 @@ set(DEADORALIVE4_SOURCES
     src/doa4_cvars.cpp
     src/doa4_graphics.cpp
     src/doa4_photo.cpp
+    src/doa4_photo_win.cpp
 )
 
 if(WIN32)
