@@ -79,7 +79,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 $script:job = $null
 $script:iconSet = $false
-$installSteps = @('Tools', 'Disk space', 'Code', 'Fixes', 'Build', 'Shortcut')
+$installSteps = @('Folder', 'Tools', 'Disk space', 'Code', 'Fixes', 'Build', 'Shortcut')
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Dead or Alive 4'
@@ -299,7 +299,7 @@ $bInstall.Add_Click({
         Start-Background 'plan' @{ ShortcutFolder = '' }
     })
 $bUpdate.Add_Click({
-        Show-Steps @('Tools', 'Sources', 'Local changes', 'Update', 'Build')
+        Show-Steps @('Folder', 'Tools', 'Sources', 'Local changes', 'Update', 'Build')
         Start-Background 'update' @{ ShortcutFolder = '' }
     })
 $bGameFiles.Add_Click({ [void](Invoke-ChangeGameFiles) })

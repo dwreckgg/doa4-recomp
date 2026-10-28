@@ -62,7 +62,8 @@ Describe 'make_zip.ps1' {
 }
 
 Describe 'The launcher''s non-interactive mode (a real powershell.exe on the packaged files)' {
-    $out = Join-Path $TestDrive ('cli ' + [char]0x00E9)
+    # ASCII: Install, Update and Play refuse a non-ASCII DOA4 path (review I1, tested there).
+    $out = Join-Path $TestDrive 'cli test'
     & (Join-Path $script:Src 'make_zip.ps1') -Destination $out | Out-Null
     $launcher = Join-Path $out 'DOA4\launcher\DOA4Launcher.ps1'
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'

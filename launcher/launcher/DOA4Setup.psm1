@@ -742,10 +742,29 @@ function Test-DOA4PathFitsCodePage {
 
 # The same checks, in the same order and with the same messages, as the game's CheckFolder
 # (src/doa4_gamefiles.cpp, src/doa4_setup_flow.cpp VerdictMessage).
+# Printable ASCII only (space to tilde).
+function Test-DOA4AsciiPath {
+    param([string]$Path)
+    return ($Path -cmatch '^[\x20-\x7E]*$')
+}
+
+# Why the DOA4 folder cannot be used, or $null. The game gets --user_data_root (and, for
+# builds without the first-run setup, --game_data_root) on its command line, and the SDK
+# reads command-line paths in the ANSI code page (rexglue-sdk src/ui/rex_app.cpp): any
+# non-ASCII letter in the DOA4 path sends saves to another folder or stops the game.
+function Get-DOA4RootProblem {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    if (Test-DOA4AsciiPath $Root) { return $null }
+    return ('The DOA4 folder''s path has letters the game cannot use: {0}. Move the DOA4 folder to a path with plain letters, digits and spaces (for example C:\Games\DOA4) and run setup again.' -f $Root)
+}
+
+# -AsciiOnly for builds without the first-run setup: they get the folder on the command
+# line, which the SDK turns into a path through the ANSI code page (a UTF-8 "e-acute"
+# becomes two other letters), so only plain ASCII survives.
 function Test-DOA4GameFolder {
-    param([Parameter(Mandatory = $true)][string]$Path, [string]$ExpectedSha1 = $script:SupportedXexSha1, [int]$CodePage = 0)
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$ExpectedSha1 = $script:SupportedXexSha1, [int]$CodePage = 0, [switch]$AsciiOnly)
     $ok = { param($v, $m) [pscustomobject]@{ Verdict = $v; Ok = ($v -eq 'Ok'); Message = $m } }
-    if (-not (Test-DOA4PathFitsCodePage -Path $Path -CodePage $CodePage)) {
+    if (-not (Test-DOA4PathFitsCodePage -Path $Path -CodePage $CodePage) -or ($AsciiOnly -and -not (Test-DOA4AsciiPath $Path))) {
         return & $ok 'PathUnsupported' 'This path has characters that this build cannot use. Choose a folder whose path uses plain letters and digits.'
     }
     $xex = Join-Path $Path 'default.xex'
@@ -1152,6 +1171,9 @@ function Write-DOA4DryRun {
 function Invoke-DOA4Install {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [switch]$ToolsApproved)
     $c = $Ctx.Config
+    $step = 'Folder'
+    $problem = Get-DOA4RootProblem $Ctx.Root
+    if ($problem) { Set-DOA4Step $Ctx $step 'failed' $problem; return New-DOA4StepResult $false $step $problem $Ctx }
     $step = 'Tools'
     try {
         Set-DOA4Step $Ctx $step 'running'
@@ -1322,6 +1344,9 @@ function Update-DOA4RepoToRef {
 function Invoke-DOA4Update {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx)
     $c = $Ctx.Config
+    $step = 'Folder'
+    $problem = Get-DOA4RootProblem $Ctx.Root
+    if ($problem) { Set-DOA4Step $Ctx $step 'failed' $problem; return New-DOA4StepResult $false $step $problem $Ctx }
     $step = 'Tools'
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $Ctx.GamePath '.git')) -or -not (Test-Path -LiteralPath (Join-Path $Ctx.SdkPath '.git'))) {
@@ -1412,6 +1437,9 @@ function Invoke-DOA4Update {
 # any other build gets the launcher's Game files setting as --game_data_root.
 function Get-DOA4PlayArguments {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [string]$GameFiles)
+    # Always passed, on purpose: it overrides the game's own doa4_user_data setting so saves
+    # and the shader cache stay inside this DOA4 folder. Plain ASCII is guaranteed by the
+    # root check (Get-DOA4RootProblem), so the SDK reads it back unchanged.
     $a = @("--user_data_root=$($Ctx.UserData)")
     if (-not (Test-DOA4HasFirstRunSetup $Ctx)) {
         if (-not $GameFiles) { $GameFiles = (Get-DOA4Settings $Ctx.SettingsPath).gameFiles }
@@ -1435,11 +1463,13 @@ function Get-DOA4GameStartInfo {
 
 function Start-DOA4Game {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [string]$GameFiles)
+    $problem = Get-DOA4RootProblem $Ctx.Root
+    if ($problem) { throw $problem }
     if (-not (Test-Path -LiteralPath $Ctx.ExePath)) { throw 'The game is not built yet: run Install.' }
     $a = Get-DOA4PlayArguments -Ctx $Ctx -GameFiles $GameFiles
     if (-not (Test-DOA4HasFirstRunSetup $Ctx)) {
         $gf = ($a | Where-Object { $_.StartsWith('--game_data_root=') }).Substring(17)
-        $check = Test-DOA4GameFolder -Path $gf
+        $check = Test-DOA4GameFolder -Path $gf -AsciiOnly
         if (-not $check.Ok) { throw $check.Message }
     }
     if (-not (Test-Path -LiteralPath $Ctx.UserData)) { [void](New-Item -ItemType Directory -Path $Ctx.UserData) }
@@ -1452,7 +1482,9 @@ function Start-DOA4Game {
 # toml (forward slashes, as the game itself saves it); other builds get the launcher setting.
 function Set-DOA4GameFiles {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [Parameter(Mandatory = $true)][string]$Folder)
-    $check = Test-DOA4GameFolder -Path $Folder
+    # A first-run-setup build reads the folder from its toml as UTF-8 (the code-page rule is
+    # the game's own); other builds get it on the command line, so it must be plain ASCII.
+    $check = Test-DOA4GameFolder -Path $Folder -AsciiOnly:(-not (Test-DOA4HasFirstRunSetup $Ctx))
     if (-not $check.Ok) { throw $check.Message }
     $full = [IO.Path]::GetFullPath($Folder)
     if (Test-DOA4HasFirstRunSetup $Ctx) {
