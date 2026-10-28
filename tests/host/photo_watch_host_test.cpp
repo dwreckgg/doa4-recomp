@@ -73,6 +73,8 @@ static void TestCapturesTheFinishedFrame() {
   CHECK(rig.submitted.empty());
   rig.Swap(w, 2);  // swap 42: the finished photo is shown in the photo panel
   rig.Swap(w, 2);
+  CHECK(rig.submitted.empty());  // captured and held, not written
+  w.OnAlbumSave();               // the player saves it to the in-game Album
   CHECK(rig.submitted.size() == 1);
   if (rig.submitted.size() == 1) {
     // Captured after the GPU reached swap 42, and not later: frame 42 exactly
@@ -139,8 +141,9 @@ static void TestDebugAndAutoShareOneCapture() {
   rig.Swap(w, 1);
   rig.Swap(w, 2);
   rig.Swap(w, 2);
+  w.OnAlbumSave();
   // The edge frame once (debug "n"); the photo frame twice (debug "n1" and
-  // the copy), from one capture.
+  // the copy, written at the Album save), from one capture.
   CHECK(rig.submitted.size() == 3);
   if (rig.submitted.size() == 3) {
     CHECK(rig.submitted[0].first == 2 && rig.submitted[0].second == "n");
@@ -161,7 +164,63 @@ static void TestDriftLog() {
   CHECK(lines == 2);
 }
 
+// One snapshot taken and saved, one taken and not saved, one more saved: only
+// the saved ones are written, each with its own frame, once.
+static void TestOnlySavedSnapshotsAreWritten() {
+  Rig rig;
+  SnapshotWatcher w(rig.Hooks(false));
+  auto snapshot = [&] {  // 30 blend frames, the edge, the photo frame, one more
+    for (int i = 0; i < 30; ++i) rig.Swap(w, 1);
+    rig.Swap(w, 2);
+    rig.Swap(w, 2);
+    const uint32_t photo_frame = rig.guest;
+    rig.Swap(w, 2);
+    return photo_frame;
+  };
+  const uint32_t first = snapshot();
+  w.OnAlbumSave();
+  CHECK(rig.submitted.size() == 1 && rig.submitted[0].first == first);
+  w.OnAlbumSave();  // a second save call without a new snapshot writes nothing
+  CHECK(rig.submitted.size() == 1);
+  snapshot();       // taken, not saved (the player backs out)
+  const uint32_t third = snapshot();
+  w.OnAlbumSave();
+  CHECK(rig.submitted.size() == 2);
+  if (rig.submitted.size() == 2) CHECK(rig.submitted[1].first == third);
+}
+
+// A new snapshot drops the held photo, so a failed capture never saves the
+// previous snapshot under the new one's save.
+static void TestNewSnapshotDropsTheHeldPhoto() {
+  Rig rig;
+  SnapshotWatcher w(rig.Hooks(false));
+  rig.Swap(w, 1);
+  rig.Swap(w, 2);
+  rig.Swap(w, 2);  // held: the first snapshot's photo
+  rig.stuck = true;
+  rig.Swap(w, 1);
+  rig.Swap(w, 2);  // a second snapshot whose capture will time out
+  rig.Swap(w, 2);
+  w.OnAlbumSave();
+  CHECK(rig.submitted.empty());
+}
+
+// With the option off nothing is held, and a save writes nothing.
+static void TestOffSavesNothing() {
+  Rig rig;
+  rig.auto_on = false;
+  SnapshotWatcher w(rig.Hooks(false));
+  rig.Swap(w, 1);
+  rig.Swap(w, 2);
+  rig.Swap(w, 2);
+  w.OnAlbumSave();
+  CHECK(rig.submitted.empty());
+}
+
 int main() {
+  TestOnlySavedSnapshotsAreWritten();
+  TestNewSnapshotDropsTheHeldPhoto();
+  TestOffSavesNothing();
   TestCapturesTheFinishedFrame();
   TestOffMeansNoHold();
   TestTimeout();

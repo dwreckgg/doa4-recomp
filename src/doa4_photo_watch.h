@@ -8,13 +8,17 @@
 // shows the finished photo in the game's photo panel (measured with
 // DOA4_PHOTO_DEBUG in Watch Mode). At swap n + 1 the guest thread is held
 // until the GPU has processed that swap, so the captured frame is that one and
-// not the next; then the frame goes to the service. The game is already in its slowed
-// snapshot moment, so the short hold is not felt.
+// not the next. The frame is held, not written: it goes to the service only
+// when the player saves that snapshot to the game's Album (OnAlbumSave, from
+// the hook on the game's photo compressor). A new snapshot drops it. The game
+// is already in its slowed snapshot moment, so the short hold is not felt.
 
 #pragma once
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <string>
 
 #include "doa4_photo.h"
@@ -45,6 +49,10 @@ class SnapshotWatcher {
 
   uint32_t swaps() const { return swaps_; }
 
+  // The game is saving the snapshot to its Album (its photo compressor ran):
+  // the held photo goes to the service, once. Any thread.
+  void OnAlbumSave();
+
  private:
   // Holds the calling thread until the GPU has processed swap n (or the wait
   // limit passes), then captures. False on timeout or capture failure.
@@ -56,6 +64,8 @@ class SnapshotWatcher {
   uint32_t last_state_ = 0;
   uint32_t photo_swap_ = 0;   // the swap that shows the finished photo (n + 1), or 0
   bool photo_copy_ = false;   // whether that frame is copied (doa4_photo_auto at the edge)
+  std::mutex held_mutex_;
+  std::optional<Image> held_;  // the last snapshot's photo, until saved or replaced
 };
 
 }  // namespace doa4::photo

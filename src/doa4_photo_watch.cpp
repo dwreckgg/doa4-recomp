@@ -27,11 +27,19 @@ void SnapshotWatcher::OnSwap(uint32_t state) {
     Image frame;
     if (WaitAndCapture(n, &frame)) {
       if (hooks_.debug) hooks_.submit(photo_copy_ ? frame : std::move(frame), Source::kDebug, "n1");
-      if (photo_copy_) hooks_.submit(std::move(frame), Source::kSnapshot, "");
+      if (photo_copy_) {
+        std::lock_guard<std::mutex> lock(held_mutex_);
+        held_ = std::move(frame);
+      }
     }
   }
 
   if (!edge_.OnSwap(state)) return;
+  {
+    // A new snapshot: the previous one was saved or abandoned.
+    std::lock_guard<std::mutex> lock(held_mutex_);
+    held_.reset();
+  }
   const bool copy = hooks_.auto_enabled();
   if (!copy && !hooks_.debug) return;
   photo_copy_ = copy;
@@ -40,6 +48,19 @@ void SnapshotWatcher::OnSwap(uint32_t state) {
     Image frame;
     if (WaitAndCapture(n, &frame)) hooks_.submit(std::move(frame), Source::kDebug, "n");
   }
+}
+
+void SnapshotWatcher::OnAlbumSave() {
+  std::optional<Image> photo;
+  {
+    std::lock_guard<std::mutex> lock(held_mutex_);
+    photo.swap(held_);
+  }
+  if (hooks_.debug) {
+    hooks_.log(std::format("photo hook: Album save at guest swap {} ({})", swaps_,
+                           photo ? "copy written" : "no held photo"));
+  }
+  if (photo) hooks_.submit(std::move(*photo), Source::kSnapshot, "");
 }
 
 bool SnapshotWatcher::WaitAndCapture(uint32_t n, Image* image) {

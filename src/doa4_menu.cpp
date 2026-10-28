@@ -484,7 +484,7 @@ void MenuDialog::DrawPhotoTab() {
 
   ImGui::SeparatorText("In-game snapshots");
   bool auto_copy = rex::cvar::Query<bool>("doa4_photo_auto");
-  if (ImGui::Checkbox("Also save a full-quality copy when you take an in-game snapshot",
+  if (ImGui::Checkbox("Also save a full-quality copy when you save a snapshot to the in-game Album",
                       &auto_copy)) {
     SaveThenSet("doa4_photo_auto", auto_copy ? "true" : "false", false);
   }

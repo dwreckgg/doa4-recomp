@@ -4,7 +4,11 @@
 // unconditional; VdSwap itself is a strong SDK export and cannot be
 // overridden). The hook reads the game's snapshot state before the swap is
 // issued, issues it, and hands the state to the SnapshotWatcher, which acts on
-// the swap that presents a finished in-game photo. See
+// the swap that presents a finished in-game photo.
+//
+// sub_823078C8 is the game's photo compressor, called only by the snapshot
+// save menu (sub_82535150, its save state) when the player saves the photo to
+// the Album; after it runs, the watcher writes the held full-quality copy. See
 // notes/research/photo_findings.md.
 
 #include <atomic>
@@ -32,6 +36,7 @@ void InstallSnapshotWatcher(SnapshotWatcher* watcher) {
 
 extern "C" {
 REX_EXTERN(__imp__sub_8275AEE0);
+REX_EXTERN(__imp__sub_823078C8);
 }
 
 REX_HOOK_RAW(sub_8275AEE0) {
@@ -39,4 +44,9 @@ REX_HOOK_RAW(sub_8275AEE0) {
       rex::memory::load_and_swap<uint32_t>(base + doa4::photo::kSnapshotStateAddress);
   __imp__sub_8275AEE0(ctx, base);
   if (auto* watcher = g_watcher.load(std::memory_order_acquire)) watcher->OnSwap(state);
+}
+
+REX_HOOK_RAW(sub_823078C8) {
+  __imp__sub_823078C8(ctx, base);
+  if (auto* watcher = g_watcher.load(std::memory_order_acquire)) watcher->OnAlbumSave();
 }
