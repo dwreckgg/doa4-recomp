@@ -55,6 +55,9 @@ struct MenuHost {
   tweaks::TweakPatcher* patcher = nullptr;  // owned by the app
   tweaks::ProtectFn protect;
   std::filesystem::path save_dir;  // the ups.dat save package folder, or empty
+  // Where the one-time save backup goes: outside the folder the game lists
+  // its saves from.
+  std::filesystem::path backup_root;
   ExtrasState* extras = nullptr;   // owned by the app: survives closing the menu
   bool running_alpha152 = false;   // doa4_alpha152 the game started with
   // doa4_alpha152 saved for the next start; owned by the app, changed only

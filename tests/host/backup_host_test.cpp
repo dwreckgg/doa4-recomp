@@ -31,63 +31,87 @@ static std::string ReadAll(const fs::path& path) {
 
 static int CountBackups(const fs::path& dir) {
   int n = 0;
+  if (!fs::exists(dir)) return 0;
   for (const auto& entry : fs::directory_iterator(dir)) {
     if (entry.path().filename().string().rfind("ups.dat.backup-", 0) == 0) ++n;
   }
   return n;
 }
 
+// A complete save file: kSaveFileSize bytes.
+static std::string Save(char fill) { return std::string(doa4::kSaveFileSize, fill); }
+
 static void TestBackup() {
   const fs::path root = fs::temp_directory_path() / "doa4_backup_test_data";
   fs::remove_all(root);
-  fs::create_directories(root / "00000001" / "ups.dat");
-  const fs::path save = root / "00000001" / "ups.dat";
-  WriteFile(save / "ups.dat", "profile-v1");
+  const fs::path content = root / "B13EBABEBABEBABE" / "544307D1" / "00000001";
+  const fs::path save = content / "ups.dat";
+  const fs::path backups = root / "doa4_save_backups";
+  fs::create_directories(save);
+  WriteFile(save / "ups.dat", Save('1'));
   WriteFile(save / "__thumbnail.png", "png");
 
-  // First call copies the whole folder.
-  doa4::BackupResult first = doa4::EnsureSaveBackup(save, "2026-10-28-120000");
+  // First call copies the whole folder into the backup folder, outside the
+  // folder the game lists its saves from.
+  doa4::BackupResult first = doa4::EnsureSaveBackup(save, backups, "2026-10-28-120000");
   CHECK(first.ok);
-  CHECK(first.backup == root / "00000001" / "ups.dat.backup-2026-10-28-120000");
-  CHECK(ReadAll(first.backup / "ups.dat") == "profile-v1");
+  CHECK(first.backup == backups / "ups.dat.backup-2026-10-28-120000");
+  CHECK(ReadAll(first.backup / "ups.dat") == Save('1'));
   CHECK(ReadAll(first.backup / "__thumbnail.png") == "png");
-  CHECK(ReadAll(save / "ups.dat") == "profile-v1");  // the save itself untouched
+  CHECK(ReadAll(save / "ups.dat") == Save('1'));  // the save itself untouched
+  CHECK(CountBackups(content) == 0);              // nothing new beside the save
 
   // Later calls keep the first backup and make no new one, even after the
   // save has changed.
-  WriteFile(save / "ups.dat", "profile-v2-unlocked");
-  doa4::BackupResult second = doa4::EnsureSaveBackup(save, "2026-10-29-090000");
+  WriteFile(save / "ups.dat", Save('2'));
+  doa4::BackupResult second = doa4::EnsureSaveBackup(save, backups, "2026-10-29-090000");
   CHECK(second.ok);
   CHECK(second.backup == first.backup);
-  CHECK(ReadAll(first.backup / "ups.dat") == "profile-v1");
-  CHECK(CountBackups(root / "00000001") == 1);
+  CHECK(ReadAll(first.backup / "ups.dat") == Save('1'));
+  CHECK(CountBackups(backups) == 1);
 
   // No save folder yet: nothing to lose, nothing copied.
-  const fs::path missing = root / "00000002" / "ups.dat";
-  doa4::BackupResult none = doa4::EnsureSaveBackup(missing, "2026-10-28-120000");
+  const fs::path missing = root / "other" / "ups.dat";
+  doa4::BackupResult none = doa4::EnsureSaveBackup(missing, root / "b_none", "s");
   CHECK(none.ok);
   CHECK(none.backup.empty());
   CHECK(!none.message.empty());
-  CHECK(!fs::exists(root / "00000002"));
+  CHECK(!fs::exists(root / "b_none"));
 
-  // A copy that cannot be made is an error and leaves no partial backup: the
-  // backup name is taken by a file.
-  fs::create_directories(root / "00000003" / "ups.dat");
-  WriteFile(root / "00000003" / "ups.dat" / "ups.dat", "x");
-  WriteFile(root / "00000003" / "ups.dat.backup-blocked", "a file, not a folder");
-  doa4::BackupResult blocked = doa4::EnsureSaveBackup(root / "00000003" / "ups.dat", "blocked");
+  // A save file that is not complete (caught mid-save) is not copied.
+  const fs::path partial = root / "partial" / "ups.dat";
+  fs::create_directories(partial);
+  WriteFile(partial / "ups.dat", "only part of it");
+  doa4::BackupResult cut = doa4::EnsureSaveBackup(partial, root / "b_partial", "s");
+  CHECK(!cut.ok);
+  CHECK(cut.message.find("the game may be saving") != std::string::npos);
+  CHECK(CountBackups(root / "b_partial") == 0);
+
+  // An existing backup counts only if it holds a complete save; an empty or
+  // partial one does not stop a real backup being made.
+  const fs::path save2 = root / "two" / "ups.dat";
+  fs::create_directories(save2);
+  WriteFile(save2 / "ups.dat", Save('3'));
+  const fs::path backups2 = root / "b_two";
+  fs::create_directories(backups2 / "ups.dat.backup-empty");
+  fs::create_directories(backups2 / "ups.dat.backup-short");
+  WriteFile(backups2 / "ups.dat.backup-short" / "ups.dat", "short");
+  doa4::BackupResult real = doa4::EnsureSaveBackup(save2, backups2, "s2");
+  CHECK(real.ok);
+  CHECK(real.backup == backups2 / "ups.dat.backup-s2");
+  CHECK(ReadAll(real.backup / "ups.dat") == Save('3'));
+
+  // A copy that cannot be made is an error: the backup name is taken by a file.
+  const fs::path save3 = root / "three" / "ups.dat";
+  fs::create_directories(save3);
+  WriteFile(save3 / "ups.dat", Save('4'));
+  const fs::path backups3 = root / "b_three";
+  fs::create_directories(backups3);
+  WriteFile(backups3 / "ups.dat.backup-blocked", "a file, not a folder");
+  doa4::BackupResult blocked = doa4::EnsureSaveBackup(save3, backups3, "blocked");
   CHECK(!blocked.ok);
   CHECK(!blocked.message.empty());
-  CHECK(fs::is_regular_file(root / "00000003" / "ups.dat.backup-blocked"));
-
-  // A file named like a backup is not a backup.
-  fs::create_directories(root / "00000004" / "ups.dat");
-  WriteFile(root / "00000004" / "ups.dat" / "ups.dat", "y");
-  WriteFile(root / "00000004" / "ups.dat.backup-notes.txt", "notes");
-  doa4::BackupResult real = doa4::EnsureSaveBackup(root / "00000004" / "ups.dat", "s1");
-  CHECK(real.ok);
-  CHECK(real.backup == root / "00000004" / "ups.dat.backup-s1");
-  CHECK(ReadAll(real.backup / "ups.dat") == "y");
+  CHECK(fs::is_regular_file(backups3 / "ups.dat.backup-blocked"));
 
   fs::remove_all(root);
 }

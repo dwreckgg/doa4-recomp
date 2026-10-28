@@ -5,6 +5,8 @@
 #include <chrono>
 #include <ctime>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <system_error>
 #include <vector>
 
@@ -55,13 +57,14 @@ std::string DescribeUnlock(const unlocks::UnlockResult& result) {
 }
 
 bool UnlockWithBackup(const GuestBytes& guest, uint32_t profile, unlocks::Unlock what,
-                      const std::filesystem::path& save_dir, std::string_view stamp,
+                      const std::filesystem::path& save_dir,
+                      const std::filesystem::path& backup_root, std::string_view stamp,
                       ExtrasState* state, std::string* error) {
   if (save_dir.empty()) {
     *error = "Nothing unlocked: the save folder is unknown, so it could not be backed up.";
     return false;
   }
-  BackupResult backup = EnsureSaveBackup(save_dir, stamp);
+  BackupResult backup = EnsureSaveBackup(save_dir, backup_root, stamp);
   if (!backup.ok) {
     *error = "Nothing unlocked: " + backup.message;
     return false;
@@ -75,17 +78,48 @@ bool UnlockWithBackup(const GuestBytes& guest, uint32_t profile, unlocks::Unlock
     state->waiting_for_save = true;
     state->saved = false;
     state->save_time_at_click = before;
+    state->profile = profile;
+    state->pending_unlocks |= 1u << static_cast<int>(what);
   }
   return true;
 }
 
-void PollSaved(const std::filesystem::path& save_dir, ExtrasState* state) {
+void PollSaved(const GuestBytes& guest, const std::filesystem::path& save_dir,
+               ExtrasState* state) {
   if (!state->waiting_for_save) return;
   const std::optional<std::filesystem::file_time_type> now = SaveFileTime(save_dir);
-  if (now && now != state->save_time_at_click) {
-    state->waiting_for_save = false;
-    state->saved = true;
+  if (!now || now == state->save_time_at_click) return;
+  std::string file;
+  {
+    std::ifstream in(save_dir / "ups.dat", std::ios::binary);
+    file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
   }
+  if (file.size() != kSaveFileSize) return;  // being written
+  // ups.dat is a dump of the profile record: read the record from the file and
+  // the game's tables from guest memory.
+  const uint32_t record = state->profile - unlocks::kRecordToProfile;
+  const GuestBytes in_file{[&](uint32_t address) {
+                             const uint32_t offset = address - record;  // wraps below record
+                             return offset < file.size() ? uint8_t(file[offset])
+                                                         : guest.Read(address);
+                           },
+                           [](uint32_t, uint8_t) {}};
+  for (int kind = 0; kind <= static_cast<int>(unlocks::Unlock::kEverything); ++kind) {
+    if ((state->pending_unlocks & (1u << kind)) &&
+        !unlocks::IsUnlocked(in_file, state->profile, static_cast<unlocks::Unlock>(kind))) {
+      return;  // a newer file without the unlock: keep waiting
+    }
+  }
+  state->waiting_for_save = false;
+  state->saved = true;
+  state->pending_unlocks = 0;
+}
+
+const char* UnsavedUnlocksWarning(const ExtrasState& state) {
+  return state.waiting_for_save
+             ? "Unlocks are not saved yet: restarting now loses them. Change any Options "
+               "setting first so the game saves."
+             : nullptr;
 }
 
 }  // namespace doa4

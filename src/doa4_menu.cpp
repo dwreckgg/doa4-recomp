@@ -189,6 +189,9 @@ void MenuDialog::DrawVideoTab() {
     if (ImGui::Button("Restart now")) {
       Restart();
     }
+    if (const char* warning = UnsavedUnlocksWarning(*host_.extras)) {
+      ImGui::TextColored(kErrorColor, "%s", warning);
+    }
   }
 }
 
@@ -316,8 +319,8 @@ void MenuDialog::DrawExtrasTab() {
     ImGui::BeginDisabled(!profile || done);
     if (ImGui::Button(row.label, ImVec2(220.0f, 0.0f))) {
       std::string error;
-      if (UnlockWithBackup(*host_.guest, *profile, row.what, host_.save_dir, BackupStamp(),
-                           host_.extras, &error)) {
+      if (UnlockWithBackup(*host_.guest, *profile, row.what, host_.save_dir, host_.backup_root,
+                           BackupStamp(), host_.extras, &error)) {
         status_.clear();
         REXLOG_INFO("[doa4][EXTRAS] {}: {}", row.label, host_.extras->last_change);
       } else {
@@ -341,7 +344,7 @@ void MenuDialog::DrawExtrasTab() {
 
   ExtrasState& state = *host_.extras;
   if (ImGui::GetTime() >= next_save_poll_) {
-    PollSaved(host_.save_dir, &state);
+    if (host_.guest) PollSaved(*host_.guest, host_.save_dir, &state);
     next_save_poll_ = ImGui::GetTime() + 1.0;
   }
   if (!state.last_change.empty()) {
@@ -378,6 +381,9 @@ void MenuDialog::DrawExtrasTab() {
     ImGui::TextColored(kNoteColor, "Alpha-152 changes on the next start.");
     if (ImGui::Button("Restart now##extras")) {
       Restart();
+    }
+    if (const char* warning = UnsavedUnlocksWarning(state)) {
+      ImGui::TextColored(kErrorColor, "%s", warning);
     }
   }
 }

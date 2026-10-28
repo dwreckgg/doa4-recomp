@@ -183,6 +183,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.patcher = &patcher_;
     host.protect = protect_;
     host.save_dir = SaveFolder();
+    host.backup_root = BackupFolder();
     host.extras = &extras_;
     host.running_alpha152 = running_alpha152_;
     host.saved_alpha152 = &saved_alpha152_;
@@ -283,6 +284,13 @@ class DeadOrAlive4App : public rex::ReXApp {
     return doa4::SaveDir(user_data_root(), xuid);
   }
 
+  // <user_data_root>/doa4_save_backups: outside the folder the game lists its
+  // saves from (it would see a backup as a second save package).
+  std::filesystem::path BackupFolder() const {
+    return user_data_root().empty() ? std::filesystem::path()
+                                    : user_data_root() / "doa4_save_backups";
+  }
+
   std::string DumpProfile(uint32_t profile) const {
     std::string out;
     for (uint32_t offset = doa4::unlocks::kFirstStoryClear; offset < 0x404C; ++offset) {
@@ -321,7 +329,8 @@ class DeadOrAlive4App : public rex::ReXApp {
           REXLOG_INFO("[doa4][EXTRAS] before {}", DumpProfile(*profile));
           std::string error;
           if (doa4::UnlockWithBackup(guest_, *profile, doa4::unlocks::Unlock::kEverything,
-                                     SaveFolder(), doa4::BackupStamp(), &state, &error)) {
+                                     SaveFolder(), BackupFolder(), doa4::BackupStamp(),
+                                     &state, &error)) {
             REXLOG_INFO("[doa4][EXTRAS] test unlock: {} backup: {}", state.last_change,
                         state.backup.empty() ? state.backup_note : state.backup.string());
             REXLOG_INFO("[doa4][EXTRAS] after  {}", DumpProfile(*profile));
@@ -330,7 +339,7 @@ class DeadOrAlive4App : public rex::ReXApp {
           }
         }
         if (unlocked && !saved_logged) {
-          doa4::PollSaved(SaveFolder(), &state);
+          doa4::PollSaved(guest_, SaveFolder(), &state);
           if (state.saved) {
             saved_logged = true;
             REXLOG_INFO("[doa4][EXTRAS] the game rewrote ups.dat");
