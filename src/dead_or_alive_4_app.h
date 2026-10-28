@@ -387,6 +387,9 @@ class DeadOrAlive4App : public rex::ReXApp {
     };
     host.close_menu = [this] { CloseMenu(); };
     host.set_post_effect = [this](int index) { SetPostEffect(index); };
+    host.photo_result = [this] { return photo_ ? photo_->last_result() : doa4::photo::Result{}; };
+    host.photo_default_dir = doa4::photo::DefaultPhotoDir();
+    if (host.photo_default_dir.empty()) host.photo_default_dir = user_data_root() / "photos";
     host.guest = guest_ready_ ? &guest_ : nullptr;
     host.patcher = &patcher_;
     host.protect = protect_;

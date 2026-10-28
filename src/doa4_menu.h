@@ -23,6 +23,7 @@
 
 #include "doa4_extras.h"
 #include "doa4_guest.h"
+#include "doa4_photo_service.h"
 #include "doa4_tweaks.h"
 
 namespace rex::input {
@@ -52,6 +53,10 @@ struct MenuHost {
   // Switches the running game's anti-aliasing to graphics::kAntiAliasing[index]
   // (the SDK reads swap_post_effect only at start).
   std::function<void(int index)> set_post_effect;
+  // Photo tab: the photo service's last result, and the folder photos go to
+  // when doa4_photo_dir is empty.
+  std::function<photo::Result()> photo_result;
+  std::filesystem::path photo_default_dir;
 
   // Extras tab. `guest` is null until the XEX is loaded into guest memory.
   const GuestBytes* guest = nullptr;
@@ -90,6 +95,7 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void DrawPadSection();
   void DrawKeyboardSection();
   void DrawExtrasTab();
+  void DrawPhotoTab();
   // Saves the tweak's cvar; on success sets it and, for a live tweak, writes
   // or reverts its bytes. Failures go to status_.
   void SetTweak(size_t tweak, bool on);

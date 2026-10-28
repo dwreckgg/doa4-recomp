@@ -19,6 +19,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/ui_event.h>
 #include <rex/ui/window.h>
+#include <rex/ui/window_win.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -30,6 +31,7 @@
 
 #include "doa4_config.h"
 #include "doa4_graphics.h"
+#include "doa4_photo_win.h"
 #include "doa4_unlocks.h"
 
 namespace doa4 {
@@ -134,6 +136,10 @@ void MenuDialog::OnDraw(ImGuiIO& io) {
         ImGui::EndTabItem();
       } else if (listen_ != Listen::kNone) {
         listen_ = Listen::kNone;  // left the tab while a row was listening
+      }
+      if (ImGui::BeginTabItem("Photo")) {
+        DrawPhotoTab();
+        ImGui::EndTabItem();
       }
       if (ImGui::BeginTabItem("Extras")) {
         DrawExtrasTab();
@@ -420,6 +426,87 @@ void MenuDialog::DrawExtrasTab() {
   }
 }
 
+void MenuDialog::DrawPhotoTab() {
+  ImGui::SeparatorText("Save a photo");
+  ImGui::TextWrapped(
+      "Press F12 anywhere in the game. The photo is the game's own frame at the render scale, "
+      "without this menu or any other overlay.");
+
+  ImGui::SeparatorText("Format");
+  ImGui::PushID("photo_format");
+  const int format =
+      photo::ChoiceIndex(photo::kFormats, rex::cvar::Query<std::string>("doa4_photo_format"));
+  for (int i = 0; i < int(photo::kFormats.size()); ++i) {
+    if (ImGui::RadioButton(photo::kFormats[i].label, format == i) && format != i) {
+      SaveThenSet("doa4_photo_format", photo::kFormats[i].value, true);
+    }
+  }
+  ImGui::PopID();
+  ImGui::TextDisabled("Monitor size: at x4 the same clean, supersampled image you see on screen.");
+
+  ImGui::SeparatorText("Folder");
+  const std::string custom = rex::cvar::Query<std::string>("doa4_photo_dir");
+  const std::filesystem::path folder =
+      custom.empty() ? host_.photo_default_dir
+                     : std::filesystem::path(std::u8string(custom.begin(), custom.end()));
+  const std::u8string shown = folder.u8string();
+  ImGui::TextWrapped("%s%s", reinterpret_cast<const char*>(shown.c_str()),
+                     custom.empty() ? "  (default)" : "");
+  if (ImGui::Button("Choose folder...")) {
+    // After this frame: the folder dialog is modal and must not run inside
+    // the menu's drawing.
+    auto* win32 = dynamic_cast<rex::ui::Win32Window*>(host_.window);
+    void* hwnd = win32 ? win32->hwnd() : nullptr;
+    host_.defer([this, hwnd, folder] {
+      if (std::optional<std::filesystem::path> chosen = photo::PickFolder(hwnd, folder)) {
+        const std::u8string text = chosen->u8string();
+        SaveThenSet("doa4_photo_dir", std::string(text.begin(), text.end()), true);
+      }
+    });
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Open folder")) {
+    photo::OpenInExplorer(folder);
+  }
+  if (!custom.empty()) {
+    ImGui::SameLine();
+    if (ImGui::Button("Use default")) {
+      SaveThenSet("doa4_photo_dir", "", true);
+    }
+  }
+
+  ImGui::SeparatorText("In-game snapshots");
+  bool auto_copy = rex::cvar::Query<bool>("doa4_photo_auto");
+  if (ImGui::Checkbox("Also save a full-quality copy when you take an in-game snapshot",
+                      &auto_copy)) {
+    SaveThenSet("doa4_photo_auto", auto_copy ? "true" : "false", false);
+  }
+  ImGui::BeginDisabled(!auto_copy);
+  ImGui::PushID("photo_framing");
+  const int framing = photo::ChoiceIndex(
+      photo::kFramings, rex::cvar::Query<std::string>("doa4_photo_auto_framing"));
+  for (int i = 0; i < int(photo::kFramings.size()); ++i) {
+    if (ImGui::RadioButton(photo::kFramings[i].label, framing == i) && framing != i) {
+      SaveThenSet("doa4_photo_auto_framing", photo::kFramings[i].value, true);
+    }
+  }
+  ImGui::PopID();
+  ImGui::EndDisabled();
+  ImGui::TextDisabled("3:2 matches the photo the game keeps in its Album.");
+
+  if (host_.photo_result) {
+    const photo::Result result = host_.photo_result();
+    if (result.serial) {
+      ImGui::Spacing();
+      if (result.error) {
+        ImGui::TextColored(kErrorColor, "%s", result.text.c_str());
+      } else {
+        ImGui::TextColored(kDoneColor, "%s", result.text.c_str());
+      }
+    }
+  }
+}
+
 void MenuDialog::SetTweak(size_t index, bool on) {
   const tweaks::Tweak& tweak = tweaks::AllTweaks()[index];
   const char* value = on ? "true" : "false";
@@ -564,7 +651,7 @@ bool MenuDialog::SaveThenSet(std::string_view name, std::string_view value, bool
     status_ = fmt::format("Could not set {} to {}.", name, value);
     return false;
   }
-  REXLOG_INFO("[doa4][GFX] {} = {} saved", name, value);
+  REXLOG_INFO("[doa4][UI] {} = {} saved", name, value);
   return true;
 }
 
