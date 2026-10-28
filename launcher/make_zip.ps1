@@ -3,7 +3,9 @@
 #   DOA4\setup.bat
 #   DOA4\launcher\DOA4Launcher.ps1, DOA4Setup.psm1, config.ps1
 # -Destination <folder>  writes (or refreshes) those four files in <folder>\DOA4; nothing
-#                        else in that folder is touched.
+#                        else in that folder is touched. config.ps1 is one of the four, so
+#                        an edited config there (other repository URLs) is replaced by the
+#                        default one: this is a packaging tool, not an updater.
 # -ZipPath <file.zip>    also writes a zip holding only those four files, under DOA4\.
 param(
     [Parameter(Mandatory = $true)][string]$Destination,
