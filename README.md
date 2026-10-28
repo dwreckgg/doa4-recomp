@@ -12,6 +12,40 @@ graphics options, full-quality photos, a first-run setup that finds or extracts 
 branch has been pushed anywhere; a fresh clone from GitHub gives the upstream versions without them
 (see [Building from a fresh GitHub clone](#building-from-a-fresh-github-clone)).
 
+## Quick start: the one-click launcher
+
+The launcher installs what the build needs, downloads the sources, builds the game and makes a
+desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folder (`setup.bat` and a
+`launcher` folder) made from this repository by `launcher\make_zip.ps1` (it writes
+`DOA4-launcher.zip`, or `-Destination <folder>` writes the folder directly).
+
+1. Put the `DOA4` folder somewhere whose path has only plain letters, digits and spaces (for
+   example `C:\Games\DOA4`; the game cannot start from a path with accented or non-Latin letters).
+   Everything the launcher downloads and builds stays inside it (about 4 GB).
+2. Double-click `setup.bat` and press **Install**:
+   - **Tools:** it checks for Git, LLVM 23.1.4 and Visual Studio 2026 Build Tools with the C++
+     workload, lists any that are missing with their size, and installs them with winget after
+     one confirmation (Visual Studio shows its own installer and asks for administrator rights).
+   - **Code:** it downloads the game port and the ReXGlue SDK (about 2 GB the first time).
+   - **Build:** it applies the two Windows fixes from step 4 and step 6 below and builds (a few
+     minutes on a recent PC). Progress and every step's status show in the window.
+   - **Shortcut:** a "Dead or Alive 4" shortcut on the desktop opens the launcher.
+3. Press **Play**. On the first start the game asks for your disc image or extracted folder
+   ([step 5](#5-the-game-files)).
+4. Later: **Update & rebuild** fetches new commits and rebuilds ("nothing new" when there are none);
+   **Change game files**, **Open photos**, **Open saves** and **Open logs** do what they say.
+
+![The launcher before Install](docs/images/launcher.png)
+
+- `setup.bat -DryRun` shows what Install would install and do, without doing it.
+- Which sources it builds is set in `launcher\config.ps1`: upstream `parkerallan/doa4-recomp`
+  (`main`) with the SDK at `e8ce24f` by default. To build another fork or branch, change
+  `GameRepoUrl` / `GameRef` (and `SdkRepoUrl` / `SdkRef`) and install into a new `DOA4` folder.
+- It never pushes, stashes or overwrites your changes: Update stops and lists any file you changed
+  by hand in its checkouts (other than its own two fixes).
+
+The rest of this README is the same process by hand.
+
 ## Contents
 
 1. [The game version](#1-the-game-version)
