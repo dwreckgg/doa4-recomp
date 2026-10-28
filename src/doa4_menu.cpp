@@ -30,6 +30,7 @@
 #include <windows.h>
 
 #include "doa4_config.h"
+#include "doa4_gamefiles.h"
 #include "doa4_graphics.h"
 #include "doa4_photo_win.h"
 #include "doa4_utf8.h"
@@ -144,6 +145,10 @@ void MenuDialog::OnDraw(ImGuiIO& io) {
       }
       if (ImGui::BeginTabItem("Extras")) {
         DrawExtrasTab();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Game")) {
+        DrawGameTab();
         ImGui::EndTabItem();
       }
       ImGui::EndTabBar();
@@ -425,6 +430,33 @@ void MenuDialog::DrawExtrasTab() {
       ImGui::TextColored(kErrorColor, "%s", warning);
     }
   }
+}
+
+void MenuDialog::DrawGameTab() {
+  const gamefiles::GameTab tab = gamefiles::DescribeGameTab(
+      host_.game_files, host_.game_files_from_command_line,
+      PathFromUtf8(rex::cvar::Query<std::string>("doa4_game_files")));
+  ImGui::SeparatorText("Game files");
+  ImGui::TextWrapped("%s", Utf8(tab.now).c_str());
+  if (!tab.note.empty()) ImGui::TextWrapped("%s", tab.note.c_str());
+  ImGui::BeginDisabled(!tab.can_change || !host_.change_game_files);
+  if (ImGui::Button("Change...")) {
+    // After this frame, with the menu closed first (the setup screen takes
+    // its place; the menu must not be destroyed while it is drawing).
+    host_.defer([close = host_.close_menu, change = host_.change_game_files] {
+      close();
+      change();
+    });
+  }
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  if (ImGui::Button("Open folder")) {
+    host_.defer([close = host_.close_menu, dir = tab.now] {
+      close();
+      photo::OpenInExplorer(dir);
+    });
+  }
+  ImGui::TextDisabled("A new location is used from the next start.");
 }
 
 void MenuDialog::DrawPhotoTab() {

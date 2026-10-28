@@ -99,7 +99,7 @@ setup::Effects SetupDialog::MakeEffects() {
   };
   fx.done = [this](const fs::path& folder) {
     if (host_.log) host_.log("chosen: " + Utf8(folder));
-    host_.done(folder);
+    save_error_ = host_.done(folder);
   };
   return fx;
 }
@@ -207,9 +207,13 @@ void SetupDialog::OnDraw(ImGuiIO& io) {
         break;
       }
       case Stage::kFinished:
-        ImGui::TextUnformatted(host_.mode == SetupHost::Mode::kFirstRun
-                                   ? "Starting..."
-                                   : "Saved. The new location is used from the next start.");
+        if (host_.mode == SetupHost::Mode::kFirstRun) {
+          ImGui::TextUnformatted("Starting...");
+        } else if (save_error_.empty()) {
+          ImGui::TextUnformatted("Saved. The new location is used from the next start.");
+        } else {
+          Wrapped(&red, "The new location could not be saved: " + save_error_);
+        }
         if (host_.mode == SetupHost::Mode::kChange && ImGui::Button("Close")) {
           host_.defer(host_.close);
         }

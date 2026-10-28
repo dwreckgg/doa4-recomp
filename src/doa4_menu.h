@@ -1,7 +1,8 @@
 // In-game menu, opened and closed with Escape (bind_doa4_menu).
 //
 // Tabs: Video (display mode, render scale), Controls (per-slot controller
-// remap, keyboard binds) and Extras (unlocks, game tweaks). Every setting is
+// remap, keyboard binds), Photo, Extras (unlocks, game tweaks) and Game (where
+// the game files are). Every setting is
 // applied to its cvar and saved to dead_or_alive_4.toml with doa4::SaveTomlKey. The game keeps running while
 // the menu is open; its input is blocked (DeadOrAlive4App::OnBlocksGuestInput),
 // so the game sees an untouched controller and keyboard.
@@ -67,6 +68,12 @@ struct MenuHost {
   // its saves from.
   std::filesystem::path backup_root;
   ExtrasState* extras = nullptr;   // owned by the app: survives closing the menu
+  // Game tab: the folder the game started from, whether --game_data_root
+  // chose it, and the action that closes the menu and opens the setup screen
+  // to choose another (used from the next start).
+  std::filesystem::path game_files;
+  bool game_files_from_command_line = false;
+  std::function<void()> change_game_files;
   bool running_alpha152 = false;   // doa4_alpha152 the game started with
   // doa4_alpha152 saved for the next start; owned by the app, changed only
   // after a successful save.
@@ -96,6 +103,7 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void DrawKeyboardSection();
   void DrawExtrasTab();
   void DrawPhotoTab();
+  void DrawGameTab();
   // Saves the tweak's cvar; on success sets it and, for a live tweak, writes
   // or reverts its bytes. Failures go to status_.
   void SetTweak(size_t tweak, bool on);

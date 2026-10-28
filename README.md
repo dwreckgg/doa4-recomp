@@ -7,8 +7,8 @@ repository contains **no game data**: you build it, then run it against files ex
 own copy of the game.
 
 This checkout is [parkerallan/doa4-recomp](https://github.com/parkerallan/doa4-recomp) plus the local
-branch `perf-pacing` (frame pacing, Esc menu with Video / Controls / Extras / Photo tabs, graphics
-options, full-quality photos). It builds against a local `rexglue-sdk` branch, `doa4-perf`. Neither
+branch `perf-pacing` (frame pacing, Esc menu with Video / Controls / Photo / Extras / Game tabs,
+graphics options, full-quality photos, a first-run setup that finds or extracts the game files). It builds against a local `rexglue-sdk` branch, `doa4-perf`. Neither
 branch has been pushed anywhere; a fresh clone from GitHub gives the upstream versions without them
 (see [Building from a fresh GitHub clone](#building-from-a-fresh-github-clone)).
 
@@ -18,7 +18,7 @@ branch has been pushed anywhere; a fresh clone from GitHub gives the upstream ve
 2. [Tools](#2-tools)
 3. [Folder layout](#3-folder-layout)
 4. [Get the sources](#4-get-the-sources)
-5. [Extract the game files from the ISO](#5-extract-the-game-files-from-the-iso)
+5. [The game files](#5-the-game-files)
 6. [Build](#6-build)
 7. [Run](#7-run)
 8. [Regenerating the recompiled code](#8-regenerating-the-recompiled-code)
@@ -107,12 +107,20 @@ py -3 doa4-recomp\tools\fix_git_symlinks.py rexglue-sdk
 It reports `replaced 16 symlink stub(s)` the first time and nothing afterwards; it is safe to run
 again. `git status` in the SDK then shows the two submodules as modified (` m`), which is expected.
 
-## 5. Extract the game files from the ISO
+## 5. The game files
 
 The recomp reads the game's files from a folder, not from the disc image. Xbox 360 discs use the
-XDVDFS file system, which ordinary ISO tools cannot open. `tools/xdvdfs_extract.py` (a short Python
-script, no dependencies) is what this build used. It finds the game partition itself (DOA4 is an XGD2
-disc; its partition starts at byte `0xFD90000`).
+XDVDFS file system, which ordinary ISO tools cannot open.
+
+**Usually nothing to do here:** the first time `dead_or_alive_4.exe` starts without game files it
+shows a setup screen (step 7). Choose your disc image and it checks the version, asks where to
+extract (default: a `DOA4` folder beside the image; it shows the space needed and free) and
+extracts with a progress bar; or choose a folder you extracted before. The location is saved, and
+the Esc menu's **Game** tab can change it later.
+
+**By hand:** `tools/xdvdfs_extract.py` (a short Python script, no dependencies) does the same
+extraction from a command line, and is what the first build used. It finds the game partition itself
+(DOA4 is an XGD2 disc; its partition starts at byte `0xFD90000`).
 
 ```bat
 cd /d C:\doa4
@@ -158,8 +166,14 @@ The result is in `out\build\win-amd64-release\`: `dead_or_alive_4.exe` with `rex
 
 ## 7. Run
 
-The exe needs to be told where the game files are. Save this as `run_doa4.bat` next to
-`dead_or_alive_4.exe` and edit the two paths:
+Start `out\build\win-amd64-release\dead_or_alive_4.exe`. On the first start (or when the saved
+location has gone, e.g. an unplugged drive) the setup screen asks for your disc image or extracted
+folder (step 5); after that the game starts straight away. The setup accepts only the supported
+version (step 1) and explains why when it refuses one.
+
+Optionally, a `run_doa4.bat` next to the exe can pass the folders on the command line. A
+`--game_data_root` given this way overrides the saved location (and the Game tab's **Change…** is
+then off); leave it out to use the setup's choice:
 
 ```bat
 @echo off
@@ -216,7 +230,8 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 | `clang` not found / CMake picks the wrong compiler | LLVM's `bin` folder is not first on `PATH` in that window. |
 | CMake warning `no v* tag reachable from HEAD` | Harmless; `git fetch --tags` in `rexglue-sdk` removes it. |
 | `no XDVDFS volume found` from the extractor | The file is not an Xbox / Xbox 360 game image (or is damaged). |
-| The game does not start | Check the newest log in `logs\`. Most often `--game_data_root` does not point at the folder that holds `default.xex`. |
+| The game does not start | Check the newest log in `logs\` (lines tagged `[doa4][SETUP]` say which game folder was used and why). |
+| The setup screen keeps coming back | The saved location could not be written to `dead_or_alive_4.toml` (the log says why), or the folder has moved. |
 
 ## Building from a fresh GitHub clone
 

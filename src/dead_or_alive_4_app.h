@@ -98,20 +98,35 @@ class DeadOrAlive4App : public rex::ReXApp {
     if (!drawer_) return defaults;  // no window to ask in: the SDK reports the missing path
     OpenSetup(doa4::SetupHost::Mode::kFirstRun, choice.reason,
               [this, defaults, resume](const std::filesystem::path& folder) {
-                SaveGameFiles(folder);
+                std::string error = SaveGameFiles(folder);
                 game_files_ = folder;
                 rex::PathConfig paths = defaults;
                 paths.game_data_root = folder;
                 app_context().CallInUIThreadDeferred([this, paths, resume] {
-                  setup_.reset();
+                  CloseSetup();
                   resume(paths);
                 });
+                return error;
               });
     return std::nullopt;
   }
 
+  // Esc menu, Game tab: choose another location (used from the next start).
+  void ChangeGameFiles() {
+    if (setup_) return;
+    REXLOG_INFO("[doa4][SETUP] change screen opened");
+    OpenSetup(doa4::SetupHost::Mode::kChange, "", [this](const std::filesystem::path& folder) {
+      return SaveGameFiles(folder);
+    });
+  }
+
+  void CloseSetup() {
+    setup_open_.store(false, std::memory_order_release);
+    setup_.reset();
+  }
+
   void OpenSetup(doa4::SetupHost::Mode mode, std::string reason,
-                 std::function<void(const std::filesystem::path&)> done) {
+                 std::function<std::string(const std::filesystem::path&)> done) {
     doa4::SetupHost host;
     host.mode = mode;
     auto* win32 = dynamic_cast<rex::ui::Win32Window*>(window());
@@ -128,25 +143,31 @@ class DeadOrAlive4App : public rex::ReXApp {
         REXLOG_INFO("[doa4][SETUP] quit from the setup screen");
         app_context().QuitFromUIThread();
       } else {
-        setup_.reset();
+        REXLOG_INFO("[doa4][SETUP] change screen closed");
+        CloseSetup();
       }
     };
     host.log = [](const std::string& line) { REXLOG_INFO("[doa4][SETUP] {}", line); };
+    setup_open_.store(true, std::memory_order_release);
     setup_ = std::make_unique<doa4::SetupDialog>(drawer_, std::move(host));
   }
 
-  // Saves the chosen folder as doa4_game_files. A failure is logged; the game
-  // still starts with the folder, and the setup screen opens again next time.
-  void SaveGameFiles(const std::filesystem::path& folder) {
+  // Saves the chosen folder as doa4_game_files (the file, then the cvar the
+  // Game tab reads). Returns "" or the failure, which is also logged; after a
+  // first-run failure the game still starts with the folder, and the setup
+  // screen opens again next time.
+  std::string SaveGameFiles(const std::filesystem::path& folder) {
     const std::string error = doa4::SaveTomlKey(ConfigPath(), "doa4_game_files",
                                                 doa4::TomlString(doa4::Utf8(folder)));
     if (error.empty()) {
+      rex::cvar::SetFlagByName("doa4_game_files", doa4::Utf8(folder));
       REXLOG_INFO("[doa4][SETUP] saved doa4_game_files = {}", doa4::Utf8(folder));
     } else {
       REXLOG_WARN("[doa4][SETUP] could not save doa4_game_files ({}); the setup screen will "
                   "open again next time",
                   error);
     }
+    return error;
   }
 
   std::filesystem::path ConfigPath() {
@@ -162,6 +183,11 @@ class DeadOrAlive4App : public rex::ReXApp {
   // void OnLoadXexImage(std::string& xex_image) override {}
   void OnPostSetup() override {
     REXLOG_INFO("[doa4][LIFE] OnPostSetup: runtime ready");
+    // Test switch: open the Game tab's change screen once the game runs (with
+    // DOA4_SETUP_TEST choosing the folder), as "Change..." would.
+    if (const char* change = std::getenv("DOA4_SETUP_CHANGE_TEST"); change && change[0] == '1') {
+      app_context().CallInUIThreadDeferred([this] { ChangeGameFiles(); });
+    }
     // NOTE: log_noisy intentionally left OFF. It was force-enabled during boot
     // bring-up to trace kernel imports; that trace is hot-path spam now and is
     // a no-op at the relwithdebinfo log level (info) anyway.
@@ -474,6 +500,9 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.save_dir = SaveFolder();
     host.backup_root = BackupFolder();
     host.extras = &extras_;
+    host.game_files = game_files_;
+    host.game_files_from_command_line = game_files_from_command_line_;
+    host.change_game_files = [this] { ChangeGameFiles(); };
     host.running_alpha152 = running_alpha152_;
     host.saved_alpha152 = &saved_alpha152_;
     menu_ = std::make_unique<doa4::MenuDialog>(drawer_, std::move(host));
@@ -491,7 +520,10 @@ class DeadOrAlive4App : public rex::ReXApp {
   // The game sees an untouched controller and keyboard while the menu is open
   // (the button pressed to remap something must not also act in the game).
   // Called from the guest's input polls: reads only the atomic.
-  bool OnBlocksGuestInput() override { return menu_open_.load(std::memory_order_acquire); }
+  bool OnBlocksGuestInput() override {
+    return menu_open_.load(std::memory_order_acquire) ||
+           setup_open_.load(std::memory_order_acquire);
+  }
 
   void ToggleDiagOverlay(rex::ui::ImGuiDrawer* drawer) {
     if (diag_overlay_) {
@@ -507,6 +539,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   // First-run setup (doa4_setup_dialog.h): the screen while it is open, and
   // the folder the game started from.
   std::unique_ptr<doa4::SetupDialog> setup_;
+  std::atomic<bool> setup_open_{false};  // read by the guest's input polls
   std::filesystem::path game_files_;
   bool game_files_from_command_line_ = false;
   std::unique_ptr<doa4::DiagOverlayDialog> diag_overlay_;

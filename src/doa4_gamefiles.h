@@ -56,6 +56,17 @@ StartChoice ChooseStartPath(const std::filesystem::path& command_line,
                             const std::filesystem::path& saved,
                             const std::function<bool(const std::filesystem::path&)>& has_xex);
 
+// What the Esc menu's Game tab shows: the folder in use, a note (UTF-8; empty
+// for none) and whether Change is offered. `saved` is doa4_game_files now
+// (possibly changed since start-up).
+struct GameTab {
+  std::filesystem::path now;
+  std::string note;
+  bool can_change = true;
+};
+GameTab DescribeGameTab(const std::filesystem::path& now, bool from_command_line,
+                        const std::filesystem::path& saved);
+
 enum class Verdict {
   kOk,
   kNotXbox,       // not an Xbox disc image

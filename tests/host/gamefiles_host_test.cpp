@@ -326,6 +326,28 @@ static void TestNonAnsiTarget(const fs::path& dir) {
   CHECK(c.reason.find("\xE3\x82\xB2") != std::string::npos);
 }
 
+// The Esc menu's Game tab: the folder in use, what the next start uses, and
+// whether Change is offered.
+static void TestGameTab() {
+  const fs::path now = "C:/doa4/xex/DOA4", other = "E:/DOA4";
+  GameTab t = DescribeGameTab(now, false, now);
+  CHECK(t.now == now && t.note.empty() && t.can_change);
+  // Changed in this session (saved, used from the next start).
+  t = DescribeGameTab(now, false, other);
+  CHECK(t.can_change && t.note.find("Next start") != std::string::npos);
+  CHECK(t.note.find("E:/DOA4") != std::string::npos);
+  // Started with --game_data_root: it would override any saved choice, so
+  // Change is off and the note says why.
+  t = DescribeGameTab(now, true, "");
+  CHECK(!t.can_change && t.note.find("--game_data_root") != std::string::npos);
+  t = DescribeGameTab(now, true, other);
+  CHECK(!t.can_change && t.note.find("--game_data_root") != std::string::npos);
+  // Nothing saved (started from the command line before any setup) and not
+  // from the command line cannot happen; a saved value equal to now: no note.
+  t = DescribeGameTab(now, false, "");
+  CHECK(t.can_change && t.note.empty());
+}
+
 int main() {
   const fs::path dir = fs::temp_directory_path() / "doa4_gamefiles_test_data";
   fs::remove_all(dir);
@@ -333,6 +355,7 @@ int main() {
   try {
     TestSha1();
     TestChooseStartPath();
+    TestGameTab();
     TestHasXex(dir);
     TestCheckImage(dir);
     TestCheckFolder(dir);

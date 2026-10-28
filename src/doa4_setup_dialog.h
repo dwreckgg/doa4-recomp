@@ -35,7 +35,8 @@ struct SetupHost {
   // Runs `fn` on the UI thread; callable from any thread.
   std::function<void(std::function<void()> fn)> post;
   // The chosen folder (checked or just extracted and verified). UI thread.
-  std::function<void(const std::filesystem::path& folder)> done;
+  // Returns "" or why it could not be saved (shown in kChange).
+  std::function<std::string(const std::filesystem::path& folder)> done;
   // Quit (kFirstRun) or close the dialog (kChange). UI thread, deferred.
   std::function<void()> close;
   std::function<void(const std::string& line)> log;
@@ -60,6 +61,7 @@ class SetupDialog : public rex::ui::ImGuiDialog {
   std::thread worker_;
   setup::TestScript test_;
   bool test_started_ = false, test_extract_started_ = false;
+  std::string save_error_;  // what `done` returned
   setup::Stage logged_stage_ = setup::Stage::kChoose;
   std::string logged_message_;
 };

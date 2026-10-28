@@ -142,6 +142,21 @@ StartChoice ChooseStartPath(const fs::path& command_line, const fs::path& saved,
   return choice;
 }
 
+GameTab DescribeGameTab(const fs::path& now, bool from_command_line, const fs::path& saved) {
+  GameTab tab;
+  tab.now = now;
+  if (from_command_line) {
+    tab.can_change = false;
+    tab.note =
+        "This start used --game_data_root (for example from run_doa4.bat), which overrides a "
+        "saved location, so Change is off. Start dead_or_alive_4.exe directly to use the saved "
+        "location and change it here.";
+  } else if (!saved.empty() && saved != now) {
+    tab.note = "Next start: " + Utf8(saved);
+  }
+  return tab;
+}
+
 ImageCheck CheckImage(const fs::path& iso, std::string_view expected_sha1) {
   ImageCheck check;
   xdvdfs::FileSource src;
