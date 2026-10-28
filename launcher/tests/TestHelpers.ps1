@@ -179,6 +179,45 @@ function Get-TStatus {
     return @(Invoke-TGit $Repo @('-c', 'core.quotepath=false', 'status', '--porcelain', '--untracked-files=no') | Where-Object { $_ })
 }
 
+# An installed DOA4 folder: real git origins under $Base, faked tools, a faked build (it only
+# creates the exe). The root is ASCII with a space: Install refuses other roots (review I1).
+function New-TInstalled {
+    param([string]$Base, [switch]$WithSetupDialog, [scriptblock]$BeforeInstall, [string]$RootName = 'DOA4 test')
+    Enable-TFileProtocol
+    $o = New-TOrigins -Base $Base -WithSetupDialog:$WithSetupDialog
+    if ($BeforeInstall) { & $BeforeInstall $o }
+    $cfg = New-TestConfig
+    $cfg.GameRepoUrl = $o.Game; $cfg.GameRef = 'main'
+    $sdkHead = @(Invoke-TGit $o.Sdk @('rev-parse', 'HEAD'))[0]
+    # The SDK pinned to a commit, as in the default config (e8ce24f).
+    $cfg.SdkRepoUrl = $o.Sdk; $cfg.SdkRef = $sdkHead.Substring(0, 7)
+    $tools = New-FakeTools -VsRoot (Join-Path $Base 'vs')
+    $build = New-FakeCmd -Do {
+        param($envVars)
+        $exeDir = Join-Path $envVars.DOA4_GAME 'out\build\win-amd64-release'
+        [void](New-Item -ItemType Directory -Force -Path $exeDir)
+        [IO.File]::WriteAllText((Join-Path $exeDir 'dead_or_alive_4.exe'), 'fake exe')
+    }
+    $root = Join-Path $Base $RootName
+    $shortcuts = Join-Path $Base 'shortcuts'
+    [void](New-Item -ItemType Directory -Force -Path $shortcuts)
+    $ctx = New-DOA4Context -Root $root -Config $cfg -Cmd (New-FakeTable $tools -Cmd $build -RealGit) -ShortcutFolder $shortcuts
+    $r = Invoke-DOA4Install -Ctx $ctx
+    [pscustomobject]@{ Origins = $o; Config = $cfg; Tools = $tools; Build = $build; Root = $root; Ctx = $ctx; Install = $r; Shortcuts = $shortcuts }
+}
+
+function New-TCtx {
+    param($T, [string]$Action = 'run')
+    New-DOA4Context -Root $T.Root -Config $T.Config -Cmd (New-FakeTable $T.Tools -Cmd $T.Build -RealGit) -Action $Action
+}
+
+function Add-TUpstreamCommit {
+    param($T)
+    Write-TFile (Join-Path $T.Origins.Game 'src\new.cpp') "// new`n"
+    Invoke-TGit $T.Origins.Game @('add', '-A') | Out-Null
+    Invoke-TGit $T.Origins.Game @('commit', '-q', '-m', 'new upstream') | Out-Null
+}
+
 # Lets the module's own git calls clone file:// submodules in tests (never set outside tests).
 function Enable-TFileProtocol {
     $env:GIT_CONFIG_COUNT = '1'

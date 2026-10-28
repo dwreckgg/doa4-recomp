@@ -240,11 +240,13 @@ Describe 'Get-DOA4StubChanges (what an update may undo)' {
     It 'lists an edited ordinary file in the submodule as foreign' {
         [IO.File]::AppendAllText((Join-Path $sdk 'thirdparty\lib\real\a.c'), "int mine;`r`n")
         $c = Get-DOA4StubChanges -Cmd $real -RepoPath $sdk
-        $c.Foreign -join ',' | Should Be 'thirdparty/lib/real/a.c'
+        # real/a.c is also link/a.c's target, so the (unchanged) copy no longer equals its
+        # target and is listed too (review I5: a copy is the launcher's only while equal).
+        @($c.Foreign | Sort-Object) -join ',' | Should Be 'thirdparty/lib/link/a.c (copied file differs from its link target),thirdparty/lib/real/a.c'
     }
     It 'lists an edited file in the SDK itself as foreign' {
         [IO.File]::AppendAllText((Join-Path $sdk 'README.md'), "mine`r`n")
         $c = Get-DOA4StubChanges -Cmd $real -RepoPath $sdk
-        @($c.Foreign | Sort-Object) -join ',' | Should Be 'README.md,thirdparty/lib/real/a.c'
+        @($c.Foreign | Sort-Object) -join ',' | Should Be 'README.md,thirdparty/lib/link/a.c (copied file differs from its link target),thirdparty/lib/real/a.c'
     }
 }

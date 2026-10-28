@@ -1,36 +1,10 @@
 . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
 
 # Install and Update against real git repositories in TestDrive, with faked tools and a
-# faked build (it only creates the exe). Each Describe gets its own DOA4 folder.
+# faked build (it only creates the exe). Each Describe gets its own DOA4 folder
+# (New-TInstalled, TestHelpers.ps1).
 
-function New-TInstalled {
-    param([string]$Base, [switch]$WithSetupDialog)
-    Enable-TFileProtocol
-    $o = New-TOrigins -Base $Base -WithSetupDialog:$WithSetupDialog
-    $cfg = New-TestConfig
-    $cfg.GameRepoUrl = $o.Game; $cfg.GameRef = 'main'
-    $sdkHead = @(Invoke-TGit $o.Sdk @('rev-parse', 'HEAD'))[0]
-    # The SDK pinned to a commit, as in the default config (e8ce24f).
-    $cfg.SdkRepoUrl = $o.Sdk; $cfg.SdkRef = $sdkHead.Substring(0, 7)
-    $tools = New-FakeTools -VsRoot (Join-Path $Base 'vs')
-    $build = New-FakeCmd -Do {
-        param($envVars)
-        $exeDir = Join-Path $envVars.DOA4_GAME 'out\build\win-amd64-release'
-        [void](New-Item -ItemType Directory -Force -Path $exeDir)
-        [IO.File]::WriteAllText((Join-Path $exeDir 'dead_or_alive_4.exe'), 'fake exe')
-    }
-    $root = Join-Path $Base ('DOA4 ' + [char]0x00E9 + [char]0x65E5)
-    $shortcuts = Join-Path $Base 'shortcuts'
-    [void](New-Item -ItemType Directory -Force -Path $shortcuts)
-    $ctx = New-DOA4Context -Root $root -Config $cfg -Cmd (New-FakeTable $tools -Cmd $build -RealGit) -ShortcutFolder $shortcuts
-    $r = Invoke-DOA4Install -Ctx $ctx
-    [pscustomobject]@{ Origins = $o; Config = $cfg; Tools = $tools; Build = $build; Root = $root; Ctx = $ctx; Install = $r; Shortcuts = $shortcuts }
-}
-
-function New-TUpdateCtx {
-    param($T)
-    New-DOA4Context -Root $T.Root -Config $T.Config -Cmd (New-FakeTable $T.Tools -Cmd $T.Build -RealGit) -Action 'update'
-}
+function New-TUpdateCtx { param($T) New-TCtx $T 'update' }
 
 Describe 'Install end to end (real git, faked tools and build)' {
     $t = New-TInstalled -Base (Join-Path $TestDrive 'i')

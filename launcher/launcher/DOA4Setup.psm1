@@ -519,18 +519,25 @@ function Get-DOA4StubChanges {
             }
             continue
         }
+        # A file link replaced by a copy is the launcher's own only while the copy's bytes
+        # equal the link target's; a hand edit to it is a foreign change.
         if ($e.Type -eq '1' -and ($e.XY -eq '.M' -or $e.XY -eq '.T') -and $e.ModeHead -eq '120000') {
-            $stubs.Add([pscustomobject]@{ Repo = $RepoPath; Path = $e.Path; Shown = $shown; Folder = $false })
+            $copy = Join-Path $RepoPath ($e.Path.Replace('/', '\'))
+            $target = Get-DOA4LinkTarget -Cmd $Cmd -RepoPath $RepoPath -RelPath $e.Path
+            if ($target -and (Test-Path -LiteralPath $copy -PathType Leaf) -and (Test-Path -LiteralPath $target -PathType Leaf) -and
+                (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) {
+                $stubs.Add([pscustomobject]@{ Repo = $RepoPath; Path = $e.Path; Shown = $shown; Folder = $false })
+                continue
+            }
+            $foreign.Add("$shown (copied file differs from its link target)")
             continue
         }
         # A directory link replaced by a copied folder shows as deleted. It is the launcher's
         # own copy only while the folder still equals the link's target, file for file.
         if ($e.Type -eq '1' -and $e.XY -eq '.D' -and $e.ModeHead -eq '120000') {
             $copy = Join-Path $RepoPath ($e.Path.Replace('/', '\'))
-            $link = Invoke-DOA4Git -Cmd $Cmd -Arguments @('-C', $RepoPath, 'cat-file', '-p', "HEAD:$($e.Path)")
-            $linkText = (@($link.Output) -join "`n").Trim()
-            if ($link.ExitCode -eq 0 -and $linkText -and (Test-Path -LiteralPath $copy -PathType Container)) {
-                $target = [IO.Path]::GetFullPath([IO.Path]::Combine([IO.Path]::GetDirectoryName($copy), $linkText.Replace('/', '\')))
+            $target = Get-DOA4LinkTarget -Cmd $Cmd -RepoPath $RepoPath -RelPath $e.Path
+            if ($target -and (Test-Path -LiteralPath $copy -PathType Container)) {
                 if (Test-DOA4SameFolder $copy $target) {
                     $stubs.Add([pscustomobject]@{ Repo = $RepoPath; Path = $e.Path; Shown = $shown; Folder = $true; FullPath = $copy })
                     continue
@@ -542,6 +549,21 @@ function Get-DOA4StubChanges {
         $foreign.Add($shown)
     }
     [pscustomobject]@{ Stubs = $stubs.ToArray(); Foreign = $foreign.ToArray(); Moved = $moved.ToArray() }
+}
+
+# The full path a git symlink (mode 120000 in HEAD) points at, from the link text in HEAD;
+# $null when it cannot be read.
+function Get-DOA4LinkTarget {
+    param([hashtable]$Cmd, [string]$RepoPath, [string]$RelPath)
+    $link = Invoke-DOA4Git -Cmd $Cmd -Arguments @('-C', $RepoPath, 'cat-file', '-p', "HEAD:$RelPath")
+    $linkText = (@($link.Output) -join "`n").Trim()
+    if ($link.ExitCode -ne 0 -or -not $linkText) { return $null }
+    $at = Join-Path $RepoPath ($RelPath.Replace('/', '\'))
+    try {
+        return [IO.Path]::GetFullPath([IO.Path]::Combine([IO.Path]::GetDirectoryName($at), $linkText.Replace('/', '\')))
+    } catch {
+        return $null
+    }
 }
 
 function Test-DOA4SameFolder {
@@ -641,7 +663,8 @@ function Add-DOA4CMakeIncludeFix {
     if ($f.Text.Contains($script:CMakePresentNeedle)) { return 'present' }
     $at = Get-DOA4CMakeAnchorEnd $f.Text
     $new = $f.Text.Insert($at, (Get-DOA4CMakeFixText (Get-DOA4NewLine $f.Text)))
-    [IO.File]::WriteAllBytes($Path, (ConvertTo-DOA4FileBytes $new $f.Bom))
+    # Swapped in whole: a killed launcher leaves the old file or the new one, never half.
+    Write-DOA4FileAtomic -Path $Path -Bytes (ConvertTo-DOA4FileBytes $new $f.Bom)
     return 'added'
 }
 
@@ -688,7 +711,7 @@ function Remove-DOA4CMakeIncludeFix {
     $b = (@($h2.Output) | Select-Object -First 1)
     if ($h1.ExitCode -ne 0 -or $h2.ExitCode -ne 0 -or -not $a -or $a -ne $b) { return 'refused' }
     if ($CheckOnly) { return 'removable' }
-    [IO.File]::WriteAllBytes($path, $bytes)
+    Write-DOA4FileAtomic -Path $path -Bytes $bytes
     return 'removed'
 }
 
