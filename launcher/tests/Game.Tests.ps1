@@ -46,11 +46,16 @@ Describe 'Test-DOA4GameFolder' {
         (Test-DOA4PathFitsCodePage -Path ('C:\' + [char]0x0101) -CodePage 1252) | Should Be $false
         (Test-DOA4PathFitsCodePage -Path ('C:\' + [char]0x65E5) -CodePage 65001) | Should Be $true
     }
-    $realXex = 'C:\Users\fsop1\doa4\xex\DOA4'
-    if (Test-Path -LiteralPath (Join-Path $realXex 'default.xex')) {
-        It 'accepts the real extracted game on this PC (read only)' {
+    # Opt-in: set DOA4_TEST_GAME_DIR to your extracted game folder (for example
+    # C:\Games\DOA4, the folder holding default.xex) to run the real-folder checks.
+    $realXex = $env:DOA4_TEST_GAME_DIR
+    if ($realXex) {
+        It 'accepts the real extracted game in DOA4_TEST_GAME_DIR (read only)' {
+            Test-Path -LiteralPath (Join-Path $realXex 'default.xex') | Should Be $true
             (Test-DOA4GameFolder -Path $realXex).Verdict | Should Be 'Ok'
         }
+    } else {
+        It 'accepts the real extracted game (set DOA4_TEST_GAME_DIR to run)' -Skip { }
     }
 }
 
@@ -165,8 +170,11 @@ Describe 'Play and Change game files' {
         { Set-DOA4GameFiles -Ctx $ctx -Folder $xexDir } | Should Throw 'not the supported version'
         Test-Path -LiteralPath $ctx.SettingsPath | Should Be $false
     }
-    $realXex = 'C:\Users\fsop1\doa4\xex\DOA4'
-    if (Test-Path -LiteralPath (Join-Path $realXex 'default.xex')) {
+    # Opt-in, as above: DOA4_TEST_GAME_DIR is a full path with backslashes, such as C:\Games\DOA4.
+    $realXex = $env:DOA4_TEST_GAME_DIR
+    if (-not $realXex) {
+        It 'Change game files (real game folder; set DOA4_TEST_GAME_DIR to run)' -Skip { }
+    } else {
         It 'Change game files (real game folder, read only): upstream -> settings.json' {
             $ctx = New-TGameCtx 'c2'
             Set-DOA4GameFiles -Ctx $ctx -Folder $realXex | Should Be 'settings'
@@ -177,7 +185,10 @@ Describe 'Play and Change game files' {
             $ctx = New-TGameCtx 'c3' -WithSetup
             Write-TFile $ctx.TomlPath "fullscreen = true`n"
             Set-DOA4GameFiles -Ctx $ctx -Folder $realXex | Should Be 'toml'
-            (Read-TToml $ctx.TomlPath).doa4_game_files | Should BeExactly 'C:/Users/fsop1/doa4/xex/DOA4'
+            # The toml holds the same folder in forward-slash form (no backslash survives).
+            $saved = (Read-TToml $ctx.TomlPath).doa4_game_files
+            $saved | Should BeExactly ($realXex.Replace('\', '/'))
+            $saved.Contains('\') | Should Be $false
             Test-Path -LiteralPath $ctx.SettingsPath | Should Be $false
         }
     }

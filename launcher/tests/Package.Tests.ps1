@@ -16,7 +16,10 @@ Describe 'Launcher scripts parse' {
         foreach ($k in (New-TestConfig).Keys) { $c.ContainsKey($k) | Should Be $true }
         $c.GameRepoUrl | Should Be 'https://github.com/parkerallan/doa4-recomp'
         $c.GameRef | Should Be 'main'
-        $c.SdkRef | Should Be 'e8ce24f'
+        # The port's code calls SDK changes that upstream e8ce24f does not have, so the default
+        # SDK is the fork branch that carries them.
+        $c.SdkRepoUrl | Should Be 'https://github.com/Dwreckgg/rexglue-sdk'
+        $c.SdkRef | Should Be 'doa4-recomp'
     }
 }
 

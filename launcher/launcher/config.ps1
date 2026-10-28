@@ -3,13 +3,16 @@
 # URLs and refs below. A ref is a branch name, or a commit id (7 to 40 hex digits), which is
 # checked out as a fixed version and never moves on Update.
 @{
-    # The game port. Default: upstream, its default branch (confirmed 2026-10-28).
+    # The game port: upstream, its default branch. Until the launcher pull request is merged,
+    # testers set GameRef = 'launcher' (the branch that carries the launcher and its features).
     GameRepoUrl    = 'https://github.com/parkerallan/doa4-recomp'
     GameRef        = 'main'
 
-    # The ReXGlue SDK. e8ce24f is the SDK version the port's code was generated with.
-    SdkRepoUrl     = 'https://github.com/rexglue/rexglue-sdk'
-    SdkRef         = 'e8ce24f'
+    # The ReXGlue SDK: branch doa4-recomp of this fork carries the SDK changes the port needs
+    # (frame pacing, audio fixes, controller remap, a swap counter), based on rexglue-sdk e8ce24f,
+    # the SDK version the port's code was generated with.
+    SdkRepoUrl     = 'https://github.com/Dwreckgg/rexglue-sdk'
+    SdkRef         = 'doa4-recomp'
 
     # Tools, installed with winget after one confirmation when missing.
     WingetGitId    = 'Git.Git'

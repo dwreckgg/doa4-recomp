@@ -6,11 +6,14 @@ into C++ (`generated/`); the SDK supplies the Xbox 360 runtime (kernel, GPU, aud
 repository contains **no game data**: you build it, then run it against files extracted from your
 own copy of the game.
 
-This checkout is [parkerallan/doa4-recomp](https://github.com/parkerallan/doa4-recomp) plus the local
-branch `perf-pacing` (frame pacing, Esc menu with Video / Controls / Photo / Extras / Game tabs,
-graphics options, full-quality photos, a first-run setup that finds or extracts the game files). It builds against a local `rexglue-sdk` branch, `doa4-perf`. Neither
-branch has been pushed anywhere; a fresh clone from GitHub gives the upstream versions without them
-(see [Building from a fresh GitHub clone](#building-from-a-fresh-github-clone)).
+This port adds, on top of the original recomp: frame pacing fixes, an Esc menu with Video /
+Controls / Photo / Extras / Game tabs, graphics options (anti-aliasing, anisotropic filtering,
+render scale), photos (F12 and full-quality copies of in-game snapshots), unlockables and tweaks,
+a diagnostics overlay (F6), a first-run setup that finds or extracts the game files, and a
+one-click launcher. It builds against the ReXGlue SDK branch
+[`doa4-recomp` of Dwreckgg/rexglue-sdk](https://github.com/Dwreckgg/rexglue-sdk/tree/doa4-recomp),
+which carries the SDK changes the port needs (frame pacing, audio fixes, controller remap, a swap
+counter) on top of rexglue-sdk `e8ce24f`, the SDK version the port's code was generated with.
 
 ## Quick start: the one-click launcher
 
@@ -27,8 +30,8 @@ desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folde
      workload, lists any that are missing with their size, and installs them with winget after
      one confirmation (Visual Studio shows its own installer and asks for administrator rights).
    - **Code:** it downloads the game port and the ReXGlue SDK (about 2 GB the first time).
-   - **Build:** it applies the two Windows fixes from step 4 and step 6 below and builds (a few
-     minutes on a recent PC). Progress and every step's status show in the window.
+   - **Build:** it applies the Windows symlink fix from step 4 below and builds (a few minutes on
+     a recent PC). Progress and every step's status show in the window.
    - **Shortcut:** a "Dead or Alive 4" shortcut on the desktop opens the launcher.
 3. Press **Play**. On the first start the game asks for your disc image or extracted folder
    ([step 5](#5-the-game-files)).
@@ -38,9 +41,11 @@ desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folde
 ![The launcher before Install](docs/images/launcher.png)
 
 - `setup.bat -DryRun` shows what Install would install and do, without doing it.
-- Which sources it builds is set in `launcher\config.ps1`: upstream `parkerallan/doa4-recomp`
-  (`main`) with the SDK at `e8ce24f` by default. To build another fork or branch, change
-  `GameRepoUrl` / `GameRef` (and `SdkRepoUrl` / `SdkRef`) and install into a new `DOA4` folder.
+- Which sources it builds is set in `launcher\config.ps1`: `parkerallan/doa4-recomp` (`main`)
+  with the SDK from `Dwreckgg/rexglue-sdk` (branch `doa4-recomp`) by default. To build another
+  fork or branch, change `GameRepoUrl` / `GameRef` (and `SdkRepoUrl` / `SdkRef`) and install into
+  a new `DOA4` folder. Until the pull request that adds the launcher is merged into `main`, set
+  `GameRef = 'launcher'` to build this branch.
 - It never pushes, stashes or overwrites your changes: Update stops and lists any file you changed
   by hand in its checkouts (other than its own two fixes).
 
@@ -112,19 +117,19 @@ doa4\
 mkdir C:\doa4
 cd /d C:\doa4
 git clone https://github.com/parkerallan/doa4-recomp doa4-recomp
-git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
+git clone --branch doa4-recomp https://github.com/Dwreckgg/rexglue-sdk rexglue-sdk
 cd rexglue-sdk
-git checkout e8ce24f
 git submodule update --init --recursive
 cd ..
 ```
 
-`e8ce24f` is the SDK commit that generated this port's code (v0.8.x; the manifest names
-`0.8.1.4-dev.ge8ce24f`). CMake still prints a harmless "no v* tag reachable from HEAD" warning on a
-fresh clone (fetching the tags does not silence it).
+(Until the pull request that adds these features is merged into `main`, clone the port with
+`git clone --branch launcher https://github.com/parkerallan/doa4-recomp doa4-recomp`.)
 
-On this PC the working branches are `perf-pacing` (this repository) and `doa4-perf` (the SDK):
-`git checkout perf-pacing` and `git -C ..\rexglue-sdk checkout doa4-perf`.
+The SDK branch `doa4-recomp` is rexglue-sdk `e8ce24f`, the SDK commit that generated this port's
+code (v0.8.x; the manifest names `0.8.1.4-dev.ge8ce24f`), plus the SDK changes this port calls; the
+upstream SDK alone does not build it. CMake prints a harmless "no v* tag reachable from HEAD"
+warning on a fresh clone (fetching the tags does not silence it).
 
 ### Fix the SDK's symlinks (Windows)
 
@@ -275,7 +280,7 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 |---|---|
 | Compile errors in `thirdparty/libmspack/...` or `thirdparty/o1heap/...` | Symlink stubs: run `tools/fix_git_symlinks.py` (step 4). |
 | Errors about SSSE3 / AVX intrinsics (`_mm_...` functions) | Configure was run without the `-march=x86-64-v3` flags. Delete `out\build\win-amd64-release` and configure again. |
-| `imgui.h` or `rex/version.h` not found | The two include directories at the end of the `CMakeLists.txt` target setup are missing: they are local fixes in commit `6b95afc` on `perf-pacing`. |
+| `imgui.h` or `rex/version.h` not found | The two include directories after `rexglue_setup_target(dead_or_alive_4)` in `CMakeLists.txt` are missing (an older upstream checkout): see [Building from a fresh GitHub clone](#building-from-a-fresh-github-clone). |
 | `clang` not found / CMake picks the wrong compiler | LLVM's `bin` folder is not first on `PATH` in that window. |
 | CMake warning `no v* tag reachable from HEAD` | Harmless; the build is not affected. |
 | `no XDVDFS volume found` from the extractor | The file is not an Xbox / Xbox 360 game image (or is damaged). |
@@ -286,9 +291,21 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 
 ## Building from a fresh GitHub clone
 
-The upstream repositories are at `parkerallan/doa4-recomp` `1d38c03` and `rexglue/rexglue-sdk`
-`e8ce24f`. The steps above work for them too, with one addition: upstream lacks the two include-
-directory fixes, so add these lines to `CMakeLists.txt` after `rexglue_setup_target(dead_or_alive_4)`:
+A fresh clone of this branch builds with steps 4 and 6 exactly as written: clone the port and the
+SDK branch `doa4-recomp`, update the SDK's submodules, run the symlink fix, configure with
+`REXSDK_DIR` and the `-march=x86-64-v3` flags, and build. Nothing has to be edited by hand.
+
+Two things a fresh clone needs that are easy to miss:
+
+- **The SDK branch, not upstream rexglue-sdk.** The port calls SDK additions (the swap counter,
+  controller remap, raw pad state, input blocking for the menu) that upstream `e8ce24f` does not
+  have, so it does not build against upstream (for example `rex/input/pad_remap.h` is not found).
+- **The symlink fix** (step 4) on Windows without Developer Mode symlinks; without it the SDK's
+  `libmspack` / `o1heap` sources fail to compile.
+
+`CMakeLists.txt` on this branch already has the two include directories the Windows build needs
+after `rexglue_setup_target(dead_or_alive_4)` (older upstream checkouts lack them; the launcher adds
+them to such a checkout itself):
 
 ```cmake
 if(TARGET imgui)
@@ -299,4 +316,6 @@ if(REXSDK_DIR)
 endif()
 ```
 
-The upstream build has none of the `perf-pacing` features (Esc menu, pacing fixes, photos).
+An upstream checkout from before this branch (`parkerallan/doa4-recomp` `1d38c03`) builds the same
+way against rexglue-sdk `e8ce24f`, but has none of the features listed at the top (Esc menu, pacing
+fixes, photos, setup screen, launcher).

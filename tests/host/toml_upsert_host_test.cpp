@@ -133,7 +133,7 @@ static void TestGameFilesPathRoundTrip() {
   std::filesystem::create_directories(dir);
   auto path = dir / "dead_or_alive_4.toml";
   const std::filesystem::path folders[] = {
-      std::filesystem::path(L"C:\\Users\\fsop1\\doa4\\xex\\DOA4"),
+      std::filesystem::path(L"C:\\Games\\DOA4"),
       std::filesystem::path(u8"D:\\\u30b2\u30fc\u30e0\\DOA4 \"copy\""),
   };
   for (const auto& folder : folders) {
@@ -163,7 +163,7 @@ static void TestGameFilesPathRoundTrip() {
 // must parse back to the same folder.
 static void TestGameFilesSurvivesTheSdkWriter() {
   const std::filesystem::path folders[] = {
-      std::filesystem::path(L"C:\\Users\\fsop1\\doa4\\xex\\DOA4"),
+      std::filesystem::path(L"C:\\Games\\DOA4"),
       std::filesystem::path(u8"D:\\\u30b2\u30fc\u30e0\\DOA4"),
   };
   for (const auto& folder : folders) {
