@@ -106,6 +106,11 @@ function Invoke-DOA4Process {
         foreach ($k in $Environment.Keys) { $psi.EnvironmentVariables[[string]$k] = [string]$Environment[$k] }
     }
     $p = [System.Diagnostics.Process]::Start($psi)
+    # Into the launcher's job: when the launcher dies (window closed, process killed), git,
+    # cmake, ninja and winget die with it instead of running on unseen. A grandchild the
+    # program starts in the few instructions before this call would escape; cmd, git and
+    # winget start theirs later than that.
+    [void](Add-DOA4ChildToJob $p)
     try {
         $p.StandardInput.Close()
         $lines = New-Object System.Collections.Generic.List[string]
@@ -132,6 +137,83 @@ function Invoke-DOA4Process {
     } finally {
         $p.Dispose()
     }
+}
+
+# One job object per launcher process, with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: the job's
+# handle closes when the launcher process ends, however it ends, and Windows then ends every
+# process in the job. Only the launcher's tools are put in it; the game is not (Play starts
+# it through the shell, and the launcher process itself is not in the job).
+function Add-DOA4ChildToJob {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
+    if (-not ('DOA4Launcher.ChildJob' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace DOA4Launcher {
+    public static class ChildJob {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BasicLimits {
+            public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit;
+            public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        struct IoCounters { public ulong A, B, C, D, E, F; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ExtendedLimits {
+            public BasicLimits Basic; public IoCounters Io; public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        const int ExtendedLimitInformation = 9;
+        const uint KillOnJobClose = 0x2000;
+        static IntPtr job = IntPtr.Zero;   // never closed: it closes when this process ends
+        static readonly object gate = new object();
+        public static bool Assign(IntPtr process) {
+            lock (gate) {
+                if (job == IntPtr.Zero) {
+                    IntPtr j = CreateJobObject(IntPtr.Zero, null);
+                    if (j == IntPtr.Zero) return false;
+                    ExtendedLimits info = new ExtendedLimits();
+                    info.Basic.LimitFlags = KillOnJobClose;
+                    int length = Marshal.SizeOf(typeof(ExtendedLimits));
+                    IntPtr buffer = Marshal.AllocHGlobal(length);
+                    try {
+                        Marshal.StructureToPtr(info, buffer, false);
+                        if (!SetInformationJobObject(j, ExtendedLimitInformation, buffer, (uint)length)) return false;
+                    } finally { Marshal.FreeHGlobal(buffer); }
+                    job = j;
+                }
+                return AssignProcessToJobObject(job, process);
+            }
+        }
+    }
+}
+'@
+    }
+    try { return [DOA4Launcher.ChildJob]::Assign($Process.Handle) } catch { return $false }
+}
+
+# One launcher per DOA4 folder: a named mutex per root (full path, case-insensitive). Returns
+# the held mutex, or $null when another launcher holds it. The caller keeps the object for
+# as long as it runs; Windows releases it when the process ends.
+function Enter-DOA4RootLock {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $sha = [Security.Cryptography.SHA1]::Create()
+    try {
+        $hex = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes((ConvertTo-DOA4PathKey $Root))) | ForEach-Object { $_.ToString('x2') })
+    } finally { $sha.Dispose() }
+    $m = New-Object System.Threading.Mutex($false, "Local\DOA4Launcher-$hex")
+    $got = $false
+    try { $got = $m.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $got = $true }
+    if ($got) { return $m }
+    $m.Dispose()
+    return $null
 }
 
 function Get-DOA4GitPath {

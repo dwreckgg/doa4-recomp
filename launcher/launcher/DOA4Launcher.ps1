@@ -31,6 +31,20 @@ if ($DryRun -and -not $Action) { $Action = 'DryRun' }
 # With -File, "-AssumeMissing git,llvm" arrives as one string.
 $AssumeMissing = @($AssumeMissing | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
+# One launcher per DOA4 folder (the window and every action that changes something; the
+# read-only DryRun and Status need no lock). Held until this process ends.
+$script:rootLock = $null
+if ($Action -ne 'DryRun' -and $Action -ne 'Status') {
+    $script:rootLock = Enter-DOA4RootLock -Root $root
+    if (-not $script:rootLock) {
+        $busy = "The DOA4 launcher is already running for this folder ($root). Use that window, or wait until it has finished."
+        if ($Action) { [Console]::Out.WriteLine($busy); exit 1 }
+        Add-Type -AssemblyName System.Windows.Forms
+        [void][System.Windows.Forms.MessageBox]::Show($busy, 'Dead or Alive 4', 'OK', 'Information')
+        exit 1
+    }
+}
+
 # ------------------------------------------------------------------------------------------
 # Non-interactive mode
 # ------------------------------------------------------------------------------------------
