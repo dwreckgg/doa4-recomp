@@ -184,8 +184,10 @@ cd /d "%~dp0"
 start "" dead_or_alive_4.exe --game_data_root="%GAME%" --user_data_root="%USERDATA%"
 ```
 
-Without `--user_data_root`, saves go to `Documents\dead_or_alive_4`. Keep it outside OneDrive if you
-can (OneDrive can lock files the game is writing).
+Saves and the shader cache go to `--user_data_root` if given, else to the folder in
+`doa4_user_data` in `dead_or_alive_4.toml` (for example `doa4_user_data = "C:/doa4/userdata"`, with
+forward slashes), else to `Documents\dead_or_alive_4`. Keep it outside OneDrive if you can (OneDrive
+can lock files the game is writing). The Esc menu's Game tab shows the folder in use.
 
 - Settings live in `dead_or_alive_4.toml` next to the exe; the **Esc** menu edits them.
 - **F12** saves a photo of the screen (format and folder in the Esc menu's Photo tab; default
