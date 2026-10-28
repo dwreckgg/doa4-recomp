@@ -23,6 +23,7 @@ set(DEADORALIVE4_SOURCES
     src/doa4_backup.cpp
     src/doa4_extras.cpp
     src/doa4_cvars.cpp
+    src/doa4_graphics.cpp
 )
 
 if(WIN32)
