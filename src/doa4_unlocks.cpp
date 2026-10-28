@@ -90,6 +90,12 @@ std::optional<uint32_t> FindProfile(const GuestBytes& guest) {
   const uint32_t slot = guest.ReadBe32(kProfileSlot);
   if (slot > 3) return std::nullopt;
   if (profile != kRecordBase + slot * kRecordStride + kRecordToProfile) return std::nullopt;
+  // The game fills the record with defaults at boot (costume counts 2) and
+  // reads the save over it only after Start; the name is empty until then.
+  const uint32_t record = profile - kRecordToProfile;
+  if (guest.Read(record + kRecordName) == 0 && guest.Read(record + kRecordName + 1) == 0) {
+    return std::nullopt;
+  }
   for (int i = 0; i < kCharacterCount; ++i) {
     if (CharId(guest, i) >= kCharIdCount) return std::nullopt;
     const uint8_t count = ProfileByte(guest, profile, kCostumeCount, i);

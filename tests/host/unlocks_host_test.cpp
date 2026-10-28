@@ -57,6 +57,9 @@ static void Setup(FakeGuest& g, const std::array<uint8_t, N>& profile, uint32_t 
   // The profile bytes go where the pointer points, so only the pointer checks
   // can reject a bad pointer.
   for (size_t i = 0; i < N; ++i) g.bytes[pointer + kFixtureStart + uint32_t(i)] = profile[i];
+  // The profile name, as in a loaded save: "User" in UTF-16BE at record+8.
+  const char* name = "User";
+  for (uint32_t i = 0; name[i]; ++i) g.bytes[pointer - kRecordToProfile + kRecordName + 2 * i + 1] = uint8_t(name[i]);
   g.writes = 0;
 }
 
@@ -112,6 +115,16 @@ static void TestFindProfile() {
   Setup(g8, fx::kFreshProfile);
   g8.bytes[kP + kCostumeCount + kSpartanIndex] = 1;
   CHECK(!FindProfile(g8.guest));
+  // The game's default record before the save is read (seen at runtime from
+  // 1 s after launch until Start is pressed): fresh costume counts and
+  // character flags, but no name. Not a loaded profile.
+  FakeGuest g10;
+  Setup(g10, fx::kFreshProfile);
+  for (uint32_t i = 0; i < 32; ++i) g10.bytes[kP - kRecordToProfile + kRecordName + i] = 0;
+  CHECK(!FindProfile(g10.guest));
+  // A name is enough: one UTF-16 character.
+  g10.bytes[kP - kRecordToProfile + kRecordName + 1] = 'A';
+  CHECK(FindProfile(g10.guest).has_value());
   // The 100% save is a profile.
   FakeGuest g9;
   Setup(g9, fx::kFullProfile);

@@ -20,6 +20,7 @@ inline constexpr uint32_t kProfileSlot = 0x831A4F30;     // be32: record index 0
 inline constexpr uint32_t kRecordBase = 0x831A90D8;
 inline constexpr uint32_t kRecordStride = 0x10900;
 inline constexpr uint32_t kRecordToProfile = 0x7968;     // P = record + this
+inline constexpr uint32_t kRecordName = 8;  // record offset: profile name, UTF-16BE, 16 chars
 inline constexpr uint32_t kProfileIndexToChar = 0x82C5A014;  // u8[23]
 inline constexpr uint32_t kMaxCostumes = 0x82C34888;         // u8[25], by charId
 inline constexpr uint32_t kStoryRoster = 0x82C34400;         // 18 x 40 bytes, byte 0 = charId
@@ -51,9 +52,10 @@ struct UnlockResult {
 };
 
 // P when a loaded profile is in place: P matches the record formula for the
-// slot index, and every costume count is between 2 and its character's maximum
-// (a record the game has not loaded yet is all zero). Otherwise nullopt, and
-// nothing may be written.
+// slot index, the record has a profile name (the game's boot defaults have
+// none until the save is read, after Start), and every costume count is
+// between 2 and its character's maximum. Otherwise nullopt, and nothing may
+// be written.
 std::optional<uint32_t> FindProfile(const GuestBytes& guest);
 
 bool IsUnlocked(const GuestBytes& guest, uint32_t profile, Unlock what);
