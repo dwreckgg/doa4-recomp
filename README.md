@@ -82,12 +82,12 @@ git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
 cd rexglue-sdk
 git checkout e8ce24f
 git submodule update --init --recursive
-git fetch --tags
 cd ..
 ```
 
 `e8ce24f` is the SDK commit that generated this port's code (v0.8.x; the manifest names
-`0.8.1.4-dev.ge8ce24f`). `git fetch --tags` only silences a CMake version warning.
+`0.8.1.4-dev.ge8ce24f`). CMake still prints a harmless "no v* tag reachable from HEAD" warning on a
+fresh clone (fetching the tags does not silence it).
 
 On this PC the working branches are `perf-pacing` (this repository) and `doa4-perf` (the SDK):
 `git checkout perf-pacing` and `git -C ..\rexglue-sdk checkout doa4-perf`.
@@ -117,6 +117,8 @@ shows a setup screen (step 7). Choose your disc image and it checks the version,
 extract (default: a `DOA4` folder beside the image; it shows the space needed and free) and
 extracts with a progress bar; or choose a folder you extracted before. The location is saved, and
 the Esc menu's **Game** tab can change it later.
+
+![The setup screen: choose the disc image or the extracted folder](docs/images/setup-screen.png)
 
 **By hand:** `tools/xdvdfs_extract.py` (a short Python script, no dependencies) does the same
 extraction from a command line, and is what the first build used. It finds the game partition itself
@@ -189,11 +191,22 @@ Saves and the shader cache go to `--user_data_root` if given, else to the folder
 forward slashes), else to `Documents\dead_or_alive_4`. Keep it outside OneDrive if you can (OneDrive
 can lock files the game is writing). The Esc menu's Game tab shows the folder in use.
 
-- Settings live in `dead_or_alive_4.toml` next to the exe; the **Esc** menu edits them.
-- **F12** saves a photo of the screen (format and folder in the Esc menu's Photo tab; default
-  `Pictures\DOA4`). With "Also save a full-quality copy…" ticked, saving a snapshot to the in-game
-  Album also writes a full-quality copy there.
+![The Esc menu's Game tab: the game files folder (with Change... and Open folder) and the saves folder](docs/images/game-tab.png)
+
+- Settings live in `dead_or_alive_4.toml` next to the exe; the **Esc** menu edits them (tabs
+  Video, Controls, Photo, Extras, Game).
 - **F6** shows a diagnostics overlay.
+
+### Photos
+
+- **F12** saves a photo of the game's own frame at the render scale, without any overlay. The Esc
+  menu's Photo tab picks the format (PNG at monitor size by default, or PNG / JPG at full render size)
+  and the folder (default `Pictures\DOA4`; **Open folder** opens it).
+- With "Also save a full-quality copy when you save a snapshot to the in-game Album" ticked, saving a
+  snapshot in the game's own photo mode also writes that photo at full quality to the same folder
+  (the game's Album keeps a small, compressed copy). Only snapshots you save to the Album are copied.
+
+![A snapshot from the game's photo mode, saved as a full-quality copy (shown here reduced)](docs/images/photo-mode.jpg)
 - Logs: `out\build\win-amd64-release\logs\dead_or_alive_4_NNN.log`.
 
 ## 8. Regenerating the recompiled code
@@ -230,7 +243,7 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 | Errors about SSSE3 / AVX intrinsics (`_mm_...` functions) | Configure was run without the `-march=x86-64-v3` flags. Delete `out\build\win-amd64-release` and configure again. |
 | `imgui.h` or `rex/version.h` not found | The two include directories at the end of the `CMakeLists.txt` target setup are missing: they are local fixes in commit `6b95afc` on `perf-pacing`. |
 | `clang` not found / CMake picks the wrong compiler | LLVM's `bin` folder is not first on `PATH` in that window. |
-| CMake warning `no v* tag reachable from HEAD` | Harmless; `git fetch --tags` in `rexglue-sdk` removes it. |
+| CMake warning `no v* tag reachable from HEAD` | Harmless; the build is not affected. |
 | `no XDVDFS volume found` from the extractor | The file is not an Xbox / Xbox 360 game image (or is damaged). |
 | The game does not start | Check the newest log in `logs\` (lines tagged `[doa4][SETUP]` say which game folder was used and why). |
 | The setup screen keeps coming back | The saved location could not be written to `dead_or_alive_4.toml` (the log says why), or the folder has moved. |
