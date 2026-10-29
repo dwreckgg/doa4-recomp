@@ -10,7 +10,7 @@ timeout.
 Options: --exe, --game, --userdata (the pristine source), --runs (where run folders go),
 --cache (shared shader cache), --sweep N|all, --dump f,f, --shot-every N,
 --env KEY=VALUE (repeatable: extra environment, e.g. DOA4_NP_FIX=none), --timeout seconds.
-Prints the run folder and the session log's last lines.
+Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
 """
 import argparse
 import os
@@ -21,6 +21,18 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+
+# The quit reasons that end a good run (np_session.cpp Quit(): "quit at frame N: <reason>").
+OK_REASONS = {"record": ("quit frame", "np_ctl.on"), "replay": ("end of the recording",)}
+
+
+def judge(mode, code, timed_out, log_lines):
+    """(status, quit line): ok only if the game exited 0 by itself after the session quit for a
+    reason that ends a good run of this mode."""
+    quit_line = next((l for l in reversed(log_lines) if l.startswith("quit at frame ")), None)
+    reason = quit_line.split(": ", 1)[1] if quit_line and ": " in quit_line else None
+    ok = not timed_out and code == 0 and reason in OK_REASONS[mode]
+    return ("ok" if ok else "failed"), (quit_line or "none")
 
 
 def main():
@@ -91,19 +103,27 @@ def main():
     with open(os.path.join(run, "pid.txt"), "w") as f:
         f.write(str(p.pid))
     print(f"run {run} pid {p.pid}", flush=True)
+    timed_out = False
     try:
         code = p.wait(timeout=a.timeout)
     except subprocess.TimeoutExpired:
         print(f"timeout after {a.timeout} s: ending pid {p.pid}", flush=True)
+        timed_out = True
         p.kill()
         code = p.wait()
     print(f"exit {code} after {time.time() - t0:.0f} s", flush=True)
     log = os.path.join(out, "np_log.txt")
+    lines = []
     if os.path.exists(log):
         lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
         print("\n".join(lines[-8:]))
     else:
         print("no np_log.txt: the session did not start")
+    status, quit_line = judge(a.mode, code, timed_out, lines)
+    with open(os.path.join(out, "run_result.txt"), "w", encoding="utf-8") as f:
+        f.write(f"status {status}\nexit {code}\ntimeout {int(timed_out)}\nquit {quit_line}\n")
+    print(f"status {status}", flush=True)
+    sys.exit(0 if status == "ok" else 1)
 
 
 if __name__ == "__main__":

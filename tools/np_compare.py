@@ -1,11 +1,14 @@
 """Compares two DOA4 netplay phase-0 runs: digest (per-frame region hashes) and sweep (rolling
 64 KB .data block hashes). Formats: src/net/np_core.h.
 
-  py -3 tools/np_compare.py RUN_A RUN_B [--from F] [--blocks N]
+  py -3 tools/np_compare.py RUN_A RUN_B [--from F] [--blocks N] [--allow-unchecked] [--sweep-advisory]
 RUN_A/RUN_B are run output folders (holding digest.d4d and sweep.d4s) or run folders (with
 out/). Prints the frames compared, the first differing frame of every region (and the first
 frame of all), and the sweep blocks that differ with the first frame each was seen to differ.
-Exit status: 0 = every compared frame equal, 1 = a difference, 2 = nothing to compare.
+--allow-unchecked (runs without run_result.txt, e.g. the proof's)
+--sweep-advisory (report sweep differences without failing)
+Exit status: 0 = both runs good, equal lengths, every compared frame equal; 1 = otherwise;
+2 = nothing to compare.
 """
 import argparse
 import os
@@ -51,14 +54,36 @@ def read_sweep(path):
     return (lo, hi, block, per), frames
 
 
+def run_status(d):
+    p = os.path.join(d, "run_result.txt")
+    if not os.path.exists(p):
+        return None
+    for line in open(p, encoding="utf-8"):
+        if line.startswith("status "):
+            return line.split(None, 1)[1].strip()
+    return "unknown"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("a")
     ap.add_argument("b")
     ap.add_argument("--from", dest="start", type=int, default=0, help="first frame to compare")
     ap.add_argument("--blocks", type=int, default=40, help="sweep blocks to list")
+    ap.add_argument("--allow-unchecked", action="store_true")
+    ap.add_argument("--sweep-advisory", action="store_true")
     args = ap.parse_args()
     a, b = out_dir(args.a), out_dir(args.b)
+    result = 0
+    for label, d in (("A", a), ("B", b)):
+        st = run_status(d)
+        if st is None:
+            print(f"run {label}: no run_result.txt" + (" (allowed)" if args.allow_unchecked else ""))
+            if not args.allow_unchecked:
+                result = 1
+        elif st != "ok":
+            print(f"run {label} failed: status {st}")
+            result = 1
     ra, fa = read_digest(os.path.join(a, "digest.d4d"))
     rb, fb = read_digest(os.path.join(b, "digest.d4d"))
     if ra != rb:
@@ -68,6 +93,9 @@ def main():
         print("no common frames")
         sys.exit(2)
     print(f"digest: {len(common)} common frames ({common[0]}..{common[-1]}); run A {len(fa)}, run B {len(fb)}")
+    if len(fa) != len(fb):
+        print(f"digest: run lengths differ (A {len(fa)} frames, B {len(fb)} frames)")
+        result = 1
     first_any = None
     differ = {}
     for f in common:
@@ -85,7 +113,8 @@ def main():
             print(f"  {name:14s} {addr:08X}+{length:<6X} equal on all {len(common)} frames")
     print(f"digest first difference: {'none' if first_any is None else 'frame %d' % first_any}")
 
-    result = 0 if first_any is None else 1
+    if first_any is not None:
+        result = 1
     sa, sb = os.path.join(a, "sweep.d4s"), os.path.join(b, "sweep.d4s")
     if os.path.exists(sa) and os.path.exists(sb):
         ga, wa = read_sweep(sa)
@@ -110,7 +139,10 @@ def main():
             for k, f in sorted(first_block.items(), key=lambda kv: kv[1])[:args.blocks]:
                 print(f"  block {lo + k * block:08X} first differs at frame {f}")
             if first_block:
-                result = 1
+                if args.sweep_advisory:
+                    print("  (sweep differences reported only: --sweep-advisory)")
+                else:
+                    result = 1
     sys.exit(result)
 
 

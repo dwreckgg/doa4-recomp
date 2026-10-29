@@ -312,6 +312,11 @@ void OnFrame(PPCContext& ctx, uint8_t* base) {
   const double t0 = Now(s);
   const uint32_t f = s.frame++;
   if (s.quitting) return;
+  // A replay ends where its recording ends: it hashes exactly the frames the record run hashed.
+  if (s.mode == Mode::kReplay && f >= s.replay.frames.size()) {
+    Quit(s, "end of the recording");
+    return;
+  }
 
   // 1. Hash the state entering frame f.
   const double h0 = Now(s);
@@ -332,10 +337,6 @@ void OnFrame(PPCContext& ctx, uint8_t* base) {
   if ((f % 15) == 0) PollRequests(s, f);
   std::vector<ScriptEvent::Kind> fired;
   if (s.mode == Mode::kReplay) {
-    if (f >= s.replay.frames.size()) {
-      Quit(s, "end of the recording");
-      return;
-    }
     s.staged = s.replay.frames[f];
   } else {
     s.staged = s.queue.Next(f, &fired);
