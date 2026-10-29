@@ -18,7 +18,7 @@
 // Request files in DOA4_NP_DIR, taken (deleted) when read, polled every 15 frames:
 //   np_pad.on   a pad script appended to the input queue (record only)
 //   np_shot.on  a screenshot now
-//   np_ctl.on   "quit" | "dump"
+//   np_ctl.on   "quit" (the run ends after this frame, as a quit frame) | "dump"
 
 #pragma once
 

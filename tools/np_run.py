@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
 # The quit reasons that end a good run (np_session.cpp Quit(): "quit at frame N: <reason>").
-OK_REASONS = {"record": ("quit frame", "np_ctl.on"), "replay": ("end of the recording",)}
+OK_REASONS = {"record": ("quit frame",), "replay": ("end of the recording",)}
 
 
 def judge(mode, code, timed_out, log_lines):

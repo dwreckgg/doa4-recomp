@@ -265,7 +265,10 @@ void PollRequests(State& s, uint32_t f) {
   }
   if (Take("np_shot.on", &text)) Enqueue({Job::kShot, f, {}});
   if (Take("np_ctl.on", &text)) {
-    if (text.rfind("quit", 0) == 0) Quit(s, "np_ctl.on");
+    // Not Quit() here: PollRequests runs after this frame's digest row is written but before its
+    // input is recorded, and Quit() closes the recording. The run ends at step 3 of OnFrame like a
+    // quit frame, so the recording and its digest have the same length and its replay matches.
+    if (text.rfind("quit", 0) == 0) s.quit_frame = std::min(s.quit_frame, f);
     if (text.rfind("dump", 0) == 0) s.dump_frames.insert(s.dump_frames.begin(), f);
   }
 }
