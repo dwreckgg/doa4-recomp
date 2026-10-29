@@ -207,6 +207,8 @@ static void TestRecording() {
   v1[8] = 1;
   v1[28] = 0;
   CHECK(DecodeRecording(v1, &r, &error, &note) && r.meta.empty() && r.frames.size() == 3);
+  v1[28] = 7;  // version 1's word at byte 28 was "reserved": whatever it holds is not a meta length
+  CHECK(DecodeRecording(v1, &r, &error, &note) && r.meta.empty() && r.frames.size() == 3 && note.empty());
 
   // Beyond the brief: wrong versions this excludes. The frame body is measured from the END of the meta
   // (a body measured from byte 32 turns the meta into a "partial frame": note set), the meta length is
