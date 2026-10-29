@@ -331,6 +331,62 @@ def test_judge(root):
           "judge: a replay cut short by a request ('quit frame') fails")
 
 
+REFUSED = "refused: the recording was made with a different sweep 4 vs 8"
+CANNOT = r"cannot replay C:\runs\x\rec.d4r: unsupported recording version"
+REFUSAL_LOG = [r"replay C:\runs\x\rec.d4r: 6995 frames, seed 1", REFUSED]
+LEAKED_LOG = REFUSAL_LOG + ["sweep masks: 5 ranges, 1068 bytes in 4 blocks hashed as zero",
+                            "session on: replay, sweep 8 blocks/frame, quit frame none"]
+GOOD_REPLAY_LOG = [r"replay C:\runs\x\rec.d4r: 6995 frames, seed 1", "session on: replay, sweep 4 blocks/frame, quit frame none",
+                   "quit at frame 6995: end of the recording"]
+
+
+def test_judge_refusal(root):
+    # A session that refuses its recording (np_session.cpp Start: another build, fix set, settings, or a
+    # recording it cannot read) ends the run at once, writes no hash file and logs no "session on" line.
+    # The refusal is the failure reason in run_result ("quit refused: ..."); a refusal the session did not
+    # honour is a different reason, because the status is "failed" either way.
+    judge = load("np_run").judge
+    check(judge("replay", 0, False, REFUSAL_LOG) == ("failed", REFUSED), f"judge: a clean refusal: {judge('replay', 0, False, REFUSAL_LOG)}")
+    check(judge("replay", 0, False, [CANNOT]) == ("failed", CANNOT), "judge: a recording that cannot be read is the reason")
+    for line, log in ((REFUSED, LEAKED_LOG), (CANNOT, [CANNOT, "session on: replay, sweep 4 blocks/frame, quit frame none"])):
+        status, why = judge("replay", 0, False, log)
+        check(status == "failed" and why.startswith("refusal not honoured (a session started after it): "),
+              f"judge: a session on line after '{line}' is not a clean refusal: {why!r}")
+        check(line in why, f"judge: the not-honoured reason still names the refusal: {why!r}")
+    status, why = judge("replay", 0, True, REFUSAL_LOG)
+    check(status == "failed" and why.startswith("refusal not honoured (the run had to be ended after the timeout): "),
+          f"judge: a refusal that hangs to the timeout (the host never quit): {why!r}")
+    status, why = judge("replay", 5, False, REFUSAL_LOG)
+    check(status == "failed" and why.startswith("refusal not honoured (exit 5): "), f"judge: a refusal that exits with an error: {why!r}")
+    # the reason is the refusal line itself, not the last line of the log
+    check(judge("replay", 0, False, REFUSAL_LOG + ["np_pad.on ignored: not recording"]) == ("failed", REFUSED),
+          "judge: a clean refusal followed by an unrelated line still names the refusal")
+    # negative controls: a refusal is recognised at the start of a line only, and a good replay stays good
+    # (its log has a "session on" line, which is only a flaw AFTER a refusal)
+    shot = ["shot 12: refused: no guest output yet"] + GOOD_REPLAY_LOG[1:]
+    check(judge("replay", 0, False, shot) == ("ok", "quit at frame 6995: end of the recording"),
+          f"judge: 'refused:' inside a line is not a refusal: {judge('replay', 0, False, shot)}")
+    check(judge("replay", 0, False, GOOD_REPLAY_LOG) == ("ok", "quit at frame 6995: end of the recording"), "judge: a good replay is still ok")
+    check(judge("replay", 0, False, ["session on: replay, sweep 4 blocks/frame, quit frame none"] + REFUSAL_LOG)[1].startswith("refused: "),
+          "judge: a session on line BEFORE a refusal is not a flaw of the refusal")
+
+
+def test_judge_refusal_digest(root):
+    # a refusal that kept going has written the digest file; judge looks in the run's out folder for it
+    judge = load("np_run").judge
+    out = os.path.join(root, "out")
+    os.makedirs(out)
+    check(judge("replay", 0, False, REFUSAL_LOG, out) == ("failed", REFUSED), "judge: a refusal with an empty out folder is clean")
+    open(os.path.join(out, "digest.d4d"), "wb").close()
+    status, why = judge("replay", 0, False, REFUSAL_LOG, out)
+    check(status == "failed" and why.startswith("refusal not honoured (digest.d4d was written): ") and REFUSED in why,
+          f"judge: digest.d4d beside a refusal: {why!r}")
+    status, why = judge("replay", 0, False, LEAKED_LOG, out)
+    check("a session started after it; digest.d4d was written" in why, f"judge: both flaws are named: {why!r}")
+    check(judge("replay", 0, False, GOOD_REPLAY_LOG, out) == ("ok", "quit at frame 6995: end of the recording"),
+          "judge: digest.d4d beside a good replay is what a good replay leaves")
+
+
 def stand_in_env(**extra):
     return dict(os.environ, FAKE_GAME_PYTHON=sys.executable, **extra)
 
@@ -483,6 +539,35 @@ def test_np_run_exit_status(root):
     code, out = np_run("bad", FAKE_GAME_FAIL="bad")
     check(code == 1, f"np_run, crashed run: exit {code}\n{out}")
     check(result(runs, "bad") == CRASHED, f"np_run, crashed run: result {result(runs, 'bad')!r}")
+
+
+def test_np_run_refusal(root):
+    # np_run end to end with the stand-in: the refusal reaches run_result as the reason, and the out
+    # folder reaches judge (the leaky stand-in's reason names digest.d4d, which only the folder shows)
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+    rec = os.path.join(root, "rec.txt")
+    with open(rec, "w") as f:
+        f.write("12\n")
+
+    def np_run(name, **env):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "replay", name, "--rec", rec,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60"],
+                           capture_output=True, text=True, env=stand_in_env(**env), timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    code, out = np_run("ref", FAKE_GAME_REFUSE="ref")
+    check(code == 1, f"np_run, a refused replay: exit {code}\n{out}")
+    check(result(runs, "ref") == f"status failed\nexit 0\ntimeout 0\nquit {REFUSED}\n",
+          f"np_run, a refused replay: result {result(runs, 'ref')!r}")
+    check(digest_rows(runs, "ref") == -1, "np_run, a refused replay writes no digest")
+    code, out = np_run("leaky", FAKE_GAME_REFUSE_LEAKY="leaky")
+    check(code == 1, f"np_run, a refusal the session ignored: exit {code}\n{out}")
+    check(result(runs, "leaky") == "status failed\nexit 0\ntimeout 0\nquit refusal not honoured (a session started after it; "
+          f"digest.d4d was written): {REFUSED}\n", f"np_run, a refusal the session ignored: result {result(runs, 'leaky')!r}")
+    code, out = np_run("cant", FAKE_GAME_CANNOT="cant")
+    check(code == 1, f"np_run, an unreadable recording: exit {code}\n{out}")
+    check(result(runs, "cant") == f"status failed\nexit 0\ntimeout 0\nquit cannot replay {os.path.abspath(rec)}: "
+          "unsupported recording version\n", f"np_run, an unreadable recording: result {result(runs, 'cant')!r}")
 
 
 def main():

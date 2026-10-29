@@ -11,6 +11,9 @@ Options: --exe, --game, --userdata (the pristine source), --runs (where run fold
 --cache (shared shader cache), --sweep N|all, --dump f,f, --shot-every N,
 --env KEY=VALUE (repeatable: extra environment, e.g. DOA4_NP_FIX=none), --timeout seconds.
 Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
+A replay the session refuses (another build, fix set, game data or settings than the recording's) or cannot read is
+never a good run: run_result.txt then has "status failed" and "quit refused: ..." / "quit cannot replay ...", or
+"quit refusal not honoured (...): ..." when the session ran on after the refusal.
 """
 import argparse
 import os
@@ -26,9 +29,35 @@ REPO = os.path.dirname(HERE)
 OK_REASONS = {"record": ("quit frame",), "replay": ("end of the recording",)}
 
 
-def judge(mode, code, timed_out, log_lines):
+# The log lines with which np_session.cpp Start() refuses to run: a replay whose recording was made by
+# another build, fix set, game data, settings ("refused: ...") or cannot be read ("cannot replay ...").
+# Either ends the run at once, with no session: no "session on" line, no hash file, exit 0.
+REFUSAL_PREFIXES = ("refused: ", "cannot replay ")
+
+
+def judge(mode, code, timed_out, log_lines, out_dir=None):
     """(status, quit line): ok only if the game exited 0 by itself after the session quit for a
-    reason that ends a good run of this mode."""
+    reason that ends a good run of this mode.
+
+    A run whose log holds a refusal is never ok, and its reason (the quit line of run_result.txt) is
+    the refusal itself when the refusal was honoured: the game exited 0 on its own with no session
+    started after it ("session on" line) and, when out_dir is given, no digest.d4d in it. Otherwise the
+    reason is "refusal not honoured (<what>): <the refusal>": the status is "failed" either way, so
+    this is the line that tells a clean refusal from one the session ignored."""
+    at = next((i for i, l in enumerate(log_lines) if l.startswith(REFUSAL_PREFIXES)), None)
+    if at is not None:
+        flaws = []
+        if any(l.startswith("session on") for l in log_lines[at + 1:]):
+            flaws.append("a session started after it")
+        if out_dir and os.path.exists(os.path.join(out_dir, "digest.d4d")):
+            flaws.append("digest.d4d was written")
+        if timed_out:
+            flaws.append("the run had to be ended after the timeout")
+        elif code != 0:
+            flaws.append(f"exit {code}")
+        if flaws:
+            return "failed", f"refusal not honoured ({'; '.join(flaws)}): {log_lines[at]}"
+        return "failed", log_lines[at]
     quit_line = next((l for l in reversed(log_lines) if l.startswith("quit at frame ")), None)
     reason = quit_line.split(": ", 1)[1] if quit_line and ": " in quit_line else None
     ok = not timed_out and code == 0 and reason in OK_REASONS[mode]
@@ -119,7 +148,7 @@ def main():
         print("\n".join(lines[-8:]))
     else:
         print("no np_log.txt: the session did not start")
-    status, quit_line = judge(a.mode, code, timed_out, lines)
+    status, quit_line = judge(a.mode, code, timed_out, lines, out)
     with open(os.path.join(out, "run_result.txt"), "w", encoding="utf-8") as f:
         f.write(f"status {status}\nexit {code}\ntimeout {int(timed_out)}\nquit {quit_line}\n")
     print(f"status {status}", flush=True)

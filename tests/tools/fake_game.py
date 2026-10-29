@@ -19,6 +19,13 @@ Test-only environment (the stand-in's own, not the game's):
                     only (+1 there)
   FAKE_GAME_SWEEP   same form: that run's sweep row of frame 5 differs from every other run's (its
                     first block, 0x82C10000) and otherwise ends cleanly
+  FAKE_GAME_REFUSE  same form, replays: that replay refuses its recording as the real session does
+                    (np_session.cpp Start): the replay line and a "refused:" line, no other file, exit 0
+  FAKE_GAME_REFUSE_LEAKY  same form: the refusal that does not stop the session (the `return` after it
+                    deleted): "refused:" line, then the digest, sweep and counters files, a "session on"
+                    line and no quit line, exit 0
+  FAKE_GAME_CANNOT  same form, replays: that replay cannot read its recording: one "cannot replay" line,
+                    no other file, exit 0 (the host was asked to quit)
 Every run writes the same hashes and the same counters for the same frame, so runs of equal length
 compare equal. Counters: the real file layout (np_core.h) with the real names (np_det.cpp, pinned by
 test_counter_names_match_source); fb_* are 0, pr_* are a function of the frame.
@@ -96,6 +103,19 @@ def main():
     if crash:
         rows = frames // 2
     os.makedirs(out, exist_ok=True)
+    if mode == "replay" and listed(name, "FAKE_GAME_CANNOT"):
+        rec = os.environ["DOA4_NP_REC"]
+        with open(os.path.join(out, "np_log.txt"), "w") as f:
+            f.write(f"cannot replay {rec}: unsupported recording version\n")
+        sys.exit(0)
+    leaky = mode == "replay" and listed(name, "FAKE_GAME_REFUSE_LEAKY")
+    if mode == "replay":
+        refusal = [f"replay {os.environ['DOA4_NP_REC']}: {frames} frames, seed 1",
+                   "refused: the recording was made with a different sweep 4 vs 8"]
+        if listed(name, "FAKE_GAME_REFUSE"):
+            with open(os.path.join(out, "np_log.txt"), "w") as f:
+                f.write("\n".join(refusal) + "\n")
+            sys.exit(0)
     write_digest(os.path.join(out, "digest.d4d"), rows)
     write_sweep(os.path.join(out, "sweep.d4s"), rows, listed(name, "FAKE_GAME_SWEEP"))
     write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
@@ -104,7 +124,10 @@ def main():
     if mode == "record":
         with open(os.path.join(out, "rec.d4r"), "w") as f:
             f.write(f"{frames}\n")
-    if crash:
+    if leaky:
+        log = refusal + [f"session on: replay, sweep {SWEEP_PER} blocks/frame, quit frame none"]
+        code = 0
+    elif crash:
         log.append("stand-in game: crashing")
         code = 3
     else:
