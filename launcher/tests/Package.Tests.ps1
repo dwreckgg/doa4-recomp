@@ -14,8 +14,9 @@ Describe 'Launcher scripts parse' {
         $c = & (Join-Path $script:Src 'launcher\config.ps1')
         $c -is [hashtable] | Should Be $true
         foreach ($k in (New-TestConfig).Keys) { $c.ContainsKey($k) | Should Be $true }
-        $c.GameRepoUrl | Should Be 'https://github.com/parkerallan/doa4-recomp'
-        $c.GameRef | Should Be 'main'
+        # The playtest branch of the fork builds itself (the pull request branch points at upstream).
+        $c.GameRepoUrl | Should Be 'https://github.com/Dwreckgg/doa4-recomp'
+        $c.GameRef | Should Be 'playtest'
         # The port's code calls SDK changes that upstream e8ce24f does not have, so the default
         # SDK is the fork branch that carries them.
         $c.SdkRepoUrl | Should Be 'https://github.com/Dwreckgg/rexglue-sdk'

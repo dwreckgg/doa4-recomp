@@ -3,10 +3,10 @@
 # URLs and refs below. A ref is a branch name, or a commit id (7 to 40 hex digits), which is
 # checked out as a fixed version and never moves on Update.
 @{
-    # The game port: upstream, its default branch. Until the launcher pull request is merged,
-    # testers set GameRef = 'launcher' (the branch that carries the launcher and its features).
-    GameRepoUrl    = 'https://github.com/parkerallan/doa4-recomp'
-    GameRef        = 'main'
+    # The game port: the playtest branch of the Dwreckgg fork, which carries the launcher and its
+    # features while the pull request to parkerallan/doa4-recomp is open.
+    GameRepoUrl    = 'https://github.com/Dwreckgg/doa4-recomp'
+    GameRef        = 'playtest'
 
     # The ReXGlue SDK: branch doa4-recomp of this fork carries the SDK changes the port needs
     # (frame pacing, audio fixes, controller remap, a swap counter), based on rexglue-sdk e8ce24f,

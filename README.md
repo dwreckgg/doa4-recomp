@@ -1,5 +1,13 @@
 # Dead or Alive 4 — PC recomp
 
+> **Playtest build.** This is the `playtest` branch of a fork of
+> [parkerallan/doa4-recomp](https://github.com/parkerallan/doa4-recomp). It carries the launcher and
+> the features of [pull request #2](https://github.com/parkerallan/doa4-recomp/pull/2) while that
+> pull request is open, and its launcher builds this branch. To try it: download this repository
+> (**Code → Download ZIP**), copy `launcher\setup.bat` and the `launcher\launcher` folder into a new
+> folder such as `C:\Games\DOA4`, and follow the [Quick start](#quick-start-the-one-click-launcher)
+> below. You need your own copy of the game ([step 1](#1-the-game-version)).
+
 A native Windows build of **Dead or Alive 4** (Xbox 360), statically recompiled with the
 [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). The game's code is translated ahead of time
 into C++ (`generated/`); the SDK supplies the Xbox 360 runtime (kernel, GPU, audio, input). This
@@ -41,11 +49,10 @@ desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folde
 ![The launcher before Install](docs/images/launcher.png)
 
 - `setup.bat -DryRun` shows what Install would install and do, without doing it.
-- Which sources it builds is set in `launcher\config.ps1`: `parkerallan/doa4-recomp` (`main`)
-  with the SDK from `Dwreckgg/rexglue-sdk` (branch `doa4-recomp`) by default. To build another
-  fork or branch, change `GameRepoUrl` / `GameRef` (and `SdkRepoUrl` / `SdkRef`) and install into
-  a new `DOA4` folder. Until the pull request that adds the launcher is merged into `main`, set
-  `GameRef = 'launcher'` to build this branch.
+- Which sources it builds is set in `launcher\config.ps1`: this fork's `playtest` branch
+  (`Dwreckgg/doa4-recomp`) with the SDK from `Dwreckgg/rexglue-sdk` (branch `doa4-recomp`) by
+  default. To build another fork or branch, change `GameRepoUrl` / `GameRef` (and `SdkRepoUrl` /
+  `SdkRef`) and install into a new `DOA4` folder.
 - It never pushes, stashes or overwrites your changes: Update stops and lists any file you changed
   by hand in its checkouts (other than its own two fixes).
 
@@ -116,15 +123,12 @@ doa4\
 ```bat
 mkdir C:\doa4
 cd /d C:\doa4
-git clone https://github.com/parkerallan/doa4-recomp doa4-recomp
+git clone --branch playtest https://github.com/Dwreckgg/doa4-recomp doa4-recomp
 git clone --branch doa4-recomp https://github.com/Dwreckgg/rexglue-sdk rexglue-sdk
 cd rexglue-sdk
 git submodule update --init --recursive
 cd ..
 ```
-
-(Until the pull request that adds these features is merged into `main`, clone the port with
-`git clone --branch launcher https://github.com/parkerallan/doa4-recomp doa4-recomp`.)
 
 The SDK branch `doa4-recomp` is rexglue-sdk `e8ce24f`, the SDK commit that generated this port's
 code (v0.8.x; the manifest names `0.8.1.4-dev.ge8ce24f`), plus the SDK changes this port calls; the
