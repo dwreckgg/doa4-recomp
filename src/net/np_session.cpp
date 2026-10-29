@@ -102,6 +102,7 @@ struct State {
   int64_t last_frame_qpc = 0;
   double sum_hook_us = 0, max_hook_us = 0, sum_hash_us = 0, max_hash_us = 0, sum_period_us = 0;
   double max_period_us = 0;
+  double sum_det_us = 0, max_det_us = 0;
   uint32_t window = 0;
 
   // writer thread
@@ -237,6 +238,7 @@ void Quit(State& s, const char* why) {
   if (s.rec) std::fclose(s.rec), s.rec = nullptr;
   if (s.digest) std::fclose(s.digest), s.digest = nullptr;
   if (s.sweep) std::fclose(s.sweep), s.sweep = nullptr;
+  det::Stop();
   if (s.host.quit) s.host.quit();
 }
 
@@ -301,7 +303,7 @@ void HashFrame(State& s, uint8_t* base, uint32_t f) {
 
 // The frame hook: runs at the loop head before frame f. The state hashed here
 // is the state entering frame f (everything frame f - 1 did).
-void OnFrame(uint8_t* base) {
+void OnFrame(PPCContext& ctx, uint8_t* base) {
   State& s = S();
   const double t0 = Now(s);
   const uint32_t f = s.frame++;
@@ -338,7 +340,9 @@ void OnFrame(uint8_t* base) {
       std::fwrite(bytes.data(), 1, bytes.size(), s.rec);
     }
   }
-  det::OnFrame(f, base);
+  const double d0 = Now(s);
+  det::OnFrame(f, ctx, base);
+  const double det_us = Now(s) - d0;
 
   // 3. Screenshots and the end of the run.
   bool shot = false;
@@ -357,9 +361,12 @@ void OnFrame(uint8_t* base) {
     return;
   }
 
-  // 4. Timing: hook cost, hash cost, frame period; 600-frame averages.
+  // 4. Timing: hook cost (without the determinism layer's waits), hash cost,
+  // the determinism layer (audio wait), frame period; 600-frame averages.
   const double t1 = Now(s);
-  const double hook = t1 - t0, hash = h1 - h0;
+  const double hook = t1 - t0 - det_us, hash = h1 - h0;
+  s.sum_det_us += det_us;
+  s.max_det_us = std::max(s.max_det_us, det_us);
   s.sum_hook_us += hook;
   s.max_hook_us = std::max(s.max_hook_us, hook);
   s.sum_hash_us += hash;
@@ -371,16 +378,17 @@ void OnFrame(uint8_t* base) {
   }
   s.last_frame_qpc = int64_t(t0);
   if (++s.window == 600) {
-    char line[256];
+    char line[320];
     std::snprintf(line, sizeof(line),
                   "frame %u: hook avg %.1f us max %.1f us, hash avg %.1f us max %.1f us, "
-                  "frame period avg %.3f ms (%.2f fps) max %.2f ms",
+                  "det wait avg %.1f us max %.1f us, frame period avg %.3f ms (%.2f fps) max %.2f ms",
                   f, s.sum_hook_us / 600, s.max_hook_us, s.sum_hash_us / 600, s.max_hash_us,
-                  s.sum_period_us / 600 / 1000, 600e6 / std::max(1.0, s.sum_period_us),
-                  s.max_period_us / 1000);
+                  s.sum_det_us / 600, s.max_det_us, s.sum_period_us / 600 / 1000,
+                  600e6 / std::max(1.0, s.sum_period_us), s.max_period_us / 1000);
     Log(line);
     s.window = 0;
     s.sum_hook_us = s.max_hook_us = s.sum_hash_us = s.max_hash_us = 0;
+    s.sum_det_us = s.max_det_us = 0;
     s.sum_period_us = s.max_period_us = 0;
   }
 }
@@ -484,7 +492,7 @@ void LogLine(const std::string& line) { Log(line); }
 // ---- Hooks ----
 
 REX_HOOK_RAW(sub_824F4498) {
-  if (doa4::np::Active()) doa4::np::OnFrame(base);
+  if (doa4::np::Active()) doa4::np::OnFrame(ctx, base);
   __imp__sub_824F4498(ctx, base);
 }
 
