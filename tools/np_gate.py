@@ -99,9 +99,9 @@ def main():
             for l in lines:
                 if not l.startswith("digest first"):
                     print("   ", l.strip())
-        else:  # an equal pair still shows what the counters found (frames compared, no fallback)
+        else:  # an equal pair still shows what the sweep and the counters compared (frames, blocks, no fallback)
             for l in lines:
-                if l.startswith("counters:"):
+                if l.startswith("sweep:") or l.startswith("counters:"):
                     print("   ", l.strip())
     ok = bad == 0 and not failed
     print(f"gate {'PASSED' if ok else 'FAILED'}: {len(names)} runs ({len(failed)} failed), "

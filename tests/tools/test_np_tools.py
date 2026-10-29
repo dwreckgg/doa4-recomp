@@ -69,20 +69,23 @@ def write_counters(path, frames, names=COUNTERS):
 
 
 def make_run(root, name, nframes=10, digest_change=None, sweep_change=None, status="ok", fallback_at=None,
-             progress_change=None, counter_rows=None, counter_names=COUNTERS):
+             progress_change=None, counter_rows=None, counter_names=COUNTERS, sweep_rows=None, sweep_file=True,
+             sweep_per=2):
     """A synthetic run folder. Counters: fb_main_wait is 0 (1 from frame `fallback_at` on),
     pr_cri_passes is 10 + frame (99 at frame `progress_change` only); counter_rows cuts the counters
-    file to that many rows (0: header only)."""
+    file to that many rows (0: header only). Sweep: sweep_rows cuts sweep.d4s the same way,
+    sweep_file=False leaves it out, sweep_per sets its blocks per frame."""
     out = os.path.join(root, name, "out")
     os.makedirs(out)
     frames = [(1000 + i, 2000 + i) for i in range(nframes)]
     if digest_change is not None:
         frames[digest_change] = (9, 9)
     write_digest(os.path.join(out, "digest.d4d"), frames)
-    sweep = [(3000 + i, 4000 + i) for i in range(nframes)]
+    sweep = [tuple(3000 + 1000 * k + i for k in range(sweep_per)) for i in range(nframes)]
     if sweep_change is not None:
-        sweep[sweep_change] = (7, 7)
-    write_sweep(os.path.join(out, "sweep.d4s"), sweep)
+        sweep[sweep_change] = (7,) * sweep_per
+    if sweep_file:
+        write_sweep(os.path.join(out, "sweep.d4s"), sweep[:sweep_rows], sweep_per)
     counters = [(0, 10 + i) for i in range(nframes)]
     if fallback_at is not None:
         counters = [(1 if i >= fallback_at else 0, 10 + i) for i in range(nframes)]
@@ -145,6 +148,61 @@ def test_sweep_diff(root):
     check("2 blocks ever differ" in out, f"sweep difference: count line\n{out}")
     code, out = compare(a, b, "--sweep-advisory")
     check(code == 0, f"sweep difference with --sweep-advisory: exit {code}\n{out}")
+
+
+def test_sweep_missing(root):
+    # a run without sweep.d4s says nothing about the sweep: like the digest and the counters, a missing
+    # file fails the pair (in either run, and in both), unless --allow-unchecked
+    a = make_run(root, "a")
+    for label, x, y in (("B", a, make_run(root, "b", sweep_file=False)), ("A", make_run(root, "c", sweep_file=False), a)):
+        code, out = compare(x, y)
+        check(code == 1, f"sweep.d4s missing in run {label} must fail: exit {code}\n{out}")
+        check(f"run {label}: no sweep.d4s" in out, f"sweep.d4s missing in run {label}: line\n{out}")
+        code, out = compare(x, y, "--allow-unchecked")
+        check(code == 0, f"sweep.d4s missing in run {label} with --allow-unchecked: exit {code}\n{out}")
+        check(f"run {label}: no sweep.d4s (allowed)" in out, f"sweep.d4s missing in run {label}, allowed: line\n{out}")
+    both = make_run(root, "d", sweep_file=False), make_run(root, "e", sweep_file=False)
+    code, out = compare(*both)
+    check(code == 1, f"sweep.d4s missing in both runs must fail: exit {code}\n{out}")
+    check("run A: no sweep.d4s" in out and "run B: no sweep.d4s" in out, f"sweep.d4s missing in both: lines\n{out}")
+    code, out = compare(*both, "--allow-unchecked")
+    check(code == 0, f"sweep.d4s missing in both runs with --allow-unchecked: exit {code}\n{out}")
+    # --sweep-advisory forgives sweep differences only, not a sweep that was never written
+    code, out = compare(a, make_run(root, "f", sweep_file=False), "--sweep-advisory")
+    check(code == 1, f"sweep.d4s missing with --sweep-advisory must fail: exit {code}\n{out}")
+
+
+def test_sweep_length(root):
+    # the sweep is judged over every digest frame, not over the frames both sweeps happen to have: a sweep
+    # cut short (here 6 rows for 10 digest frames, equal digests) fails, in either run
+    a = make_run(root, "a")
+    for label, x, y in (("B", a, make_run(root, "b", sweep_rows=6)), ("A", make_run(root, "c", sweep_rows=6), a)):
+        code, out = compare(x, y)
+        check(code == 1, f"sweep.d4s with 6 rows in run {label} must fail: exit {code}\n{out}")
+        check(f"run {label}: sweep.d4s has 6 rows for 10 digest frames" in out, f"6 sweep rows in run {label}: line\n{out}")
+        check("sweep: run lengths differ" in out, f"6 sweep rows in run {label}: length line\n{out}")
+        code, out = compare(x, y, "--sweep-advisory")
+        check(code == 1, f"sweep.d4s with 6 rows in run {label} with --sweep-advisory must fail: exit {code}\n{out}")
+    # an empty sweep (header only) has no differing block: it must not read as an equal one
+    code, out = compare(a, make_run(root, "d", sweep_rows=0))
+    check(code == 1, f"sweep.d4s with 0 rows must fail: exit {code}\n{out}")
+    check("run B: sweep.d4s has 0 rows for 10 digest frames" in out, f"0 sweep rows: line\n{out}")
+    # both sweeps short by the same amount: equal to each other, still not covering the digest
+    code, out = compare(make_run(root, "e", sweep_rows=6), make_run(root, "f", sweep_rows=6))
+    check(code == 1, f"both sweeps cut to 6 rows must fail: exit {code}\n{out}")
+    check("sweep: run lengths differ" not in out, f"both sweeps cut to 6 rows: lengths are equal\n{out}")
+
+
+def test_sweep_configuration(root):
+    # sweeps hashed with different settings cannot be compared: a failure, not a silent skip
+    a, b = make_run(root, "a"), make_run(root, "b", sweep_per=4)
+    code, out = compare(a, b)
+    check(code == 1, f"different sweep configurations must fail: exit {code}\n{out}")
+    check("sweep: different configurations" in out, f"different sweep configurations: line\n{out}")
+    code, out = compare(a, b, "--allow-unchecked")
+    check(code == 0, f"different sweep configurations with --allow-unchecked: exit {code}\n{out}")
+    check("sweep: different configurations, not compared (allowed)" in out,
+          f"different sweep configurations, allowed: line\n{out}")
 
 
 def test_missing_result(root):
@@ -324,6 +382,8 @@ def test_gate_good(root):
     check(rows == [12, 12, 12], f"gate, all runs good: every run played 12 frames, got {rows}")
     check(out.count("counters: 12 common frames; no fallbacks, progress equal") == 3,
           f"gate, all runs good: every pair prints its counters line\n{out}")
+    check(out.count("sweep: 12 common frames, 2 blocks/frame of 164; 0 blocks ever differ (0 block-frames)") == 3,
+          f"gate, all runs good: every pair prints its sweep line\n{out}")
 
 
 def test_gate_record_fails(root):
@@ -381,6 +441,21 @@ def test_gate_progress(root):
     check(code == 1, f"gate --sweep-advisory, a progress difference: exit {code}\n{out}")
     check("pr_cri_passes first differs at frame 6" in out, f"gate, a progress difference: line\n{out}")
     check("gate FAILED: 3 runs (0 failed), 3 pairs, 2 differ" in out, f"gate, a progress difference: summary\n{out}")
+
+
+def test_gate_sweep_strict(root):
+    # from Task 7 on the production gate runs WITHOUT --sweep-advisory: a sweep difference in a run that
+    # otherwise ended well fails it, through the gate's own compare calls; with the flag it is forgiven
+    code, out, runs = gate(root, "sw", "--script", SCRIPT, "--replays", "1", "--concurrent", "1", FAKE_GAME_SWEEP="_con1")
+    check(code == 1, f"strict gate, a sweep difference in a replay: exit {code}\n{out}")
+    check(out.count("sweep: 12 common frames, 2 blocks/frame of 164; 1 blocks ever differ (1 block-frames)") == 2,
+          f"strict gate, a sweep difference: each differing pair's sweep line\n{out}")
+    check("gate FAILED: 3 runs (0 failed), 3 pairs, 2 differ" in out, f"strict gate, a sweep difference: summary\n{out}")
+    check(result(runs, "sw_con1") == REP_OK, f"strict gate, a sweep difference: the run ended well {result(runs, 'sw_con1')!r}")
+    code, out, runs = gate(root, "sv", "--script", SCRIPT, "--replays", "1", "--concurrent", "1", "--sweep-advisory",
+                           FAKE_GAME_SWEEP="_con1")
+    check(code == 0, f"gate --sweep-advisory, a sweep difference only: exit {code}\n{out}")
+    check("gate PASSED: 3 runs (0 failed), 3 pairs, 0 differ" in out, f"gate --sweep-advisory, sweep only: summary\n{out}")
 
 
 def test_gate_single_replay_fails(root):

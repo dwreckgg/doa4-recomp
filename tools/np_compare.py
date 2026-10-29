@@ -9,10 +9,12 @@ the first frame of all), the sweep blocks that differ with the first frame each 
 differ, and the counters: every fallback counter (fb_*) above zero in either run (its final value
 and the first frame it was above zero) and every progress counter (pr_*) that differs between the
 runs, with the first frame it differs at.
---allow-unchecked (runs without run_result.txt or counters.d4k, e.g. the proof's)
---sweep-advisory (report sweep differences without failing)
-Exit status: 0 = both runs good, equal lengths, every compared frame equal, no fallback, equal
-progress; 1 = otherwise; 2 = nothing to compare.
+--allow-unchecked (runs without run_result.txt, sweep.d4s or counters.d4k, e.g. the proof's, and
+sweeps hashed with different settings: not compared)
+--sweep-advisory (report sweep block differences without failing; nothing else is forgiven)
+Exit status: 0 = both runs good, equal lengths, every compared frame equal, a sweep row and a
+counters row for every digest frame, no fallback, equal progress; 1 = otherwise; 2 = nothing to
+compare.
 """
 import argparse
 import os
@@ -126,6 +128,59 @@ def judge_counters(a, b, digest_a, digest_b, start, allow_unchecked):
     return bool(problems)
 
 
+def judge_sweep(a, b, digest_a, digest_b, args):
+    """Judges the runs' sweep.d4s (np_core.h) as strictly as the digest: a missing file in either run
+    (unless --allow-unchecked: then the pair's sweep is not compared), sweeps hashed with different
+    settings (unless --allow-unchecked), a sweep without a row for every digest frame of its run (a
+    run cut short, or an empty file, would otherwise compare equal over the frames it has), sweeps
+    of different lengths, and blocks that differ at a frame both have (from --from; with
+    --sweep-advisory these are reported and forgiven, nothing else is).
+    Prints the findings; returns True if the pair fails."""
+    found, fail = {}, False
+    for label, d, digest in (("A", a, digest_a), ("B", b, digest_b)):
+        path = os.path.join(d, "sweep.d4s")
+        if not os.path.exists(path):
+            print(f"run {label}: no sweep.d4s" + (" (allowed)" if args.allow_unchecked else ""))
+            fail |= not args.allow_unchecked
+            continue
+        geometry, frames = read_sweep(path)
+        if set(frames) != set(digest):
+            print(f"run {label}: sweep.d4s has {len(frames)} rows for {len(digest)} digest frames")
+            fail = True
+        found[label] = (geometry, frames)
+    if len(found) < 2:
+        return fail
+    (ga, wa), (gb, wb) = found["A"], found["B"]
+    if ga != gb:
+        print("sweep: different configurations, not compared" + (" (allowed)" if args.allow_unchecked else ""))
+        return fail or not args.allow_unchecked
+    if len(wa) != len(wb):
+        print(f"sweep: run lengths differ (A {len(wa)} frames, B {len(wb)} frames)")
+        fail = True
+    lo, hi, block, per = ga
+    nblocks = (hi - lo) // block
+    scommon = sorted(f for f in wa if f in wb and f >= args.start)
+    first_block = {}
+    ndiff = 0
+    for f in scommon:
+        (fa0, ha), (fb0, hb) = wa[f], wb[f]
+        for i in range(per):
+            if ha[i] != hb[i]:
+                k = (fa0 + i) % nblocks
+                ndiff += 1
+                first_block.setdefault(k, f)
+    print(f"sweep: {len(scommon)} common frames, {per} blocks/frame of {nblocks}; "
+          f"{len(first_block)} blocks ever differ ({ndiff} block-frames)")
+    for k, f in sorted(first_block.items(), key=lambda kv: kv[1])[:args.blocks]:
+        print(f"  block {lo + k * block:08X} first differs at frame {f}")
+    if first_block:
+        if args.sweep_advisory:
+            print("  (sweep differences reported only: --sweep-advisory)")
+        else:
+            fail = True
+    return fail
+
+
 def run_status(d):
     p = os.path.join(d, "run_result.txt")
     if not os.path.exists(p):
@@ -187,34 +242,8 @@ def main():
 
     if first_any is not None:
         result = 1
-    sa, sb = os.path.join(a, "sweep.d4s"), os.path.join(b, "sweep.d4s")
-    if os.path.exists(sa) and os.path.exists(sb):
-        ga, wa = read_sweep(sa)
-        gb, wb = read_sweep(sb)
-        if ga != gb:
-            print("sweep: different configurations, not compared")
-        else:
-            lo, hi, block, per = ga
-            nblocks = (hi - lo) // block
-            scommon = sorted(f for f in wa if f in wb and f >= args.start)
-            first_block = {}
-            ndiff = 0
-            for f in scommon:
-                (fa0, ha), (fb0, hb) = wa[f], wb[f]
-                for i in range(per):
-                    if ha[i] != hb[i]:
-                        k = (fa0 + i) % nblocks
-                        ndiff += 1
-                        first_block.setdefault(k, f)
-            print(f"sweep: {len(scommon)} common frames, {per} blocks/frame of {nblocks}; "
-                  f"{len(first_block)} blocks ever differ ({ndiff} block-frames)")
-            for k, f in sorted(first_block.items(), key=lambda kv: kv[1])[:args.blocks]:
-                print(f"  block {lo + k * block:08X} first differs at frame {f}")
-            if first_block:
-                if args.sweep_advisory:
-                    print("  (sweep differences reported only: --sweep-advisory)")
-                else:
-                    result = 1
+    if judge_sweep(a, b, fa, fb, args):
+        result = 1
     if judge_counters(a, b, fa, fb, args.start, args.allow_unchecked):
         result = 1
     sys.exit(result)

@@ -17,6 +17,8 @@ Test-only environment (the stand-in's own, not the game's):
                     and otherwise ends cleanly
   FAKE_GAME_PROGRESS  same form: that run's pr_cri_passes differs from every other run's at frame 6
                     only (+1 there)
+  FAKE_GAME_SWEEP   same form: that run's sweep row of frame 5 differs from every other run's (its
+                    first block, 0x82C10000) and otherwise ends cleanly
 Every run writes the same hashes and the same counters for the same frame, so runs of equal length
 compare equal. Counters: the real file layout (np_core.h) with the real names (np_det.cpp, pinned by
 test_counter_names_match_source); fb_* are 0, pr_* are a function of the frame.
@@ -32,6 +34,7 @@ COUNTERS = ["fb_worker_token", "fb_main_wait", "fb_unranked", "fb_loader_outside
             "pr_spin_steps", "pr_loader_jobs", "pr_cri_jobs", "pr_reseeds", "pr_notify"]
 FALLBACK_FRAME = 4
 PROGRESS_FRAME = 6
+SWEEP_FRAME = 5
 
 
 def write_digest(path, rows):
@@ -43,11 +46,12 @@ def write_digest(path, rows):
             f.write(struct.pack("<II", i, 0) + struct.pack(f"<{len(REGIONS)}Q", 1000 + i, 2000 + i))
 
 
-def write_sweep(path, rows):
+def write_sweep(path, rows, differ=False):
     with open(path, "wb") as f:
         f.write(b"D4NPSWP1" + struct.pack("<IIIIII", 1, 0x82B70000, 0x835B0000, 0x10000, SWEEP_PER, 0))
         for i in range(rows):
-            f.write(struct.pack("<II", i, (i * SWEEP_PER) % 164) + struct.pack(f"<{SWEEP_PER}Q", 3000 + i, 4000 + i))
+            first = 3000 + i + (1 if differ and i == SWEEP_FRAME else 0)
+            f.write(struct.pack("<II", i, (i * SWEEP_PER) % 164) + struct.pack(f"<{SWEEP_PER}Q", first, 4000 + i))
 
 
 def counter_values(frame, fallback, progress):
@@ -93,7 +97,7 @@ def main():
         rows = frames // 2
     os.makedirs(out, exist_ok=True)
     write_digest(os.path.join(out, "digest.d4d"), rows)
-    write_sweep(os.path.join(out, "sweep.d4s"), rows)
+    write_sweep(os.path.join(out, "sweep.d4s"), rows, listed(name, "FAKE_GAME_SWEEP"))
     write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
                    listed(name, "FAKE_GAME_PROGRESS"))
     log = [f"stand-in game: {mode} run {name}, {rows} frames"]
