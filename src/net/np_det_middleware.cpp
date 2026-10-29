@@ -143,17 +143,35 @@ void LoaderBoundary(uint8_t* base, uint32_t frame) {
 // do nothing; the main thread runs groups 2, 6, 4 at every frame boundary and
 // once more for every repeated tick-count read from one call site in a frame
 // (the game's wait loops read it for their timeouts), so each iteration of such
-// a loop sees the state after one more pass. The passes start at the first frame boundary after the game
-// created thread B (the thread-creation hook) and B reached its loop: the boundary waits for B, so the
-// first pass does not depend on how fast the host starts the thread.
+// a loop sees the state after one more pass. Every pass, at a boundary or in a spin step, starts only once
+// the game has created thread B (the thread-creation hook) and B has reached its loop: the pass waits for
+// B (WaitCriReady), so which passes run does not depend on how fast the host starts the thread.
 constexpr uint32_t kCriThreadA = 0x829BC458, kCriThreadB = 0x829BC8F8, kCriThreadC = 0x829BC980;
 std::atomic<bool> g_cri_ready{false};  // thread B reached its loop: the middleware is set up
 std::atomic<bool> g_cri_created{false};  // the game created server thread B (thread-creation hook)
+std::atomic<bool> g_cri_gave_up{false};  // B was not in its loop 2 s after the first wait: not waited for again
 std::mutex g_cri_mu;
 std::condition_variable g_cri_cv;
 thread_local bool t_on_main_pass = false;
 uint32_t g_spin_steps_frame = 0, g_spin_steps_window = 0, g_spin_steps_max = 0;
 std::vector<std::pair<uint32_t, uint32_t>> g_spin_lrs;  // main thread: tick-read LR -> reads this frame
+
+// Called on the main thread before a pass. Before the game has created thread B nothing is waited for (the
+// pass does nothing, as before); once it has, the pass waits until B is in its loop. After one timeout the
+// fallback is counted once and later passes do not wait again (a spin loop can read the tick count thousands
+// of times a frame: a B that never comes must end the run through the counter, not through 2 s per read).
+void WaitCriReady(uint32_t frame) {
+  if (!g_cri_created.load(std::memory_order_acquire) || g_cri_ready.load(std::memory_order_acquire) ||
+      g_cri_gave_up.load(std::memory_order_relaxed)) {
+    return;
+  }
+  std::unique_lock lk(g_cri_mu);
+  if (!g_cri_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_cri_ready.load() || Stopped(); })) {
+    g_cri_gave_up.store(true, std::memory_order_relaxed);
+    Count(kFbCriReady);
+    LogLine("cri: frame " + std::to_string(frame) + ": server thread B not in its loop 2 s after it was created");
+  }
+}
 
 void CriPass(PPCContext& ctx, uint8_t* base) {
   if (!g_cri_ready.load(std::memory_order_acquire)) return;
@@ -233,15 +251,7 @@ void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
       g_spin_steps_window = g_spin_steps_max = 0;
     }
     g_spin_steps_frame = 0;
-    // Thread B was created by the game at a fixed point; the first pass waits until it is in its
-    // loop, so the passes start at the same boundary in every run whatever the host's timing.
-    if (g_cri_created.load(std::memory_order_acquire) && !g_cri_ready.load(std::memory_order_acquire)) {
-      std::unique_lock lk(g_cri_mu);
-      if (!g_cri_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_cri_ready.load() || Stopped(); })) {
-        Count(kFbCriReady);
-        LogLine("cri: frame " + std::to_string(frame) + ": server thread B not in its loop 2 s after it was created");
-      }
-    }
+    WaitCriReady(frame);  // thread B was created by the game at a fixed point: the first pass waits for it
     CriPass(ctx, base);
   }
   g_watch.Check(base, frame, "in the CRI pass");
@@ -262,6 +272,7 @@ void SpinRead(PPCContext& ctx, uint8_t* base, uint32_t lr) {
         ++g_spin_steps_frame;
         ++g_spin_steps_window;
         g_spin_steps_max = std::max(g_spin_steps_max, g_spin_steps_frame);
+        WaitCriReady(Frame());  // a spin step before the first boundary waits for thread B like the boundary does
         CriPass(ctx, base);
       } else {
         Count(kFbSpinCap);
