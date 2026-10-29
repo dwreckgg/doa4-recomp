@@ -1,0 +1,50 @@
+# boot -> title -> Versus -> Single Battle -> entry (P1 left, P2 right) -> Kasumi vs Ayane,
+# costume 1 -> stage (one right of RANDOM) -> 60 s of random fighting -> quit.
+# Needs --headless=true (the entry's sign-in message box is answered with its default).
+connect 0 1
+1500 -
+shot
+6 START
+120 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+40 -
+shot
+4 A
+90 -
+4 A
+120 -
+shot
+4 - RIGHT
+30 -
+4 - A
+300 -
+shot
+4 A A
+60 -
+4 A A
+360 -
+shot
+4 RIGHT
+30 -
+4 A
+600 -
+shot
+random 600 7 0 1
+shot
+random 600 8 0 1
+shot
+random 600 9 0 1
+shot
+random 600 10 0 1
+shot
+random 600 11 0 1
+shot
+random 600 12 0 1
+shot
+quit
