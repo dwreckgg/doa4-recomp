@@ -3,9 +3,12 @@
 
 #include "../../src/net/np_core.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 static int g_checks = 0;
 static int g_failures = 0;
@@ -302,6 +305,28 @@ static void TestMtSeeds() {
   CHECK(series.Next(1, 0x8321B198) == 0x7EE65792);
   series.Reset();
   CHECK(series.Next(1, 0x833F7600) == 0xDEEFC502);  // a new session counts from the start again
+
+  // Several threads seeding one MT: every k from 0 to n - 1 is handed out exactly once (the hook runs on
+  // whatever guest thread seeds). A GUARD, not proof: a missing lock loses an update only when the
+  // threads overlap, which this cannot force. The probe that removes the lock was caught in 10 of 10
+  // runs, the clean build passed 30 of 30.
+  SeedSeries shared;
+  constexpr int kThreads = 8, kEach = 1000;
+  std::vector<std::vector<uint32_t>> got(kThreads);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&shared, &got, t] {
+      for (int i = 0; i < kEach; ++i) got[t].push_back(shared.Next(1, 0x833F7600));
+    });
+  }
+  for (std::thread& t : threads) t.join();
+  std::vector<uint32_t> all, want;
+  for (const auto& v : got) all.insert(all.end(), v.begin(), v.end());
+  for (uint32_t k = 0; k < uint32_t(kThreads * kEach); ++k) want.push_back(MtSeed(1, 0x833F7600, k));
+  std::sort(all.begin(), all.end());
+  std::sort(want.begin(), want.end());
+  CHECK(all.size() == size_t(kThreads * kEach));
+  CHECK(all == want);
 }
 
 int main() {
