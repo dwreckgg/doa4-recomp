@@ -23,6 +23,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -154,14 +156,46 @@ void CriPass(PPCContext& ctx, uint8_t* base) {
   _mm_setcsr(csr);  // the cached flush mode in ctx must match the hardware again
 }
 
+// Hunt instrument (DOA4_NP_WATCH=<hex address>,<hex length>): logs which step
+// of the frame boundary changes the watched bytes (none should: the boundary
+// runs no game code except the middleware passes).
+struct Watch {
+  uint32_t lo = 0, len = 0;
+  std::vector<uint8_t> copy;
+  uint32_t logged = 0;
+  void Init() {
+    const char* e = std::getenv("DOA4_NP_WATCH");
+    if (!e) return;
+    lo = uint32_t(std::strtoul(e, nullptr, 16));
+    const char* comma = std::strchr(e, ',');
+    len = comma ? uint32_t(std::strtoul(comma + 1, nullptr, 16)) : 0;
+  }
+  void Check(uint8_t* base, uint32_t frame, const char* step) {
+    if (!len) return;
+    const uint8_t* p = base + lo;
+    if (step && !copy.empty() && std::memcmp(copy.data(), p, len) != 0 && logged < 40) {
+      ++logged;
+      uint32_t at = 0;
+      while (at < len && copy[at] == p[at]) ++at;
+      LogLine(fmt::format("watch: {:08X} changed {} (frame {}, first byte +{:X})", lo, step, frame, at));
+    }
+    copy.assign(p, p + len);
+  }
+};
+Watch g_watch;
+
 }  // namespace
 
 void MiddlewareStart() {
+  g_watch.Init();
   if (On(kAudio)) rex_audio_lockstep(1);
 }
 
+
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
+  g_watch.Check(base, frame, nullptr);  // the frame's own changes: not reported
   if (On(kLoader)) LoaderBoundary(base, frame);
+  g_watch.Check(base, frame, "in the loader boundary");
   g_spin_lrs.clear();
   if (On(kCri)) {
     if (frame % 600 == 599 && g_spin_steps_window) {
@@ -172,7 +206,9 @@ void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
     g_spin_steps_frame = 0;
     CriPass(ctx, base);
   }
+  g_watch.Check(base, frame, "in the CRI pass");
   if (On(kAudio)) AudioStep(frame);
+  g_watch.Check(base, frame, "in the audio step");
 }
 
 void SpinRead(PPCContext& ctx, uint8_t* base, uint32_t lr) {

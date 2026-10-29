@@ -42,7 +42,10 @@ void WorkersFrame();
 void WorkersStop();
 
 // np_det_trace.cpp (DOA4_NP_TRACE)
-enum ReadKind { kRdQpc, kRdTick, kRdFileTime, kRdSdkTb, kRdSdkFt, kRdCall0, kRdCall1, kRdMt, kRdWorker, kRdKinds };
+enum ReadKind {
+  kRdQpc, kRdTick, kRdFileTime, kRdSdkTb, kRdSdkFt,
+  kRdCall0, kRdCall1, kRdMt, kRdWorker, kRdCall2, kRdCall3, kRdKinds
+};
 void TraceStart(const std::filesystem::path& dir);
 bool Tracing();
 void TraceRead(int kind, uint32_t lr);

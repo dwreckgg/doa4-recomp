@@ -36,7 +36,8 @@ namespace doa4::np::det {
 namespace {
 
 constexpr const char* kReadNames[] = {"qpc",  "tick", "ft",         "sdktb", "sdkft",
-                                      "call24026E8", "call2401CD8", "mt8357B5C0", "wake"};
+                                      "call24026E8", "call2401CD8", "mt8357B5C0", "wake",
+                                      "call26868A8", "call2686B10"};
 static_assert(sizeof(kReadNames) / sizeof(kReadNames[0]) == kRdKinds);
 
 FILE* g_trace = nullptr;
@@ -113,6 +114,8 @@ REX_EXTERN(__imp__sub_8276B6A8);
 REX_EXTERN(__imp__sub_8276B770);
 REX_EXTERN(__imp__sub_8276B818);
 REX_EXTERN(__imp__sub_8276B8F8);
+REX_EXTERN(__imp__sub_826868A8);
+REX_EXTERN(__imp__sub_82686B10);
 }
 
 #define NP_TRACE_CALL(fn, kind)          \
@@ -127,3 +130,5 @@ NP_TRACE_CALL(sub_8276B6A8, kRdMt)
 NP_TRACE_CALL(sub_8276B770, kRdMt)
 NP_TRACE_CALL(sub_8276B818, kRdMt)
 NP_TRACE_CALL(sub_8276B8F8, kRdMt)
+NP_TRACE_CALL(sub_826868A8, kRdCall2)
+NP_TRACE_CALL(sub_82686B10, kRdCall3)

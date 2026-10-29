@@ -228,6 +228,10 @@ std::vector<Region> DigestRegions() {
   r.push_back({"mt_83420020", 0x83420020, 2504, {}});
   r.push_back({"mt_8321B198", 0x8321B198, 2504, {}});
   r.push_back({"frame_ctr", 0x831013E4, 4, {}});
+  if (std::getenv("DOA4_NP_EXTRA_REGIONS")) {  // hunt: the stage-effect timers and a vblank-like counter
+    r.push_back({"stage_fx", 0x82EDA260, 0x4A0, {}});
+    r.push_back({"ctr_831A7AC0", 0x831A7AC0, 0x20, {}});
+  }
   return r;
 }
 
