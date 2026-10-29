@@ -63,6 +63,10 @@ void SpinRead(PPCContext& ctx, uint8_t* base, uint32_t lr);
 // np_det_workers.cpp
 void WorkersFrame();
 void WorkersStop();
+// A thread the game created through its CreateThread path (np_det.cpp, hook on sub_82793B68), in
+// creation order; start = its guest entry point, tid = XThread::thread_id().
+void ThreadCreated(uint32_t start, uint32_t tid);
+void WorkerCreated(uint32_t start, uint32_t tid);  // np_det_workers.cpp
 
 // np_det_trace.cpp (DOA4_NP_TRACE)
 enum ReadKind {

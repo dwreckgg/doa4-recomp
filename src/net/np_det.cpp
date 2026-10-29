@@ -38,7 +38,9 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
+#include <rex/system/util/object_table.h>
 #include <rex/system/xthread.h>
 
 #include "generated/default/dead_or_alive_4_init.h"
@@ -51,6 +53,7 @@ REX_EXTERN(__imp__sub_82334C60);
 REX_EXTERN(__imp__sub_82790138);
 REX_EXTERN(__imp__sub_82792660);
 REX_EXTERN(__imp__sub_82790130);
+REX_EXTERN(__imp__sub_82793B68);
 // SDK netplay export (sdk-np0 src/system/kernel_state.cpp).
 __declspec(dllimport) void rex_overlapped_inline(int on);
 }
@@ -198,6 +201,8 @@ bool IsMainThread() {
   return t && t->main_thread();
 }
 
+void ThreadCreated(uint32_t start, uint32_t tid) { WorkerCreated(start, tid); }
+
 void Start(uint64_t seed, const std::filesystem::path& dir) {
   g_seed = seed;
   TraceStart(dir);
@@ -280,4 +285,20 @@ REX_HOOK_RAW(sub_82790130) {
     return;
   }
   __imp__sub_82790130(ctx, base);
+}
+
+// sub_82793B68(r3, stack size r4, start r5, parameter r6, flags r7, processor r8, thread id out r9):
+// the game's CreateThread path (sub_82791B40 -> here -> ExCreateThread, phase0_facts.md 5); returns
+// the new thread's handle, or 0. D3D creates its own thread with ExCreateThread directly (not here).
+REX_HOOK_RAW(sub_82793B68) {
+  const uint32_t start = ctx.r5.u32;
+  __imp__sub_82793B68(ctx, base);
+  if (!doa4::np::Active()) return;
+  const uint32_t handle = ctx.r3.u32;
+  uint32_t tid = 0;
+  if (auto* ks = rex::system::kernel_state(); ks && handle) {
+    if (auto thread = ks->object_table()->LookupObject<rex::system::XThread>(handle)) tid = thread->thread_id();
+  }
+  doa4::np::LogLine(fmt::format("thread created: start {:08X} id {} (frame {})", start, tid, Frame()));
+  ThreadCreated(start, tid);
 }

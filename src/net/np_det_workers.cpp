@@ -15,12 +15,14 @@
 //   0  parallel, as the game runs them;
 //   1  mutually exclusive: a worker holds one process-wide lock from its wait's
 //      return to its next signal (the order is still the OS's);
-//   2  one at a time in a fixed order: by thread id, which is creation order and
-//      round-robin over the five chains, so it agrees with each chain's own
-//      order; a token, reset by the frame hook, passes from worker to worker as
-//      each one signals. Every worker runs exactly once per frame (traced), so
-//      the token never waits for one that does not come; if it ever did, the
-//      waiter gives up after 2 s and says so;
+//   2  one at a time in a fixed order: the order the game created the workers in
+//      (the thread-creation hook, np_det.cpp), which is round-robin over the five
+//      chains and agrees with each chain's own order; a token, reset by the frame
+//      hook, passes from worker to worker as each one signals. A worker that
+//      wakes without a rank, or a token that does not come within 2 s, is a
+//      counted fallback (fb_unranked, fb_worker_token). Every worker runs exactly
+//      once per frame (traced), so the token never waits for one that does not
+//      come;
 //   3  mode 2, and the workers never run beside the main thread: after the
 //      update half sets the pool's start events the main thread waits until
 //      the workers have gone as far as they can before the pool's mid event,
@@ -32,6 +34,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -63,13 +66,16 @@ std::mutex g_serial_mu;   // mode 1: held through a worker's work section
 thread_local bool t_held = false;   // mode 1
 thread_local int t_rank = -1;       // mode 2
 std::atomic<int> g_mode{-1};        // -1: not decided yet
-std::vector<uint32_t> g_tids;       // sorted worker thread ids
+std::vector<uint32_t> g_tids;       // worker thread ids in creation order: the index is the rank
 int g_token = 0;
 uint32_t g_timeouts = 0;
-int g_ranked = 0;                   // workers that have their rank
 int g_mid_waiter = -1;              // rank of the worker blocked on the pool's mid event
 uint32_t g_main_timeouts = 0;
 constexpr uint32_t kPool = 0x8341FAA0;  // job pool: start events +20..+36, done +40.., mid +60
+// The 25 job workers' entry points (phase0_facts.md 5; the proof's SignalObjectAndWait census).
+constexpr uint32_t kWorkerEntries[] = {0x825414B0, 0x82573A40, 0x82573958, 0x825689E8,
+                                       0x82374990, 0x8234A160, 0x82370638};
+uint32_t g_unranked_logs = 0;
 
 int Mode() {
   int v = g_mode.load(std::memory_order_relaxed);
@@ -119,7 +125,10 @@ void MainWaitForWorkers(bool until_done) {
     }
   } timed{t0};
   std::unique_lock lk(g_mu);
-  if (g_ranked < kWorkerCount) return;
+  if (int(g_tids.size()) < kWorkerCount) {  // the order cannot hold: say so in the counters
+    Count(kFbUnranked);
+    return;
+  }
   auto ready = [until_done] {
     return Stopped() || g_token >= kWorkerCount || (!until_done && g_mid_waiter >= 0 && g_mid_waiter == g_token);
   };
@@ -135,6 +144,15 @@ void MainWaitForWorkers(bool until_done) {
 }
 
 }  // namespace
+
+void WorkerCreated(uint32_t start, uint32_t tid) {
+  if (std::find(std::begin(kWorkerEntries), std::end(kWorkerEntries), start) == std::end(kWorkerEntries)) return;
+  std::lock_guard lk(g_mu);
+  g_tids.push_back(tid);  // creation order = rank
+  if (int(g_tids.size()) == kWorkerCount) {
+    LogLine("job workers: all 25 created at frame " + std::to_string(Frame()));
+  }
+}
 
 void WorkersFrame() {
   const uint32_t frame = Frame();
@@ -184,18 +202,9 @@ REX_HOOK_RAW(sub_827921C0) {
     t_held = false;
     g_serial_mu.unlock();
   }
-  if (mode >= 2) {
+  if (mode >= 2 && t_rank >= 0) {
     std::lock_guard lk(g_mu);
-    if (t_rank < 0) {
-      if (std::find(g_tids.begin(), g_tids.end(), tid) == g_tids.end()) {
-        g_tids.push_back(tid);
-        std::sort(g_tids.begin(), g_tids.end());
-        if (int(g_tids.size()) == kWorkerCount) {
-          doa4::np::LogLine("job workers: all 25 registered at frame " + std::to_string(Frame()) +
-                            "; the fixed order applies from their next wake");
-        }
-      }
-    } else if (g_token == t_rank) {
+    if (g_token == t_rank) {
       ++g_token;  // end of this worker's work section: the next one may run
       g_cv.notify_all();
     }
@@ -207,9 +216,17 @@ REX_HOOK_RAW(sub_827921C0) {
     t_held = true;
   } else if (mode >= 2) {
     std::unique_lock lk(g_mu);
-    if (t_rank < 0 && int(g_tids.size()) == kWorkerCount) {
-      t_rank = int(std::find(g_tids.begin(), g_tids.end(), tid) - g_tids.begin());
-      ++g_ranked;
+    if (t_rank < 0) {
+      const auto it = std::find(g_tids.begin(), g_tids.end(), tid);
+      if (it != g_tids.end() && int(g_tids.size()) == kWorkerCount) {
+        t_rank = int(it - g_tids.begin());
+      } else {
+        Count(kFbUnranked);
+        if (g_unranked_logs++ < 10) {
+          doa4::np::LogLine(fmt::format("job workers: thread {} (start {:08X}) woke without a rank ({} created)",
+                                        tid, ThreadStart(), g_tids.size()));
+        }
+      }
     }
     if (t_rank >= 0) {
       const int rank = t_rank;
