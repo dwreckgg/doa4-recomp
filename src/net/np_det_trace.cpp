@@ -75,7 +75,9 @@ bool Tracing() { return g_trace != nullptr; }
 
 void TraceRead(int kind, uint32_t lr) {
   if (!g_trace) return;
-  rex::system::XThread* t = rex::system::XThread::GetCurrentThread();
+  // A plain host thread (no XThread; GetCurrentThread asserts there) counts as "other".
+  rex::system::XThread* t =
+      rex::system::XThread::IsInThread() ? rex::system::XThread::GetCurrentThread() : nullptr;
   std::lock_guard lk(g_mu);
   if (t && t->main_thread()) {
     g_main[{kind, lr}]++;

@@ -403,4 +403,57 @@ std::string EncodeCountersFrame(uint32_t frame, const std::vector<uint32_t>& val
   return s;
 }
 
+namespace {
+void StartFrame(ThreadClock* c, uint32_t frame) {
+  if (c->frame != frame) {
+    c->frame = frame;
+    c->tb_reads = c->tick_reads = c->ft_reads = 0;
+  }
+}
+}  // namespace
+
+uint64_t VirtualTimebase(ThreadClock* c, uint32_t frame) {
+  StartFrame(c, frame);
+  const uint64_t v =
+      kTimebaseBase + uint64_t(frame) * kTimebaseHz / 60 + uint64_t(++c->tb_reads) * (kTimebaseHz / 100000);
+  c->last_tb = std::max(v, c->last_tb + 1);
+  return c->last_tb;
+}
+
+uint32_t VirtualTickCount(ThreadClock* c, uint32_t frame) {
+  StartFrame(c, frame);
+  const uint32_t v = kTickBase + uint32_t(uint64_t(frame) * 1000 / 60) + (c->tick_reads++ >> 4);
+  c->last_tick = std::max(v, c->last_tick);
+  return c->last_tick;
+}
+
+uint64_t VirtualFileTime(ThreadClock* c, uint32_t frame) {
+  StartFrame(c, frame);
+  const uint64_t v = kFileTimeBase + uint64_t(frame) * 10000000 / 60 + uint64_t(++c->ft_reads) * 100;
+  c->last_ft = std::max(v, c->last_ft + 1);
+  return c->last_ft;
+}
+
+uint32_t MtSeed(uint64_t session_seed, uint32_t state, uint32_t k) {
+  uint64_t x = session_seed ^ (uint64_t(state) << 32) ^ (uint64_t(k) * 0x9E3779B97F4A7C15ull);
+  x += 0x9E3779B97F4A7C15ull;  // splitmix64 finaliser
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return uint32_t(x ^ (x >> 31));
+}
+
+uint32_t SeedSeries::Next(uint64_t session_seed, uint32_t state) {
+  uint32_t k;
+  {
+    std::lock_guard lk(mu_);
+    k = seeded_[state]++;
+  }
+  return MtSeed(session_seed, state, k);
+}
+
+void SeedSeries::Reset() {
+  std::lock_guard lk(mu_);
+  seeded_.clear();
+}
+
 }  // namespace doa4::np

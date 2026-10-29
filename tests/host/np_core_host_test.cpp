@@ -234,6 +234,76 @@ static void TestCounters() {
   CHECK(f.size() == 16 && std::memcmp(f.data(), want, 16) == 0);
 }
 
+// The virtual clocks (np_core.h): a read inside a frame advances the thread's clock a little; a
+// frame whose start lies behind what an earlier frame's reads reached continues from the last value.
+// Expected values are derived from the formulas: time base 50 MHz / 100000 = 500 ticks a read and
+// 50,000,000 / 60 = 833,333 a frame; tick count 1 ms per 16 reads and 1000 / 60 = 16 ms a frame;
+// FILETIME 100 a read and 10,000,000 / 60 = 166,666 a frame.
+static void TestVirtualClocks() {
+  ThreadClock c;
+  CHECK(VirtualTimebase(&c, 0) == kTimebaseBase + 500);  // 10 us a read
+  CHECK(VirtualTimebase(&c, 0) == kTimebaseBase + 1000);
+  CHECK(VirtualTimebase(&c, 1) == kTimebaseBase + 833333 + 500);  // a new frame starts its reads again
+  ThreadClock busy;
+  uint64_t last = 0;
+  for (int i = 0; i < 2000; ++i) last = VirtualTimebase(&busy, 0);  // more reads than a frame holds (1,667)
+  CHECK(last == kTimebaseBase + 2000 * 500);
+  CHECK(VirtualTimebase(&busy, 1) == last + 1);  // frame 1 would start at +833,833: never backwards
+  ThreadClock t;
+  CHECK(VirtualTickCount(&t, 0) == kTickBase);
+  for (int i = 0; i < 300; ++i) VirtualTickCount(&t, 0);
+  CHECK(VirtualTickCount(&t, 0) == kTickBase + 18);  // read 302: 301 >> 4 = 18 ms
+  CHECK(VirtualTickCount(&t, 1) == kTickBase + 18);  // frame 1 starts at +16 ms: held at +18
+  ThreadClock ft;
+  CHECK(VirtualFileTime(&ft, 0) == kFileTimeBase + 100);
+  for (int i = 0; i < 2000; ++i) VirtualFileTime(&ft, 0);  // last: +200,100
+  CHECK(VirtualFileTime(&ft, 1) == kFileTimeBase + 200101);  // frame 1 would start at +166,766
+
+  // Beyond the supplied checks. Each passes on the plain formulas, so each is proved by a mutation
+  // probe, not by the RED: once a frame starts past the overrun the clock is back on the formula
+  // (frame 2 starts at +1,666,666 time base, +33 ms, +333,333 FILETIME) and its reads count from the
+  // frame's start again; and "never backwards" is a property of one thread's clock (a fresh thread
+  // reading in frame 1 is not held up by the busy ones).
+  CHECK(VirtualTimebase(&busy, 2) == kTimebaseBase + 1666666 + 500);
+  CHECK(VirtualTimebase(&busy, 2) == kTimebaseBase + 1666666 + 1000);
+  CHECK(VirtualTickCount(&t, 2) == kTickBase + 33);
+  CHECK(VirtualFileTime(&ft, 2) == kFileTimeBase + 333333 + 100);
+  ThreadClock other;
+  CHECK(VirtualTimebase(&other, 1) == kTimebaseBase + 833333 + 500);
+  CHECK(VirtualTickCount(&other, 1) == kTickBase + 16);
+  CHECK(VirtualFileTime(&other, 1) == kFileTimeBase + 166666 + 100);
+}
+
+// The seed an MT gets at its (k + 1)th seeding in a session, and the per-MT count that makes k.
+// Offline play seeds each of the four MTs once, at boot (a 6,995-frame Single record has 4 seedings,
+// pr_reseeds = 4), so no replay reaches k >= 1: this is where the series is pinned.
+// Oracles: k = 0 is what the proof's formula logged in a real run (np_log of a record run, session seed
+// 1: "seed: MT 8321B198 seed 000003E8 -> 17CEE0B2" and the three others); the k >= 1 values come from a
+// separate implementation of the formula (splitmix64 finaliser of session ^ state << 32 ^ k * golden
+// ratio, low 32 bits, in Python), not from this code.
+static void TestMtSeeds() {
+  CHECK(MtSeed(1, 0x8321B198, 0) == 0x17CEE0B2);
+  CHECK(MtSeed(1, 0x833F7600, 0) == 0xDEEFC502);
+  CHECK(MtSeed(1, 0x83420020, 0) == 0xC635FC19);
+  CHECK(MtSeed(1, 0x8357B5C0, 0) == 0x67431C31);
+  CHECK(MtSeed(1, 0x833F7600, 1) == 0x31D0360E);
+  CHECK(MtSeed(1, 0x833F7600, 2) == 0x79DC99F5);
+  CHECK(MtSeed(1, 0x8321B198, 1) == 0x7EE65792);
+  CHECK(MtSeed(2, 0x833F7600, 0) == 0xE175B2BB);  // another session seed, another draw
+  CHECK(MtSeed(2, 0x833F7600, 1) == 0x62138727);
+
+  SeedSeries series;
+  CHECK(series.Next(1, 0x833F7600) == 0xDEEFC502);  // the first seeding is the proof's
+  CHECK(series.Next(1, 0x833F7600) == 0x31D0360E);  // the second draws anew (NOT the first again)
+  // Another MT counts on its own: its first seeding is still k = 0, although the first MT is at k = 2
+  // (NOT one count for all MTs, which would give 0xD9309BFC here).
+  CHECK(series.Next(1, 0x8321B198) == 0x17CEE0B2);
+  CHECK(series.Next(1, 0x833F7600) == 0x79DC99F5);
+  CHECK(series.Next(1, 0x8321B198) == 0x7EE65792);
+  series.Reset();
+  CHECK(series.Next(1, 0x833F7600) == 0xDEEFC502);  // a new session counts from the start again
+}
+
 int main() {
   TestPadBytes();
   TestScript();
@@ -243,6 +313,8 @@ int main() {
   TestMaskedCopy();
   TestSweep();
   TestCounters();
+  TestVirtualClocks();
+  TestMtSeeds();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

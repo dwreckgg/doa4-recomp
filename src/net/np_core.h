@@ -14,8 +14,10 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace doa4::np {
@@ -164,5 +166,42 @@ uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks);
 // stay 0), "pr_" count progress (equal in every run of one recording).
 std::string EncodeCountersHeader(const std::vector<std::string>& names);
 std::string EncodeCountersFrame(uint32_t frame, const std::vector<uint32_t>& values);
+
+// ---- Virtual clocks (the determinism layer's "clock" and "sdkclock" fixes) ----
+// Time derived from the session frame. Every read of a thread advances its clock a little within
+// a frame (10 us of time base, 1 ms per 16 tick-count reads, 10 us of FILETIME), so a loop that
+// waits on the clock still ends (Tekken 6 t6_determinism.cpp); a thread's clock never runs
+// backwards, also when its reads in one frame went past the next frame's start (the next frame
+// then continues from the last value).
+inline constexpr uint64_t kTimebaseHz = 50000000;                 // KeQueryPerformanceFrequency
+inline constexpr uint64_t kTimebaseBase = 1ull << 40;             // far from 0, the same in every session
+inline constexpr uint32_t kTickBase = 600000;                     // GetTickCount at frame 0 (ms)
+inline constexpr uint64_t kFileTimeBase = 0x01DB000000000000ull;  // a fixed date (FILETIME, 100 ns)
+
+struct ThreadClock {
+  uint32_t frame = ~0u;
+  uint32_t tb_reads = 0, tick_reads = 0, ft_reads = 0;
+  uint64_t last_tb = 0, last_ft = 0;
+  uint32_t last_tick = 0;
+};
+uint64_t VirtualTimebase(ThreadClock* c, uint32_t frame);   // strictly increasing per thread
+uint32_t VirtualTickCount(ThreadClock* c, uint32_t frame);  // never decreasing per thread
+uint64_t VirtualFileTime(ThreadClock* c, uint32_t frame);   // strictly increasing per thread
+
+// ---- Mersenne Twister seeds (the determinism layer's "seed" fix) ----
+// Every seeding of one of the game's MTs (sub_82334C60, state = the MT's address) gets a value derived
+// from the session seed, the MT's address and k, the number of times that MT was seeded before in the
+// session: every run of one recording draws the same, and a later seeding does not repeat an earlier one.
+// k = 0 is the value the proof gave.
+uint32_t MtSeed(uint64_t session_seed, uint32_t state, uint32_t k);
+
+class SeedSeries {
+ public:
+  uint32_t Next(uint64_t session_seed, uint32_t state);  // the seed for `state`'s next seeding
+  void Reset();                                          // a new session counts from the start
+ private:
+  std::mutex mu_;
+  std::unordered_map<uint32_t, uint32_t> seeded_;  // MT address -> seedings so far
+};
 
 }  // namespace doa4::np

@@ -3,9 +3,11 @@
 // Fixes (DOA4_NP_FIX names; each is active only in a session). The evidence
 // for each (two replays of one recording, first frame whose digest differs,
 // with and without the fix) is in the proof's hand-back report.
-//   seed      every Mersenne Twister seed (sub_82334C60, the single seeding
-//             function of the four MTs, phase0_facts.md 7) is replaced by a
-//             value derived from the session seed and the MT's address.
+//   seed      every Mersenne Twister seeding (sub_82334C60, the single seeding
+//             function of the four MTs, phase0_facts.md 7) gets a value derived
+//             from the session seed, the MT's address and how many times that MT
+//             was seeded before (so each match draws differently, the same in
+//             every run).
 //   clock     the game's clock wrappers return time derived from the session
 //             frame: GetTickCount (sub_82790138), QueryPerformanceCounter = mftb
 //             (sub_82792660), KeQuerySystemTime (sub_82790130). Within a frame
@@ -45,6 +47,7 @@
 
 #include "generated/default/dead_or_alive_4_init.h"
 
+#include "np_core.h"
 #include "np_det_internal.h"
 #include "np_session.h"
 
@@ -76,6 +79,7 @@ std::atomic<uint32_t> g_frame{0};
 std::atomic<bool> g_stopped{false};
 std::string g_headless_before = "false";  // the headless cvar as Start found it; Stop puts it back
 uint64_t g_seed = 1;
+SeedSeries g_seeds;  // seedings so far per MT in the session (np_core.h; Start resets it)
 std::atomic<uint32_t> g_counters[kCounterCount];
 constexpr const char* kCounterNames[] = {
     "fb_worker_token", "fb_main_wait",  "fb_unranked",    "fb_loader_outside", "fb_loader_idle",
@@ -108,59 +112,19 @@ uint32_t ParseFixes(const char* text) {
   return bits;
 }
 
-uint64_t Mix(uint64_t x) {  // splitmix64 finaliser
-  x += 0x9E3779B97F4A7C15ull;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-  return x ^ (x >> 31);
-}
-
 // ---- Virtual clocks ----
-constexpr uint64_t kTimebaseHz = 50000000;                 // KeQueryPerformanceFrequency
-constexpr uint64_t kTimebaseBase = 1ull << 40;             // far from 0, the same in every session
-constexpr uint32_t kTickBase = 600000;                     // GetTickCount at frame 0 (ms)
-constexpr uint64_t kFileTimeBase = 0x01DB000000000000ull;  // a fixed date (FILETIME, 100 ns)
-
-struct ThreadClock {
-  uint32_t frame = ~0u;
-  uint32_t tb_reads = 0;
-  uint32_t tick_reads = 0;
-  uint32_t ft_reads = 0;
-};
+// The formulas and the never-backwards rule are in np_core.h; each thread keeps its own clock.
 thread_local ThreadClock t_clock;
-
-ThreadClock& Clock() {
-  const uint32_t f = g_frame.load(std::memory_order_acquire);
-  if (t_clock.frame != f) {
-    t_clock.frame = f;
-    t_clock.tb_reads = t_clock.tick_reads = t_clock.ft_reads = 0;
-  }
-  return t_clock;
-}
-
-uint64_t VirtualTimebase() {
-  ThreadClock& c = Clock();
-  return kTimebaseBase + uint64_t(c.frame) * kTimebaseHz / 60 +
-         uint64_t(++c.tb_reads) * (kTimebaseHz / 100000);
-}
-
-uint32_t VirtualTickCount() {
-  ThreadClock& c = Clock();
-  return kTickBase + uint32_t(uint64_t(c.frame) * 1000 / 60) + (c.tick_reads++ >> 4);
-}
-
-uint64_t VirtualFileTime() {
-  ThreadClock& c = Clock();
-  return kFileTimeBase + uint64_t(c.frame) * 10000000 / 60 + uint64_t(++c.ft_reads) * 100;
-}
 
 // The SDK's guest-time override: guest threads get the virtual clocks; host
 // threads (GPU vblank, audio worker, kernel dispatch) keep the host clock.
 bool GuestTime(int kind, uint64_t* value) {
   if (!On(kSdkClock)) return false;
+  // GetCurrentThread asserts on a thread that is not bound to an XThread (a debug SDK), so ask first.
+  if (!rex::system::XThread::IsInThread()) return false;  // a plain host thread (no XThread)
   rex::system::XThread* thread = rex::system::XThread::GetCurrentThread();
-  if (!thread || !thread->is_guest_thread()) return false;
-  *value = kind == 0 ? VirtualTimebase() : VirtualFileTime();
+  if (!thread->is_guest_thread()) return false;
+  *value = kind == 0 ? VirtualTimebase(&t_clock, Frame()) : VirtualFileTime(&t_clock, Frame());
   if (Tracing()) {
     auto* ts = rex::runtime::ThreadState::Get();
     TraceRead(kind == 0 ? kRdSdkTb : kRdSdkFt, ts && ts->context() ? uint32_t(ts->context()->lr) : 0);
@@ -192,6 +156,7 @@ uint32_t Frame() { return g_frame.load(std::memory_order_acquire); }
 uint32_t ThreadStart() {
   thread_local uint32_t start = ~0u;
   if (start == ~0u) {
+    if (!rex::system::XThread::IsInThread()) return 0;  // a plain host thread: no entry point (not cached)
     rex::system::XThread* t = rex::system::XThread::GetCurrentThread();
     start = t && t->creation_params() ? uint32_t(t->creation_params()->start_address) : 0;
   }
@@ -199,6 +164,7 @@ uint32_t ThreadStart() {
 }
 
 bool IsMainThread() {
+  if (!rex::system::XThread::IsInThread()) return false;
   rex::system::XThread* t = rex::system::XThread::GetCurrentThread();
   return t && t->main_thread();
 }
@@ -207,6 +173,7 @@ void ThreadCreated(uint32_t start, uint32_t tid) { WorkerCreated(start, tid); }
 
 void Start(uint64_t seed, const std::filesystem::path& dir) {
   g_seed = seed;
+  g_seeds.Reset();  // the series counts the seedings of this session
   TraceStart(dir);
   const uint32_t fixes = ParseFixes(std::getenv("DOA4_NP_FIX"));
   g_fixes.store(fixes, std::memory_order_release);
@@ -257,7 +224,9 @@ REX_HOOK_RAW(sub_82334C60) {
   if (doa4::np::Active() && On(kSeed)) {
     const uint32_t state = ctx.r3.u32;
     const uint32_t old_seed = ctx.r4.u32;
-    const uint32_t seed = uint32_t(Mix(g_seed ^ (uint64_t(state) << 32)));
+    // From the session seed, this MT's address and how many times it was seeded before (np_core.h
+    // MtSeed): the first seeding of each MT is the proof's value, a later one draws anew.
+    const uint32_t seed = g_seeds.Next(g_seed, state);
     ctx.r4.u64 = seed;
     Count(kPrReseeds);
     static std::atomic<int> n{0};
@@ -274,7 +243,7 @@ REX_HOOK_RAW(sub_82334C60) {
 REX_HOOK_RAW(sub_82790138) {
   if (doa4::np::Active() && On(kClock)) {
     if (IsMainThread()) SpinRead(ctx, base, uint32_t(ctx.lr));
-    ctx.r3.u64 = VirtualTickCount();
+    ctx.r3.u64 = doa4::np::VirtualTickCount(&t_clock, Frame());
     TraceRead(kRdTick, uint32_t(ctx.lr));
     return;
   }
@@ -284,7 +253,7 @@ REX_HOOK_RAW(sub_82790138) {
 // QueryPerformanceCounter: *(u64*)r3 = mftb; returns 1.
 REX_HOOK_RAW(sub_82792660) {
   if (doa4::np::Active() && On(kClock)) {
-    rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, VirtualTimebase());
+    rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, doa4::np::VirtualTimebase(&t_clock, Frame()));
     TraceRead(kRdQpc, uint32_t(ctx.lr));
     ctx.r3.u64 = 1;
     return;
@@ -295,7 +264,7 @@ REX_HOOK_RAW(sub_82792660) {
 // KeQuerySystemTime(FILETIME* r3).
 REX_HOOK_RAW(sub_82790130) {
   if (doa4::np::Active() && On(kClock) && ctx.r3.u32) {
-    rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, VirtualFileTime());
+    rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, doa4::np::VirtualFileTime(&t_clock, Frame()));
     TraceRead(kRdFileTime, uint32_t(ctx.lr));
     return;
   }

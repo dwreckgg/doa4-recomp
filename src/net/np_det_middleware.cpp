@@ -214,8 +214,11 @@ void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
   g_watch.Check(base, frame, "in the audio step");
 }
 
+// The trigger (a second tick-count read from one call site on the main thread in a frame) is a function
+// of the main thread's own call sequence, which lockstep keeps equal; the passes it adds are counted
+// (pr_spin_steps) and compared every frame.
 void SpinRead(PPCContext& ctx, uint8_t* base, uint32_t lr) {
-  if (!On(kCri)) return;
+  if (!On(kCri) || t_on_main_pass) return;  // a tick read inside a pass is not a wait loop of the frame
   for (auto& [site, n] : g_spin_lrs) {
     if (site == lr) {
       ++n;
@@ -243,21 +246,21 @@ using namespace doa4::np::det;
 // whether it has finished (CRI status 0/3/4) and sub_8242A0F0 stops it. Movie 18
 // is the boot's opening (frames 20-1000).
 namespace {
-std::atomic<bool> g_movie_skipped{false};
+bool MoviesSkipped() { return doa4::np::Active() && On(kMovie); }
 }  // namespace
 
 REX_HOOK_RAW(sub_8242A168) {
-  if (doa4::np::Active() && On(kMovie)) {
+  if (MoviesSkipped()) {
     doa4::np::LogLine(fmt::format("movie {} skipped at frame {} (lr {:08X})", ctx.r3.u32, Frame(),
                                   uint32_t(ctx.lr)));
-    g_movie_skipped.store(true);
     return;
   }
   __imp__sub_8242A168(ctx, base);
 }
 
+// In a session every movie is skipped, so every "finished?" is yes and "stop" has nothing to stop.
 REX_HOOK_RAW(sub_8242A3A8) {
-  if (g_movie_skipped.load()) {
+  if (MoviesSkipped()) {
     ctx.r3.u64 = 1;
     return;
   }
@@ -265,7 +268,7 @@ REX_HOOK_RAW(sub_8242A3A8) {
 }
 
 REX_HOOK_RAW(sub_8242A0F0) {
-  if (g_movie_skipped.exchange(false)) return;
+  if (MoviesSkipped()) return;
   __imp__sub_8242A0F0(ctx, base);
 }
 
