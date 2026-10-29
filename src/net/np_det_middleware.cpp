@@ -50,6 +50,7 @@ REX_EXTERN(__imp__sub_8277EFC8);
 REX_EXTERN(__imp__sub_829BC7F0);
 REX_EXTERN(__imp__sub_829BF498);
 REX_EXTERN(__imp__sub_829C9958);
+REX_EXTERN(__imp__sub_8296DFE8);
 // SDK netplay exports (sdk-np0 src/audio/audio_system.cpp).
 __declspec(dllimport) void rex_audio_lockstep(int on);
 __declspec(dllimport) int rex_audio_advance(uint32_t n, int timeout_ms);
@@ -60,9 +61,12 @@ namespace doa4::np::det {
 namespace {
 
 // ---- audio ----
-// The guest registers its audio client on its own thread, so whether a client exists at a frame
-// boundary is the same in every run: the callbacks start at the first boundary after the
-// registration (before it the budget stays where rex_audio_lockstep(1) put it).
+// The game registers its audio client (sub_8296DFE8, hooked below, which logs "audio: client registered
+// on <main|thread start> at frame F") on the MAIN guest thread: every gate run logged "on main at frame 0".
+// So whether a client exists at a frame boundary is a function of the main thread's own call sequence,
+// which lockstep keeps equal, and the callbacks start at the first boundary after the registration (before
+// it the budget stays where rex_audio_lockstep(1) put it). The SDK worker runs a callback only within the
+// budget, also when its first WaitAny was entered before the lockstep was armed (sdk-np0 audio_system.cpp).
 uint32_t g_audio_late = 0;
 bool g_audio_started = false;
 
@@ -316,6 +320,29 @@ REX_HOOK_RAW(sub_8242A3A8) {
 REX_HOOK_RAW(sub_8242A0F0) {
   if (MoviesSkipped()) return;
   __imp__sub_8242A0F0(ctx, base);
+}
+
+// ---- audio ----
+// sub_8296DFE8(this r3, render callback r4): the game's audio client setup (reached through a vtable, no
+// direct callers); it unregisters the old client and registers the new one with
+// XAudioRegisterRenderDriverClient. In a session the line says which thread registered the client and in
+// which frame, because AudioStep's start frame is only a function of the game if that thread is ordered.
+REX_HOOK_RAW(sub_8296DFE8) {
+  if (!doa4::np::Active()) {
+    __imp__sub_8296DFE8(ctx, base);
+    return;
+  }
+  const uint32_t before = rex_audio_registrations();
+  __imp__sub_8296DFE8(ctx, base);
+  if (rex_audio_registrations() != before) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) {
+      doa4::np::LogLine(
+          IsMainThread() ? fmt::format("audio: client registered on main at frame {}", Frame())
+                         : fmt::format("audio: client registered on thread start {:08X} at frame {}", ThreadStart(),
+                                       Frame()));
+    }
+  }
 }
 
 // ---- loader ----
