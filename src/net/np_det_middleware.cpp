@@ -17,6 +17,9 @@
 //           frame boundary and whenever it spins on the tick count in a frame.
 //   crijob  jobs posted to the middleware's two job threads run inline on the
 //           posting thread.
+//   notify  (the game's XNotifyGetNext polls, not middleware) the frame boundary makes every system
+//           notification queued so far visible to the guest and counts the ones the guest dequeued since
+//           the last boundary (pr_notify); the fix itself is in np_det.cpp / sdk-np0 xnotifylistener.cpp.
 
 #include <xmmintrin.h>
 
@@ -51,14 +54,19 @@ REX_EXTERN(__imp__sub_829BC7F0);
 REX_EXTERN(__imp__sub_829BF498);
 REX_EXTERN(__imp__sub_829C9958);
 REX_EXTERN(__imp__sub_8296DFE8);
-// SDK netplay exports (sdk-np0 src/audio/audio_system.cpp).
+// SDK netplay exports (sdk-np0 src/audio/audio_system.cpp, src/system/xnotifylistener.cpp).
 __declspec(dllimport) void rex_audio_lockstep(int on);
 __declspec(dllimport) int rex_audio_advance(uint32_t n, int timeout_ms);
 __declspec(dllimport) uint32_t rex_audio_registrations();
+__declspec(dllimport) void rex_notify_frame();
+__declspec(dllimport) uint32_t rex_notify_delivered();
 }
 
 namespace doa4::np::det {
 namespace {
+
+// ---- notify ----
+uint32_t g_notify_seen = 0;  // notifications the guest had dequeued at the last boundary (rex_notify_delivered)
 
 // ---- audio ----
 // The game registers its audio client (sub_8296DFE8, hooked below, which logs "audio: client registered
@@ -244,6 +252,12 @@ void MiddlewareStop() {
 }
 
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
+  if (On(kNotify)) {
+    const uint32_t delivered = rex_notify_delivered();  // dequeued by the guest up to this boundary
+    Count(kPrNotify, delivered - g_notify_seen);
+    g_notify_seen = delivered;
+    rex_notify_frame();
+  }
   g_watch.Check(base, frame, nullptr);  // the frame's own changes: not reported
   if (On(kLoader)) LoaderBoundary(base, frame);
   g_watch.Check(base, frame, "in the loader boundary");

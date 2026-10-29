@@ -26,6 +26,10 @@
 //             answer with their default button (headless).
 //   audio, movie, loader, cri, crijob: np_det_middleware.cpp.
 //   workers:  np_det_workers.cpp.
+//   notify    system notifications (XNotifyGetNext) become visible at the frame boundary after they were
+//             queued; notifications about the host's own controllers are dropped (sdk-np0
+//             xnotifylistener.cpp; this SDK posts none, see its DroppedInLockstep). The boundary is in
+//             np_det_middleware.cpp.
 // DOA4_NP_FIX: "all" (the default), "none", a comma list, or "all-x-y" (all but
 // x and y).
 
@@ -60,8 +64,10 @@ REX_EXTERN(__imp__sub_82790138);
 REX_EXTERN(__imp__sub_82792660);
 REX_EXTERN(__imp__sub_82790130);
 REX_EXTERN(__imp__sub_82793B68);
-// SDK netplay exports (sdk-np0 src/system/kernel_state.cpp, src/audio/audio_system.cpp).
+// SDK netplay exports (sdk-np0 src/system/kernel_state.cpp, src/audio/audio_system.cpp,
+// src/system/xnotifylistener.cpp).
 __declspec(dllimport) void rex_overlapped_inline(int on);
+__declspec(dllimport) void rex_notify_lockstep(int on);
 __declspec(dllimport) void rex_audio_lockstep(int on);
 __declspec(dllimport) int rex_audio_worker_callback(uint64_t* index);
 }
@@ -76,7 +82,7 @@ struct FixName {
 constexpr FixName kFixNames[] = {
     {"seed", kSeed},     {"clock", kClock},   {"sdkclock", kSdkClock}, {"xam", kXam},
     {"audio", kAudio},   {"movie", kMovie},   {"loader", kLoader},     {"cri", kCri},
-    {"crijob", kCriJob}, {"workers", kWorkers}};
+    {"crijob", kCriJob}, {"workers", kWorkers}, {"notify", kNotify}};
 
 std::atomic<uint32_t> g_fixes{0};
 std::atomic<uint32_t> g_frame{0};
@@ -207,6 +213,7 @@ void Start(uint64_t seed, const std::filesystem::path& dir) {
     rex::cvar::SetFlagByName("headless", "true");
   }
   MiddlewareStart();
+  if (fixes & kNotify) rex_notify_lockstep(1);  // everything queued so far is visible; later ones at a boundary
 }
 
 void OnFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
@@ -222,6 +229,7 @@ void Stop() {
   MiddlewareStop();  // a loader job waiting at the gate sees Stopped() now, not after its 500 ms timeout
   const uint32_t fixes = g_fixes.load(std::memory_order_acquire);
   if (fixes & kAudio) rex_audio_lockstep(0);  // audio and XMA lockstep off (sdk-np0 audio_system.cpp:420)
+  if (fixes & kNotify) rex_notify_lockstep(0);  // the guest sees every queued notification again
   if (fixes & kXam) {
     rex_overlapped_inline(0);
     rex::cvar::SetFlagByName("headless", g_headless_before);
@@ -230,8 +238,9 @@ void Stop() {
   const auto state = [&](uint32_t bit) { return (fixes & bit) ? "released" : "never held"; };
   LogLine(fmt::format(
       "determinism layer off: lockstep audio {}, inline completions and headless {} (headless is now '{}', was '{}'), "
-      "clock override {}",
-      state(kAudio), state(kXam), rex::cvar::GetFlagByName("headless"), g_headless_before, state(kSdkClock)));
+      "clock override {}, notification lockstep {}",
+      state(kAudio), state(kXam), rex::cvar::GetFlagByName("headless"), g_headless_before, state(kSdkClock),
+      state(kNotify)));
 }
 
 }  // namespace doa4::np::det
