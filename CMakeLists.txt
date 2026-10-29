@@ -38,6 +38,9 @@ set(DEADORALIVE4_SOURCES
     src/net/np_core.cpp
     src/net/np_session.cpp
     src/net/np_det.cpp
+    src/net/np_det_middleware.cpp
+    src/net/np_det_workers.cpp
+    src/net/np_det_trace.cpp
 )
 
 if(WIN32)
