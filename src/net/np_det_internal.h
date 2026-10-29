@@ -55,6 +55,9 @@ void Count(Counter c, uint32_t n = 1);
 
 // np_det_middleware.cpp
 void MiddlewareStart();
+// The game created a thread through its CreateThread path (called from ThreadCreated): CRI server
+// thread B makes the first frame boundary after it wait until B is in its loop.
+void MiddlewareThreadCreated(uint32_t start);  // np_det_middleware.cpp
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base);
 // Called by Stop() once Stopped() is true: wakes a loader job waiting at the frame-boundary gate so it
 // sees Stopped() at once.

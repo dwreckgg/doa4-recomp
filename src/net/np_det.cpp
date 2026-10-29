@@ -18,6 +18,9 @@
 //             and the system time (the inline mftb sites and the direct
 //             KeQuerySystemTime imports), through the SDK's guest-time override;
 //             guest threads only (the GPU vblank thread keeps the host clock).
+//             The SDK's audio worker, while it runs the guest audio callback, gets
+//             time from the callback number instead (AudioTimebase,
+//             rex_audio_worker_callback), the same in every run.
 //   xam       XAM's deferred overlapped completions (message boxes, content,
 //             enumerators) complete inline with no host delay, and XAM dialogs
 //             answer with their default button (headless).
@@ -60,6 +63,7 @@ REX_EXTERN(__imp__sub_82793B68);
 // SDK netplay exports (sdk-np0 src/system/kernel_state.cpp, src/audio/audio_system.cpp).
 __declspec(dllimport) void rex_overlapped_inline(int on);
 __declspec(dllimport) void rex_audio_lockstep(int on);
+__declspec(dllimport) int rex_audio_worker_callback(uint64_t* index);
 }
 
 namespace doa4::np::det {
@@ -117,9 +121,15 @@ uint32_t ParseFixes(const char* text) {
 thread_local ThreadClock t_clock;
 
 // The SDK's guest-time override: guest threads get the virtual clocks; host
-// threads (GPU vblank, audio worker, kernel dispatch) keep the host clock.
+// threads (GPU vblank, kernel dispatch) keep the host clock; the audio worker, while it runs
+// a guest audio callback, gets time from its callback number (np_core.h AudioTimebase).
 bool GuestTime(int kind, uint64_t* value) {
   if (!On(kSdkClock)) return false;
+  uint64_t cb;
+  if (rex_audio_worker_callback(&cb)) {  // the SDK audio worker running a guest callback
+    *value = kind == 0 ? AudioTimebase(cb) : AudioFileTime(cb);
+    return true;
+  }
   // GetCurrentThread asserts on a thread that is not bound to an XThread (a debug SDK), so ask first.
   if (!rex::system::XThread::IsInThread()) return false;  // a plain host thread (no XThread)
   rex::system::XThread* thread = rex::system::XThread::GetCurrentThread();
@@ -169,7 +179,10 @@ bool IsMainThread() {
   return t && t->main_thread();
 }
 
-void ThreadCreated(uint32_t start, uint32_t tid) { WorkerCreated(start, tid); }
+void ThreadCreated(uint32_t start, uint32_t tid) {
+  WorkerCreated(start, tid);
+  MiddlewareThreadCreated(start);
+}
 
 void Start(uint64_t seed, const std::filesystem::path& dir) {
   g_seed = seed;
@@ -243,6 +256,11 @@ REX_HOOK_RAW(sub_82334C60) {
 // a frame is a wait loop: the middleware takes one step first (SpinRead).
 REX_HOOK_RAW(sub_82790138) {
   if (doa4::np::Active() && On(kClock)) {
+    uint64_t cb;
+    if (rex_audio_worker_callback(&cb)) {  // the SDK audio worker's callback: time from its callback number
+      ctx.r3.u64 = doa4::np::AudioTickCount(cb);
+      return;
+    }
     if (IsMainThread()) SpinRead(ctx, base, uint32_t(ctx.lr));
     ctx.r3.u64 = doa4::np::VirtualTickCount(&t_clock, Frame());
     TraceRead(kRdTick, uint32_t(ctx.lr));
@@ -254,6 +272,12 @@ REX_HOOK_RAW(sub_82790138) {
 // QueryPerformanceCounter: *(u64*)r3 = mftb; returns 1.
 REX_HOOK_RAW(sub_82792660) {
   if (doa4::np::Active() && On(kClock)) {
+    uint64_t cb;
+    if (rex_audio_worker_callback(&cb)) {  // the SDK audio worker's callback: time from its callback number
+      rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, doa4::np::AudioTimebase(cb));
+      ctx.r3.u64 = 1;
+      return;
+    }
     rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, doa4::np::VirtualTimebase(&t_clock, Frame()));
     TraceRead(kRdQpc, uint32_t(ctx.lr));
     ctx.r3.u64 = 1;
@@ -265,6 +289,11 @@ REX_HOOK_RAW(sub_82792660) {
 // KeQuerySystemTime(FILETIME* r3).
 REX_HOOK_RAW(sub_82790130) {
   if (doa4::np::Active() && On(kClock) && ctx.r3.u32) {
+    uint64_t cb;
+    if (rex_audio_worker_callback(&cb)) {  // the SDK audio worker's callback: time from its callback number
+      rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, doa4::np::AudioFileTime(cb));
+      return;
+    }
     rex::memory::store_and_swap<uint64_t>(base + ctx.r3.u32, doa4::np::VirtualFileTime(&t_clock, Frame()));
     TraceRead(kRdFileTime, uint32_t(ctx.lr));
     return;

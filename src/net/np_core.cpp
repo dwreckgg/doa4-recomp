@@ -434,6 +434,10 @@ uint64_t VirtualFileTime(ThreadClock* c, uint32_t frame) {
   return c->last_ft;
 }
 
+uint64_t AudioTimebase(uint64_t callback) { return kTimebaseBase + callback * 256 * kTimebaseHz / 48000; }
+uint32_t AudioTickCount(uint64_t callback) { return kTickBase + uint32_t(callback * 256 * 1000 / 48000); }
+uint64_t AudioFileTime(uint64_t callback) { return kFileTimeBase + callback * 256 * 10000000 / 48000; }
+
 uint32_t MtSeed(uint64_t session_seed, uint32_t state, uint32_t k) {
   uint64_t x = session_seed ^ (uint64_t(state) << 32) ^ (uint64_t(k) * 0x9E3779B97F4A7C15ull);
   x += 0x9E3779B97F4A7C15ull;  // splitmix64 finaliser

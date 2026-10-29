@@ -188,6 +188,12 @@ uint64_t VirtualTimebase(ThreadClock* c, uint32_t frame);   // strictly increasi
 uint32_t VirtualTickCount(ThreadClock* c, uint32_t frame);  // never decreasing per thread
 uint64_t VirtualFileTime(ThreadClock* c, uint32_t frame);   // strictly increasing per thread
 
+// The SDK audio worker's clock while it runs a guest audio callback (rex_audio_worker_callback):
+// time from the callback number since the lockstep started, 256 samples at 48 kHz per callback.
+uint64_t AudioTimebase(uint64_t callback);
+uint32_t AudioTickCount(uint64_t callback);
+uint64_t AudioFileTime(uint64_t callback);
+
 // ---- Mersenne Twister seeds (the determinism layer's "seed" fix) ----
 // Every seeding of one of the game's MTs (sub_82334C60, state = the MT's address) gets a value derived
 // from the session seed, the MT's address and k, the number of times that MT was seeded before in the

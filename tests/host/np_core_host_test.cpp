@@ -275,6 +275,46 @@ static void TestVirtualClocks() {
   CHECK(VirtualTimebase(&other, 1) == kTimebaseBase + 833333 + 500);
   CHECK(VirtualTickCount(&other, 1) == kTickBase + 16);
   CHECK(VirtualFileTime(&other, 1) == kFileTimeBase + 166666 + 100);
+
+  // The step edge and a frame where two spellings of the formula disagree (review of Task 5, #0330).
+  // Tick count: read n of a frame (1-based) returns (n - 1) >> 4 ms past the frame's start, so the first
+  // step is at read 17: 15 -> +0, 16 -> +0, 17 -> +1. NOT the pre-increment spelling (++reads >> 4),
+  // which steps at read 16; the reads 1 and 302 above give the same answers under both.
+  ThreadClock edge;
+  for (int i = 0; i < 14; ++i) VirtualTickCount(&edge, 0);
+  CHECK(VirtualTickCount(&edge, 0) == kTickBase);      // read 15
+  CHECK(VirtualTickCount(&edge, 0) == kTickBase);      // read 16
+  CHECK(VirtualTickCount(&edge, 0) == kTickBase + 1);  // read 17
+  // Frame 3, a new thread's first read. 3 * 50,000,000 / 60 = 2,500,000 (NOT frame * (50,000,000 / 60) =
+  // 3 * 833,333 = 2,499,999); 3 * 1000 / 60 = 50 ms (NOT 3 * 16 = 48); 3 * 10,000,000 / 60 = 500,000
+  // (NOT 3 * 166,666 = 499,998). Then the first read's own step: 500 time base, 100 FILETIME, +0 ms.
+  ThreadClock f3tb, f3tick, f3ft;
+  CHECK(VirtualTimebase(&f3tb, 3) == kTimebaseBase + 2500000 + 500);
+  CHECK(VirtualTickCount(&f3tick, 3) == kTickBase + 50);
+  CHECK(VirtualFileTime(&f3ft, 3) == kFileTimeBase + 500000 + 100);
+}
+
+// The SDK audio worker's clock (np_core.h): one callback renders 256 samples at 48 kHz, so callback n
+// is n * 256 / 48000 s after the lockstep started. Derived: 3 callbacks = 768 samples = 16 ms =
+// 800,000 ticks of 50 MHz = 160,000 FILETIME units; 2 callbacks = 512 samples = 10.67 ms, truncated to 10.
+static void TestAudioClocks() {
+  CHECK(AudioTimebase(0) == kTimebaseBase);
+  CHECK(AudioTimebase(3) == kTimebaseBase + 800000);  // 768 samples = 16 ms of 50 MHz ticks
+  CHECK(AudioTickCount(3) == kTickBase + 16);
+  CHECK(AudioTickCount(2) == kTickBase + 10);         // 512 samples = 10.67 ms, truncated
+  CHECK(AudioFileTime(3) == kFileTimeBase + 160000);
+
+  // Beyond the supplied checks (each passes on the formulas as written; proved by a mutation probe).
+  // The division truncates the whole product, not each callback: 1 callback = 266,666.67 ticks,
+  // 2 = 533,333.33 (NOT 2 * 266,666 = 533,332). And the product does not overflow 32 bits: a 6,995-frame
+  // session runs about 21,900 callbacks and 100,000 callbacks * 256 * 1000 = 2.56e10 > 2^32 (the tick
+  // count truncates 533,333.33 ms; the time base 100,000 * 256 * 50e6 / 48000 = 26,666,666,666.67; FILETIME
+  // 100,000 * 256 * 10e6 / 48000 = 5,333,333,333.33).
+  CHECK(AudioTimebase(1) == kTimebaseBase + 266666);
+  CHECK(AudioTimebase(2) == kTimebaseBase + 533333);
+  CHECK(AudioTickCount(100000) == kTickBase + 533333);
+  CHECK(AudioTimebase(100000) == kTimebaseBase + 26666666666ull);
+  CHECK(AudioFileTime(100000) == kFileTimeBase + 5333333333ull);
 }
 
 // The seed an MT gets at its (k + 1)th seeding in a session, and the per-MT count that makes k.
@@ -339,6 +379,7 @@ int main() {
   TestSweep();
   TestCounters();
   TestVirtualClocks();
+  TestAudioClocks();
   TestMtSeeds();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;

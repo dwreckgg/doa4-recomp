@@ -4,7 +4,9 @@
 // points fixed by the game's own calls instead of at host-timed points.
 //   audio   the guest audio callbacks run within a per-frame budget of
 //           800 samples (3 or 4 callbacks of 256) granted at the frame hook,
-//           from boot (Tekken 6 rex_audio_lockstep / rex_audio_advance).
+//           from the first frame boundary after the guest registered its audio
+//           client (Tekken 6 rex_audio_lockstep / rex_audio_advance;
+//           rex_audio_registrations).
 //   movie   movies are not played (sub_8242A168 returns at once, "finished"
 //           answers yes): CRI Sofdec playback ran on the middleware's threads in
 //           host time, so a movie took a different number of frames per run.
@@ -51,26 +53,30 @@ REX_EXTERN(__imp__sub_829C9958);
 // SDK netplay exports (sdk-np0 src/audio/audio_system.cpp).
 __declspec(dllimport) void rex_audio_lockstep(int on);
 __declspec(dllimport) int rex_audio_advance(uint32_t n, int timeout_ms);
+__declspec(dllimport) uint32_t rex_audio_registrations();
 }
 
 namespace doa4::np::det {
 namespace {
 
 // ---- audio ----
-bool g_audio_alive = false;
+// The guest registers its audio client on its own thread, so whether a client exists at a frame
+// boundary is the same in every run: the callbacks start at the first boundary after the
+// registration (before it the budget stays where rex_audio_lockstep(1) put it).
 uint32_t g_audio_late = 0;
+bool g_audio_started = false;
 
 void AudioStep(uint32_t f) {
+  if (rex_audio_registrations() == 0) return;
   const uint32_t n = uint32_t((uint64_t(f) + 1) * 800 / 256 - uint64_t(f) * 800 / 256);
-  if (rex_audio_advance(n, g_audio_alive ? 250 : 2)) {
-    if (!g_audio_alive) LogLine("audio: first callbacks in the lockstep at frame " + std::to_string(f));
-    g_audio_alive = true;
-  } else if (!g_audio_alive) {
-    rex_audio_lockstep(1);  // no audio client yet: drop the budget again
-  } else {
-    Count(kFbAudioLate);
-    if (g_audio_late++ < 20) LogLine("audio: frame " + std::to_string(f) + ": callbacks not done after 250 ms");
+  if (rex_audio_advance(n, 250)) {
+    if (!g_audio_started) LogLine("audio: callbacks start at frame " + std::to_string(f));
+    g_audio_started = true;
+    return;
   }
+  Count(g_audio_started ? kFbAudioLate : kFbAudioStart);
+  if (g_audio_late++ < 20) LogLine("audio: frame " + std::to_string(f) + ": callbacks not done after 250 ms");
+  g_audio_started = true;
 }
 
 // ---- loader ----
@@ -137,9 +143,14 @@ void LoaderBoundary(uint8_t* base, uint32_t frame) {
 // do nothing; the main thread runs groups 2, 6, 4 at every frame boundary and
 // once more for every repeated tick-count read from one call site in a frame
 // (the game's wait loops read it for their timeouts), so each iteration of such
-// a loop sees the state after one more pass.
+// a loop sees the state after one more pass. The passes start at the first frame boundary after the game
+// created thread B (the thread-creation hook) and B reached its loop: the boundary waits for B, so the
+// first pass does not depend on how fast the host starts the thread.
 constexpr uint32_t kCriThreadA = 0x829BC458, kCriThreadB = 0x829BC8F8, kCriThreadC = 0x829BC980;
 std::atomic<bool> g_cri_ready{false};  // thread B reached its loop: the middleware is set up
+std::atomic<bool> g_cri_created{false};  // the game created server thread B (thread-creation hook)
+std::mutex g_cri_mu;
+std::condition_variable g_cri_cv;
 thread_local bool t_on_main_pass = false;
 uint32_t g_spin_steps_frame = 0, g_spin_steps_window = 0, g_spin_steps_max = 0;
 std::vector<std::pair<uint32_t, uint32_t>> g_spin_lrs;  // main thread: tick-read LR -> reads this frame
@@ -189,6 +200,10 @@ Watch g_watch;
 
 }  // namespace
 
+void MiddlewareThreadCreated(uint32_t start) {
+  if (start == kCriThreadB) g_cri_created.store(true, std::memory_order_release);
+}
+
 void MiddlewareStart() {
   g_watch.Init();
   if (On(kAudio)) rex_audio_lockstep(1);
@@ -201,6 +216,9 @@ void MiddlewareStart() {
 void MiddlewareStop() {
   { std::lock_guard lk(g_loader_mu); }
   g_loader_cv.notify_all();
+  // Same for the frame boundary's wait for CRI thread B (its predicate also ends on Stopped()).
+  { std::lock_guard lk(g_cri_mu); }
+  g_cri_cv.notify_all();
 }
 
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
@@ -215,6 +233,15 @@ void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
       g_spin_steps_window = g_spin_steps_max = 0;
     }
     g_spin_steps_frame = 0;
+    // Thread B was created by the game at a fixed point; the first pass waits until it is in its
+    // loop, so the passes start at the same boundary in every run whatever the host's timing.
+    if (g_cri_created.load(std::memory_order_acquire) && !g_cri_ready.load(std::memory_order_acquire)) {
+      std::unique_lock lk(g_cri_mu);
+      if (!g_cri_cv.wait_for(lk, std::chrono::seconds(2), [] { return g_cri_ready.load() || Stopped(); })) {
+        Count(kFbCriReady);
+        LogLine("cri: frame " + std::to_string(frame) + ": server thread B not in its loop 2 s after it was created");
+      }
+    }
     CriPass(ctx, base);
   }
   g_watch.Check(base, frame, "in the CRI pass");
@@ -316,6 +343,8 @@ REX_HOOK_RAW(sub_8277EFC8) {
 REX_HOOK_RAW(sub_829BC7F0) {
   if (doa4::np::Active() && On(kCri) && ThreadStart() == kCriThreadB && !g_cri_ready.exchange(true)) {
     doa4::np::LogLine("cri: server threads running at frame " + std::to_string(Frame()));
+    { std::lock_guard lk(g_cri_mu); }
+    g_cri_cv.notify_all();
   }
   __imp__sub_829BC7F0(ctx, base);
 }
