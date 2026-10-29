@@ -597,7 +597,10 @@ void Start(Host host) {
         Log("script " + path + ": " + std::to_string(script.frames.size()) + " frames");
       }
     }
-    Log("record: seed " + std::to_string(s.seed) + ", " + std::to_string(meta.size()) + " bytes of meta");
+    // (the meta bytes of the header just written, not the meta string's size: a header written without
+    // the meta must show 0 here)
+    Log("record: seed " + std::to_string(s.seed) + ", " + std::to_string(head.size() - kRecHeaderBytes) +
+        " bytes of meta");
   }
   if (const std::string q = Env("DOA4_NP_QUIT"); !q.empty()) s.quit_frame = std::strtoul(q.c_str(), nullptr, 10);
   s.shot_frames = FrameList(Env("DOA4_NP_SHOTS"));
