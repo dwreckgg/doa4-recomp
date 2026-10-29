@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/hash.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -35,6 +36,7 @@
 #include "generated/default/dead_or_alive_4_init.h"
 
 #include "../doa4_photo_win.h"
+#include "../doa4_tweaks.h"
 #include "np_core.h"
 #include "np_det.h"
 #include "np_det_internal.h"
@@ -99,8 +101,10 @@ struct State {
   uint32_t sweep_per_frame = 4;
   std::vector<uint8_t> scratch;
   std::vector<uint64_t> row;
-  std::vector<std::vector<Mask>> block_masks;  // per sweep block: kSweepMasks inside it
-  bool timing_logged = false;                  // HoldFrameTiming's one log line
+  // Per sweep block k: its address range and the kSweepMasks inside it, built once in Start so that
+  // hashing a block never allocates.
+  std::vector<Region> block_regions;
+  bool timing_logged = false;  // HoldFrameTiming's one log line
 
   // timing (QPC ticks)
   double qpc_us = 0;
@@ -165,6 +169,33 @@ bool ReadFile(const std::filesystem::path& path, std::string* out) {
   ss << in.rdbuf();
   *out = ss.str();
   return true;
+}
+
+// The exe and the runtime DLL beside it (XXH3), as 16 hex digits: two PCs replay one recording only
+// with the same build.
+std::string BuildId() {
+  std::wstring path(32768, L'\0');
+  const DWORD n = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+  const std::filesystem::path exe(path.substr(0, n));
+  uint64_t h = 0;
+  for (const std::filesystem::path& p : {exe, exe.parent_path() / "rexruntime.dll"}) {
+    std::string bytes;
+    if (ReadFile(p, &bytes)) h = XXH3_64bits_withSeed(bytes.data(), bytes.size(), h);
+  }
+  return fmt::format("{:016x}", h);
+}
+
+// The recording's meta text (np_core.h): what a replay must match to run at all. The tweaks patch the
+// game's tables at boot (SetUpExtras, before this runs), so their state is part of the build.
+std::string CurrentMeta(uint32_t sweep_per_frame) {
+  std::string tweaks;
+  for (const auto& t : doa4::tweaks::AllTweaks()) {
+    tweaks += fmt::format("{}{}={}", tweaks.empty() ? "" : ",", t.cvar, rex::cvar::Query<bool>(t.cvar) ? 1 : 0);
+  }
+  const std::string serial = Env("DOA4_NP_SERIAL");
+  return "build=" + BuildId() + "\nfixes=" + det::FixSetName() + "\nserial=" +
+         (serial.empty() ? std::string("default") : serial) + "\nsweep=" + std::to_string(sweep_per_frame) +
+         "\ntweaks=" + tweaks + "\n";
 }
 
 // Reads and deletes a request file; false if it is not there.
@@ -336,10 +367,10 @@ void HashFrame(State& s, uint8_t* base, uint32_t f) {
     for (uint32_t i = 0; i < s.sweep_per_frame; ++i) {
       const uint32_t k = (first + i) % nblocks;
       const uint32_t lo = kDataLo + k * kBlock;
-      if (s.block_masks[k].empty()) {
+      const Region& r = s.block_regions[k];
+      if (r.masks.empty()) {
         s.row[i] = XXH3_64bits(base + lo, kBlock);
       } else {
-        const Region r{"", lo, kBlock, s.block_masks[k]};
         MaskedCopy(r, base + lo, &s.scratch);
         s.row[i] = XXH3_64bits(s.scratch.data(), s.scratch.size());
       }
@@ -516,6 +547,15 @@ void Start(Host host) {
   LARGE_INTEGER freq;
   QueryPerformanceFrequency(&freq);
   s.qpc_us = 1e6 / double(freq.QuadPart);
+  // The sweep setting is part of the recording's meta, so it is read before the recording is opened.
+  const std::string sweep = Env("DOA4_NP_SWEEP");
+  const uint32_t nblocks = (kDataHi - kDataLo) / kBlock;
+  if (sweep == "all") {
+    s.sweep_per_frame = nblocks;
+  } else if (!sweep.empty()) {
+    s.sweep_per_frame = std::clamp<uint32_t>(std::strtoul(sweep.c_str(), nullptr, 10), 1, nblocks);
+  }
+  const std::string meta = CurrentMeta(s.sweep_per_frame);
 
   std::string error;
   if (s.mode == Mode::kReplay) {
@@ -529,12 +569,23 @@ void Start(Host host) {
     s.seed = s.replay.seed;
     Log("replay " + rec.string() + ": " + std::to_string(s.replay.frames.size()) + " frames, seed " +
         std::to_string(s.seed) + (note.empty() ? "" : " (" + note + ")"));
+    // A recording made by another build, fix set, worker mode, sweep setting or tweak state would end in
+    // a desync nobody can read: refuse it, with the reason (DOA4_NP_ALLOW_MISMATCH=1 is for hunting).
+    if (const std::string why = MetaMismatch(s.replay.meta, meta); !why.empty()) {
+      if (Env("DOA4_NP_ALLOW_MISMATCH") != "1") {
+        Log("refused: the recording was made with a different " + why);
+        s.mode = Mode::kOff;
+        if (s.host.quit) s.host.quit();
+        return;
+      }
+      Log("replaying anyway (DOA4_NP_ALLOW_MISMATCH=1): " + why);
+    }
   } else {
     if (const std::string seed = Env("DOA4_NP_SEED"); !seed.empty()) {
       s.seed = std::strtoull(seed.c_str(), nullptr, 0);
     }
     s.rec = _wfopen((s.dir / "rec.d4r").wstring().c_str(), L"wb");
-    const std::string head = EncodeRecHeader(s.seed, 0);
+    const std::string head = EncodeRecHeader(s.seed, 0, meta);
     if (s.rec) std::fwrite(head.data(), 1, head.size(), s.rec);
     if (const std::string path = Env("DOA4_NP_SCRIPT"); !path.empty()) {
       std::string text;
@@ -546,19 +597,12 @@ void Start(Host host) {
         Log("script " + path + ": " + std::to_string(script.frames.size()) + " frames");
       }
     }
-    Log("record: seed " + std::to_string(s.seed));
+    Log("record: seed " + std::to_string(s.seed) + ", " + std::to_string(meta.size()) + " bytes of meta");
   }
   if (const std::string q = Env("DOA4_NP_QUIT"); !q.empty()) s.quit_frame = std::strtoul(q.c_str(), nullptr, 10);
   s.shot_frames = FrameList(Env("DOA4_NP_SHOTS"));
   s.shot_every = std::strtoul(Env("DOA4_NP_SHOT_EVERY").c_str(), nullptr, 10);
   s.dump_frames = FrameList(Env("DOA4_NP_DUMP"));
-  const std::string sweep = Env("DOA4_NP_SWEEP");
-  const uint32_t nblocks = (kDataHi - kDataLo) / kBlock;
-  if (sweep == "all") {
-    s.sweep_per_frame = nblocks;
-  } else if (!sweep.empty()) {
-    s.sweep_per_frame = std::clamp<uint32_t>(std::strtoul(sweep.c_str(), nullptr, 10), 1, nblocks);
-  }
 
   s.regions = DigestRegions();
   s.digest = _wfopen((s.dir / "digest.d4d").wstring().c_str(), L"wb");
@@ -574,11 +618,11 @@ void Start(Host host) {
   {
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
     for (const SweepMask& m : kSweepMasks) ranges.push_back({m.address, m.length});
-    s.block_masks = BlockMasks(kDataLo, kBlock, (kDataHi - kDataLo) / kBlock, ranges);
+    s.block_regions = BlockRegions(kDataLo, kBlock, nblocks, ranges);
     uint32_t masked = 0, blocks = 0;
-    for (const auto& b : s.block_masks) {
-      blocks += b.empty() ? 0 : 1;
-      for (const Mask& m : b) masked += m.length;
+    for (const Region& b : s.block_regions) {
+      blocks += b.masks.empty() ? 0 : 1;
+      for (const Mask& m : b.masks) masked += m.length;
     }
     Log("sweep masks: " + std::to_string(std::size(kSweepMasks)) + " ranges, " + std::to_string(masked) +
         " bytes in " + std::to_string(blocks) + " blocks hashed as zero");

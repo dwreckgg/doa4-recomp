@@ -184,17 +184,22 @@ void ThreadCreated(uint32_t start, uint32_t tid) {
   MiddlewareThreadCreated(start);
 }
 
+std::string FixSetName() {
+  const uint32_t fixes = ParseFixes(std::getenv("DOA4_NP_FIX"));
+  std::string names;
+  for (const FixName& f : kFixNames) {
+    if (fixes & f.bit) names += std::string(names.empty() ? "" : ",") + f.name;
+  }
+  return names.empty() ? std::string("none") : names;
+}
+
 void Start(uint64_t seed, const std::filesystem::path& dir) {
   g_seed = seed;
   g_seeds.Reset();  // the series counts the seedings of this session
   TraceStart(dir);
   const uint32_t fixes = ParseFixes(std::getenv("DOA4_NP_FIX"));
   g_fixes.store(fixes, std::memory_order_release);
-  std::string names;
-  for (const FixName& f : kFixNames) {
-    if (fixes & f.bit) names += std::string(names.empty() ? "" : ",") + f.name;
-  }
-  LogLine("determinism fixes: " + (names.empty() ? std::string("none") : names));
+  LogLine("determinism fixes: " + FixSetName());
   if (fixes & kSdkClock) rex::chrono::Clock::set_guest_time_override(&GuestTime);
   g_headless_before = rex::cvar::GetFlagByName("headless");
   if (fixes & kXam) {

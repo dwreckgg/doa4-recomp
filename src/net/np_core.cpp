@@ -297,13 +297,14 @@ FrameInput InputQueue::Next(uint32_t frame, std::vector<ScriptEvent::Kind>* fire
   return neutral;
 }
 
-std::string EncodeRecHeader(uint64_t seed, uint32_t flags) {
+std::string EncodeRecHeader(uint64_t seed, uint32_t flags, std::string_view meta) {
   std::string s = "D4NPREC1";
-  PutLe32(&s, 1);
+  PutLe32(&s, 2);
   PutLe32(&s, uint32_t(kRecFrameBytes));
   PutLe64(&s, seed);
   PutLe32(&s, flags);
-  PutLe32(&s, 0);
+  PutLe32(&s, uint32_t(meta.size()));
+  s.append(meta);
   return s;
 }
 
@@ -324,16 +325,27 @@ bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error,
     *error = "not a DOA4 netplay recording";
     return false;
   }
-  if (GetLe32(p + 8) != 1 || GetLe32(p + 12) != kRecFrameBytes) {
+  const uint32_t version = GetLe32(p + 8);
+  if ((version != 1 && version != 2) || GetLe32(p + 12) != kRecFrameBytes) {
     *error = "unsupported recording version";
     return false;
   }
   out->seed = GetLe64(p + 16);
   out->flags = GetLe32(p + 24);
-  const size_t body = bytes.size() - kRecHeaderBytes;
+  size_t head = kRecHeaderBytes;
+  if (version == 2) {
+    const uint32_t meta = GetLe32(p + 28);
+    if (bytes.size() < kRecHeaderBytes + size_t(meta)) {
+      *error = "recording header cut short";
+      return false;
+    }
+    out->meta.assign(bytes.substr(kRecHeaderBytes, meta));
+    head += meta;
+  }
+  const size_t body = bytes.size() - head;
   const size_t n = body / kRecFrameBytes;
   for (size_t i = 0; i < n; ++i) {
-    const uint8_t* f = p + kRecHeaderBytes + i * kRecFrameBytes;
+    const uint8_t* f = p + head + i * kRecFrameBytes;
     FrameInput in;
     in.connected = f[0];
     for (int u = 0; u < kUsers; ++u) in.pad[u] = PadFromGuest(f + 4 + 12 * u);
@@ -343,6 +355,32 @@ bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error,
     *note = "dropped a partial last frame (" + std::to_string(body % kRecFrameBytes) + " bytes)";
   }
   return true;
+}
+
+namespace {
+// The value of the line "<key>=<value>" in `meta`, or "(none)" when there is no such line.
+std::string MetaValue(std::string_view meta, std::string_view key) {
+  size_t at = 0;
+  while (at < meta.size()) {
+    size_t end = meta.find('\n', at);
+    if (end == std::string_view::npos) end = meta.size();
+    const std::string_view line = meta.substr(at, end - at);
+    if (line.size() > key.size() && line.substr(0, key.size()) == key && line[key.size()] == '=') {
+      return std::string(line.substr(key.size() + 1));
+    }
+    at = end + 1;
+  }
+  return "(none)";
+}
+}  // namespace
+
+std::string MetaMismatch(std::string_view recorded, std::string_view current) {
+  std::string out;
+  for (std::string_view key : {"build", "fixes", "serial", "sweep", "tweaks"}) {
+    const std::string a = MetaValue(recorded, key), b = MetaValue(current, key);
+    if (a != b) out += (out.empty() ? "" : "; ") + std::string(key) + " " + a + " vs " + b;
+  }
+  return out;
 }
 
 void MaskedCopy(const Region& region, const uint8_t* bytes, std::vector<uint8_t>* out) {
@@ -398,6 +436,15 @@ std::vector<std::vector<Mask>> BlockMasks(uint32_t lo, uint32_t block, uint32_t 
       a = stop;
     }
   }
+  return out;
+}
+
+std::vector<Region> BlockRegions(uint32_t lo, uint32_t block, uint32_t nblocks,
+                                 const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  std::vector<std::vector<Mask>> masks = BlockMasks(lo, block, nblocks, ranges);
+  std::vector<Region> out;
+  out.reserve(nblocks);
+  for (uint32_t k = 0; k < nblocks; ++k) out.push_back(Region{"", lo + k * block, block, std::move(masks[k])});
   return out;
 }
 

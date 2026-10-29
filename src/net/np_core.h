@@ -113,25 +113,32 @@ class InputQueue {
 };
 
 // ---- Recordings ----
-// Header (32 bytes): "D4NPREC1", u32 version (1), u32 frame bytes (52),
-// u64 session seed, u32 flags, u32 reserved. Then one 52-byte record per frame
-// from frame 0: u8 connected mask, 3 zero bytes, 4 x 12 guest gamepad bytes.
+// Header (32 bytes): "D4NPREC1", u32 version (2; 1 = the proof's, still read), u32 frame bytes (52),
+// u64 session seed, u32 flags, u32 meta bytes (0 in version 1). Version 2 then holds the meta text
+// ("key=value" lines: build, fixes, serial, sweep, tweaks) before the frames. Then one 52-byte record
+// per frame from frame 0: u8 connected mask, 3 zero bytes, 4 x 12 guest gamepad bytes.
 // A recording cut short by a crash is still readable (whole frames only).
 inline constexpr size_t kRecHeaderBytes = 32;
 inline constexpr size_t kRecFrameBytes = 52;
 
-std::string EncodeRecHeader(uint64_t seed, uint32_t flags);
+// Always writes version 2; `meta` = "key=value" lines.
+std::string EncodeRecHeader(uint64_t seed, uint32_t flags, std::string_view meta = {});
 std::string EncodeRecFrame(const FrameInput& input);
 
 struct Recording {
   uint64_t seed = 0;
   uint32_t flags = 0;
+  std::string meta;  // empty for version 1
   std::vector<FrameInput> frames;
 };
 // Returns false with the reason on a bad header; a trailing partial frame is
 // dropped (reported in *note).
 bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error,
                      std::string* note = nullptr);
+// "" when the keys build, fixes, serial, sweep and tweaks of two meta texts agree (a key missing from
+// one text, as in a version-1 recording, reads "(none)"); else "<key> <recorded> vs <current>; ..." in
+// that key order. Other keys are ignored.
+std::string MetaMismatch(std::string_view recorded, std::string_view current);
 
 // ---- Digest regions ----
 // A guest region hashed every frame, minus masked byte ranges (host-timing
@@ -165,6 +172,11 @@ uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks);
 // that touch it, as offsets within the block; a range across a block border is split.
 std::vector<std::vector<Mask>> BlockMasks(uint32_t lo, uint32_t block, uint32_t nblocks,
                                           const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+// BlockMasks as ready-made Regions: element k is {"", lo + k * block, block, block k's masks}. The sweep
+// builds them once at Start and hashes through them (MaskedCopy), so hashing a masked block allocates
+// nothing; the bytes hashed are those of Region{"", lo + k * block, block, BlockMasks(...)[k]}.
+std::vector<Region> BlockRegions(uint32_t lo, uint32_t block, uint32_t nblocks,
+                                 const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
 // Counter file: "D4NPCNT1", u32 version (1), u32 counter count, then per counter char name[24];
 // then per frame u32 frame, u32 0, u32 value per counter (values as they are when the frame's
 // state is hashed). Names starting "fb_" count fallbacks (a wait gave up and the game ran on: must

@@ -28,4 +28,9 @@ void Stop();
 const std::vector<std::string>& CounterNames();
 void CounterValues(std::vector<uint32_t>* out);
 
+// The fix names this session uses (from DOA4_NP_FIX), comma separated in fix order, or "none": as
+// Start logs them and the recording's meta holds them. Reads the environment, so it answers the same
+// before and after Start.
+std::string FixSetName();
+
 }  // namespace doa4::np::det

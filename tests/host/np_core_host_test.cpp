@@ -193,6 +193,73 @@ static void TestRecording() {
   bad[0] = 'X';
   CHECK(!DecodeRecording(bad, &r, &error));
   CHECK(!DecodeRecording(bytes.substr(0, 10), &r, &error));
+
+  // Version 2: the meta text follows the 32-byte header.
+  std::string v2 = EncodeRecHeader(7, 0, "build=ab\nfixes=all\n");
+  CHECK(v2.size() == kRecHeaderBytes + 19);
+  CHECK(uint8_t(v2[8]) == 2 && uint8_t(v2[28]) == 19);
+  v2 += EncodeRecFrame(a);
+  CHECK(DecodeRecording(v2, &r, &error, &note));
+  CHECK(r.meta == "build=ab\nfixes=all\n" && r.frames.size() == 1 && r.frames[0] == a);
+  CHECK(!DecodeRecording(v2.substr(0, kRecHeaderBytes + 5), &r, &error));  // meta cut short
+  // Version 1 (the proof's recordings) still reads, with no meta.
+  std::string v1 = bytes;
+  v1[8] = 1;
+  v1[28] = 0;
+  CHECK(DecodeRecording(v1, &r, &error, &note) && r.meta.empty() && r.frames.size() == 3);
+
+  // Beyond the brief: wrong versions this excludes. The frame body is measured from the END of the meta
+  // (a body measured from byte 32 turns the meta into a "partial frame": note set), the meta length is
+  // checked at its edge (header + meta and no frames reads, one byte short does not), a recording whose
+  // meta is empty is still version 2, and versions 0 and 3 are refused.
+  std::string two = EncodeRecHeader(9, 1, "build=ab\nfixes=all\n");
+  two += EncodeRecFrame(a);
+  two += EncodeRecFrame(b);
+  CHECK(DecodeRecording(two, &r, &error, &note));
+  CHECK(note.empty() && r.frames.size() == 2 && r.frames[0] == a && r.frames[1] == b);
+  CHECK(r.seed == 9 && r.flags == 1 && r.meta.size() == 19);
+  const std::string head_only = EncodeRecHeader(9, 1, "build=ab\nfixes=all\n");
+  CHECK(DecodeRecording(head_only, &r, &error, &note) && r.frames.empty() && r.meta.size() == 19);
+  CHECK(!DecodeRecording(head_only.substr(0, head_only.size() - 1), &r, &error));
+  std::string cut2 = two.substr(0, two.size() - 10);  // a crash mid-frame still drops the partial frame
+  CHECK(DecodeRecording(cut2, &r, &error, &note) && r.frames.size() == 1 && !note.empty());
+  CHECK(EncodeRecHeader(9, 1).size() == kRecHeaderBytes && uint8_t(EncodeRecHeader(9, 1)[8]) == 2);
+  std::string v3 = two, v0 = two;
+  v3[8] = 3;
+  v0[8] = 0;
+  CHECK(!DecodeRecording(v3, &r, &error) && error == "unsupported recording version");
+  CHECK(!DecodeRecording(v0, &r, &error));
+}
+
+static void TestMetaMismatch() {
+  const std::string cur = "build=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n";
+  CHECK(!cur.empty() && MetaMismatch(cur, cur).empty());
+  CHECK(MetaMismatch("build=bb\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur) == "build bb vs aa");
+  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=3\nsweep=4\ntweaks=x=1\n", cur) ==
+        "serial 3 vs default; tweaks x=1 vs x=0");
+  CHECK(MetaMismatch("", cur).find("build (none) vs aa") == 0);  // a version-1 recording
+  CHECK(MetaMismatch("other=1\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0", cur).empty());
+
+  // Beyond the brief: wrong versions this excludes.
+  // Every one of the five keys is compared on its own (a key dropped from the list survives the
+  // brief's build / serial / tweaks fixtures).
+  CHECK(MetaMismatch("build=aa\nfixes=none\nserial=default\nsweep=4\ntweaks=x=0\n", cur) == "fixes none vs all");
+  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=all\ntweaks=x=0\n", cur) == "sweep all vs 4");
+  // A version-1 recording names all five keys, in the fixed order, with the whole current value.
+  CHECK(MetaMismatch("", cur) ==
+        "build (none) vs aa; fixes (none) vs all; serial (none) vs default; sweep (none) vs 4; tweaks (none) vs x=0");
+  // Keys are whole names at the start of a line: "xbuild" and "build2" are other keys (a substring find
+  // or a prefix compare reads their values), and a key with a value that holds '=' keeps all of it.
+  CHECK(MetaMismatch("xbuild=zz\nbuild2=yy\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur).empty());
+  CHECK(MetaMismatch("xbuild=aa\nbuild2=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur) ==
+        "build (none) vs aa");
+  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0,y=1\n", cur) ==
+        "tweaks x=0,y=1 vs x=0");
+  // Keys outside the five never count, whatever their values; an empty value is a value, not "(none)".
+  CHECK(MetaMismatch("other=2\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n",
+                     "other=1\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n").empty());
+  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=\nsweep=4\ntweaks=x=0\n", cur) == "serial  vs default");
+  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=4\n", cur) == "tweaks (none) vs x=0");
 }
 
 static void TestMaskedCopy() {
@@ -248,6 +315,54 @@ static void TestBlockMasks() {
   MaskedCopy(Region{"", 0x1000, 0x100, block(0)}, mem.data(), &out);
   CHECK(out.size() == 0x100 && out[7] == 0 && out[8] == 0xAA && out[0x3F] == 0xAA && out[0x40] == 0 &&
         out[0x41] == 0 && out[0x42] == 0xAA && out[0xEF] == 0xAA && out[0xF0] == 0 && out[0xFF] == 0);
+}
+
+// The sweep hashes a masked block through a Region built ONCE at Start (BlockRegions), where it used to
+// build Region{"", lo, block, BlockMasks(...)[k]} - a copy of the mask vector, one heap allocation - for
+// every masked block of every frame. The bytes hashed must not change: here the old per-hash construction
+// and the prebuilt Region copy the same 64 KB blocks, and the results are compared byte for byte.
+static void TestBlockRegions() {
+  const uint32_t lo = 0x82B70000, block = 0x10000, nblocks = 5;
+  // Block 0 holds two ranges (in input order), blocks 1 and 2 share one range across their border,
+  // block 3 is covered whole, block 4 has none.
+  const std::vector<std::pair<uint32_t, uint32_t>> ranges = {
+      {0x82B70010, 4}, {0x82B8FFFE, 4}, {0x82BA0000, 0x10000}, {0x82B70200, 0x1C}};
+  std::vector<uint8_t> mem(size_t(block) * nblocks);
+  for (size_t i = 0; i < mem.size(); ++i) mem[i] = uint8_t(1 + (i * 31 + i / 251) % 250);  // never 0
+  const std::vector<Region> regions = BlockRegions(lo, block, nblocks, ranges);
+  const auto masks = BlockMasks(lo, block, nblocks, ranges);
+  CHECK(regions.size() == nblocks && masks.size() == nblocks);
+  // (every check below runs whatever BlockRegions returns, so a mutant cannot shrink the check count)
+  const Region no_region;
+  const std::vector<Mask> no_masks;
+  auto region = [&](uint32_t k) -> const Region& { return k < regions.size() ? regions[k] : no_region; };
+  auto mask_list = [&](uint32_t k) -> const std::vector<Mask>& { return k < masks.size() ? masks[k] : no_masks; };
+  uint32_t masked_blocks = 0, differing = 0;
+  std::vector<uint8_t> legacy, fresh;
+  for (uint32_t k = 0; k < nblocks; ++k) {
+    const uint8_t* at = mem.data() + size_t(k) * block;
+    MaskedCopy(Region{"", lo + k * block, block, mask_list(k)}, at, &legacy);  // the per-hash construction
+    MaskedCopy(region(k), at, &fresh);
+    CHECK(legacy == fresh);
+    CHECK(fresh.size() == block);
+    CHECK(region(k).address == lo + k * block && region(k).length == block);
+    CHECK(region(k).masks.size() == mask_list(k).size());
+    masked_blocks += region(k).masks.empty() ? 0 : 1;
+    differing += std::equal(fresh.begin(), fresh.end(), at) ? 0 : 1;  // the mask changed bytes of this block
+  }
+  // Non-vacuous: four blocks are masked and their copies differ from the raw bytes; the fifth is not.
+  CHECK(masked_blocks == 4 && differing == 4);
+  CHECK(region(4).masks.empty());
+  CHECK(region(0).masks.size() == 2 && region(0).masks[0].offset == 0x10 && region(0).masks[1].offset == 0x200);
+  // The masked bytes are zeros in a block whose raw bytes are all non-zero.
+  MaskedCopy(region(0), mem.data(), &fresh);
+  auto byte = [&](size_t i) { return i < fresh.size() ? int(fresh[i]) : -1; };  // -1: no such byte
+  CHECK(byte(0xF) > 0 && byte(0x10) == 0 && byte(0x13) == 0 && byte(0x14) > 0);
+  CHECK(byte(0x1FF) > 0 && byte(0x200) == 0 && byte(0x21B) == 0 && byte(0x21C) > 0);
+  MaskedCopy(region(3), mem.data() + size_t(3) * block, &fresh);
+  CHECK(fresh.size() == block && std::all_of(fresh.begin(), fresh.end(), [](uint8_t b) { return b == 0; }));
+  // No blocks, no regions.
+  CHECK(BlockRegions(lo, block, 0, ranges).empty());
 }
 
 static void TestSweep() {
@@ -414,8 +529,10 @@ int main() {
   TestRandom();
   TestQueue();
   TestRecording();
+  TestMetaMismatch();
   TestMaskedCopy();
   TestBlockMasks();
+  TestBlockRegions();
   TestSweep();
   TestCounters();
   TestVirtualClocks();
