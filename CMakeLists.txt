@@ -35,6 +35,9 @@ set(DEADORALIVE4_SOURCES
     src/doa4_setup_flow.cpp
     src/doa4_setup_win.cpp
     src/doa4_setup_dialog.cpp
+    src/net/np_core.cpp
+    src/net/np_session.cpp
+    src/net/np_det.cpp
 )
 
 if(WIN32)
@@ -58,4 +61,9 @@ endif()
 # target's own SDK sources (ui/rex_app.cpp) do not search.
 if(REXSDK_DIR)
     target_include_directories(dead_or_alive_4 PRIVATE ${CMAKE_BINARY_DIR}/rexglue-sdk/include)
+endif()
+# Netplay hashing (src/net/np_session.cpp) uses rex/hash.h, whose xxhash.h the SDK
+# keeps to its own targets; header-only use (XXH_INLINE_ALL), nothing to link.
+if(TARGET xxhash)
+    target_include_directories(dead_or_alive_4 PRIVATE $<TARGET_PROPERTY:xxhash,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()

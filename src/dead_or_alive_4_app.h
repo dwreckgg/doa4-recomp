@@ -57,6 +57,7 @@
 #include "doa4_tweaks.h"
 #include "doa4_unlocks.h"
 #include "doa4_utf8.h"
+#include "net/np_session.h"
 
 REXCVAR_DECLARE(bool, log_noisy);
 
@@ -253,6 +254,17 @@ class DeadOrAlive4App : public rex::ReXApp {
     DumpGuestStrings();
     SetUpExtras();  // before any guest code runs: the tweaks patch tables read at boot
     SetUpSnapshotWatcher();  // before the first guest swap, so the swap counts start together
+    StartNetplaySession();   // DOA4_NP only: record / replay / hash from the first frame
+  }
+
+  // Netplay phase 0 (src/net/np_session.h): inert unless DOA4_NP is set.
+  void StartNetplaySession() {
+    doa4::np::Host host;
+    host.capture = [this](doa4::photo::Image* image) { return CaptureFrame(image); };
+    host.quit = [this] {
+      app_context().CallInUIThreadDeferred([this] { app_context().QuitFromUIThread(); });
+    };
+    doa4::np::Start(std::move(host));
   }
   void OnPreLaunchModule() override {
     REXLOG_INFO("[doa4][LIFE] OnPreLaunchModule: about to spawn main guest thread");
