@@ -1,0 +1,60 @@
+# boot -> title -> Versus -> Single Battle -> entry (P1 left, P2 right) -> P1 one down and one right, P2 one
+# down from the defaults = Hitomi vs Hayate, costume 1 -> stage three right of RANDOM (the casino street) ->
+# 60 s of random fighting (seeds 13-18) -> quit.
+# Needs --headless=true (the entry's sign-in message box is answered with its default).
+connect 0 1
+1500 -
+shot
+6 START
+120 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+40 -
+shot
+4 A
+90 -
+4 A
+120 -
+shot
+4 - RIGHT
+30 -
+4 - A
+300 -
+shot
+4 DOWN DOWN
+30 -
+4 RIGHT -
+30 -
+shot
+4 A A
+60 -
+4 A A
+360 -
+shot
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 A
+600 -
+shot
+random 600 13 0 1
+shot
+random 600 14 0 1
+shot
+random 600 15 0 1
+shot
+random 600 16 0 1
+shot
+random 600 17 0 1
+shot
+random 600 18 0 1
+shot
+quit

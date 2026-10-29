@@ -1,0 +1,70 @@
+# boot -> title -> Versus -> Tag Battle -> entry (P1 left, P2 right) -> first fighters: P1 one down and one right
+# = Hitomi, P2 one left = Bayman, costume 2 for both (one down); the partner cursors start on the tile above P1's
+# pick and below P2's pick = Lei Fang and Christie, costume 1 -> the stage one right of the Tag default (a neon
+# dance-floor arena; A comes 600 frames after the last costume, the stage select ignores A while it fades in) ->
+# 60 s of random fighting (seeds 25-30) -> quit.
+# Needs --headless=true (the entry's sign-in message box is answered with its default).
+connect 0 1
+1500 -
+shot
+6 START
+120 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+40 -
+shot
+4 A
+90 -
+4 RIGHT
+30 -
+4 A
+120 -
+shot
+4 - RIGHT
+30 -
+4 - A
+300 -
+shot
+4 DOWN LEFT
+30 -
+4 RIGHT -
+30 -
+shot
+4 A A
+60 -
+4 DOWN DOWN
+30 -
+shot
+4 A A
+120 -
+shot
+4 A A
+60 -
+4 A A
+600 -
+shot
+4 RIGHT
+30 -
+4 A
+180 -
+shot
+600 -
+shot
+random 600 25 0 1
+shot
+random 600 26 0 1
+shot
+random 600 27 0 1
+shot
+random 600 28 0 1
+shot
+random 600 29 0 1
+shot
+random 600 30 0 1
+shot
+quit

@@ -1,0 +1,66 @@
+# boot -> title -> Versus -> Single Battle -> entry (P1 left, P2 right) -> P1 three right, P2 two left of the
+# defaults = Bass vs Tina, costume 1 -> stage five right of RANDOM (the night rooftop) -> 60 s of random
+# fighting (seeds 19-24) -> quit.
+# Needs --headless=true (the entry's sign-in message box is answered with its default).
+connect 0 1
+1500 -
+shot
+6 START
+120 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+40 -
+shot
+4 A
+90 -
+4 A
+120 -
+shot
+4 - RIGHT
+30 -
+4 - A
+300 -
+shot
+4 RIGHT LEFT
+30 -
+4 RIGHT LEFT
+30 -
+4 RIGHT -
+30 -
+shot
+4 A A
+60 -
+4 A A
+360 -
+shot
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 RIGHT
+30 -
+4 A
+600 -
+shot
+random 600 19 0 1
+shot
+random 600 20 0 1
+shot
+random 600 21 0 1
+shot
+random 600 22 0 1
+shot
+random 600 23 0 1
+shot
+random 600 24 0 1
+shot
+quit
