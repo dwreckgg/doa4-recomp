@@ -30,6 +30,29 @@ uint32_t Frame();              // the frame being run (set at the frame hook)
 uint32_t ThreadStart();        // the calling thread's guest entry point (0: none)
 bool IsMainThread();
 
+// Counters, written per frame to counters.d4k by the session (np_core.h). fb_*: a wait gave up
+// and the game ran on anyway - any non-zero value fails the gate; pr_*: progress, equal in every
+// run of one recording.
+enum Counter : int {
+  kFbWorkerToken,    // a job worker waited 2 s for its turn
+  kFbMainWait,       // the main thread waited 2 s for the job workers
+  kFbUnranked,       // a job worker ran without its rank (modes 2 and 3)
+  kFbLoaderOutside,  // a loader job waited 500 ms for the frame boundary
+  kFbLoaderIdle,     // the loader was not idle 5 s into a frame boundary
+  kFbAudioLate,      // the frame's audio callbacks were not done after 250 ms
+  kFbSpinCap,        // a frame's CRI spin steps reached the cap
+  kFbCriReady,       // the CRI server thread was not in its loop 2 s after it was created
+  kFbAudioStart,     // the first audio callbacks were not done after 250 ms
+  kPrCriPasses,      // CRI server passes run on the main thread
+  kPrSpinSteps,      // of those, spin steps
+  kPrLoaderJobs,     // loader jobs run
+  kPrCriJobs,        // CRI job-thread jobs run inline
+  kPrReseeds,        // MT seedings
+  kPrNotify,         // system notifications the guest dequeued (Task 9)
+  kCounterCount
+};
+void Count(Counter c, uint32_t n = 1);
+
 // np_det_middleware.cpp
 void MiddlewareStart();
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base);

@@ -219,6 +219,21 @@ static void TestSweep() {
   CHECK(EncodeDigestHeader(regions).size() == 16 + 2 * 32);
 }
 
+static void TestCounters() {
+  const std::string h = EncodeCountersHeader({"fb_a", "pr_b"});
+  CHECK(h.size() == 16 + 2 * 24);
+  CHECK(h.substr(0, 8) == "D4NPCNT1");
+  CHECK(uint8_t(h[8]) == 1 && h[9] == 0 && h[10] == 0 && h[11] == 0);
+  CHECK(uint8_t(h[12]) == 2 && h[13] == 0);
+  CHECK(std::string(h.data() + 16) == "fb_a");
+  CHECK(std::string(h.data() + 40) == "pr_b");
+  const std::string cut = EncodeCountersHeader({std::string(30, 'x')});
+  CHECK(cut.size() == 16 + 24 && cut[16 + 22] == 'x' && cut[16 + 23] == '\0');  // cut to 23 + terminator
+  const std::string f = EncodeCountersFrame(0x01020304, {5, 0xA0B0C0D0});
+  const uint8_t want[16] = {4, 3, 2, 1, 0, 0, 0, 0, 5, 0, 0, 0, 0xD0, 0xC0, 0xB0, 0xA0};
+  CHECK(f.size() == 16 && std::memcmp(f.data(), want, 16) == 0);
+}
+
 int main() {
   TestPadBytes();
   TestScript();
@@ -227,6 +242,7 @@ int main() {
   TestRecording();
   TestMaskedCopy();
   TestSweep();
+  TestCounters();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

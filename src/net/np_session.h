@@ -6,7 +6,7 @@
 //   DOA4_NP=record|replay   record: input from DOA4_NP_SCRIPT and request files
 //                           (np_pad.on); replay: input from DOA4_NP_REC
 //   DOA4_NP_DIR=<folder>    outputs: np_log.txt, rec.d4r (record), digest.d4d,
-//                           sweep.d4s, shots/, dumps/
+//                           sweep.d4s, counters.d4k, shots/, dumps/
 //   DOA4_NP_SCRIPT=<file>   pad script played from frame 0 (record)
 //   DOA4_NP_REC=<file>      recording to replay; the run quits after its last frame
 //   DOA4_NP_SEED=<n>        session seed written into the recording (record)

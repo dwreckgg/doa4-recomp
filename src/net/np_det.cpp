@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -70,6 +71,12 @@ std::atomic<uint32_t> g_fixes{0};
 std::atomic<uint32_t> g_frame{0};
 std::atomic<bool> g_stopped{false};
 uint64_t g_seed = 1;
+std::atomic<uint32_t> g_counters[kCounterCount];
+constexpr const char* kCounterNames[] = {
+    "fb_worker_token", "fb_main_wait",  "fb_unranked",    "fb_loader_outside", "fb_loader_idle",
+    "fb_audio_late",   "fb_spin_cap",   "fb_cri_ready",   "fb_audio_start",    "pr_cri_passes",
+    "pr_spin_steps",   "pr_loader_jobs", "pr_cri_jobs",   "pr_reseeds",        "pr_notify"};
+static_assert(std::size(kCounterNames) == kCounterCount, "one name per Counter, in enum order");
 
 uint32_t ParseFixes(const char* text) {
   if (!text || !*text || std::string_view(text) == "all") return ~0u;
@@ -162,6 +169,18 @@ bool On(uint32_t fix) {
   return (g_fixes.load(std::memory_order_relaxed) & fix) != 0 &&
          !g_stopped.load(std::memory_order_relaxed);
 }
+void Count(Counter c, uint32_t n) { g_counters[c].fetch_add(n, std::memory_order_relaxed); }
+
+const std::vector<std::string>& CounterNames() {
+  static const std::vector<std::string> names(std::begin(kCounterNames), std::end(kCounterNames));
+  return names;
+}
+
+void CounterValues(std::vector<uint32_t>* out) {
+  out->resize(kCounterCount);
+  for (int i = 0; i < kCounterCount; ++i) (*out)[i] = g_counters[i].load(std::memory_order_relaxed);
+}
+
 bool Stopped() { return g_stopped.load(std::memory_order_relaxed); }
 uint32_t Frame() { return g_frame.load(std::memory_order_acquire); }
 
@@ -220,6 +239,7 @@ REX_HOOK_RAW(sub_82334C60) {
     const uint32_t old_seed = ctx.r4.u32;
     const uint32_t seed = uint32_t(Mix(g_seed ^ (uint64_t(state) << 32)));
     ctx.r4.u64 = seed;
+    Count(kPrReseeds);
     static std::atomic<int> n{0};
     if (n.fetch_add(1) < 64) {
       doa4::np::LogLine(fmt::format("seed: MT {:08X} seed {:08X} -> {:08X} (frame {}, lr {:08X})", state,

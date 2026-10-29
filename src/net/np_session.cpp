@@ -93,6 +93,8 @@ struct State {
   std::vector<Region> regions;
   FILE* digest = nullptr;
   FILE* sweep = nullptr;
+  FILE* counters = nullptr;
+  std::vector<uint32_t> counter_row;
   uint32_t sweep_per_frame = 4;
   std::vector<uint8_t> scratch;
   std::vector<uint64_t> row;
@@ -242,6 +244,7 @@ void Quit(State& s, const char* why) {
   if (s.rec) std::fclose(s.rec), s.rec = nullptr;
   if (s.digest) std::fclose(s.digest), s.digest = nullptr;
   if (s.sweep) std::fclose(s.sweep), s.sweep = nullptr;
+  if (s.counters) std::fclose(s.counters), s.counters = nullptr;
   det::Stop();
   if (s.host.quit) s.host.quit();
 }
@@ -301,9 +304,15 @@ void HashFrame(State& s, uint8_t* base, uint32_t f) {
     std::fwrite(head, sizeof(head), 1, s.sweep);
     std::fwrite(s.row.data(), sizeof(uint64_t), s.row.size(), s.sweep);
   }
+  if (s.counters) {
+    det::CounterValues(&s.counter_row);
+    const std::string rec = EncodeCountersFrame(f, s.counter_row);
+    std::fwrite(rec.data(), 1, rec.size(), s.counters);
+  }
   if ((f % 60) == 0) {
     if (s.digest) std::fflush(s.digest);
     if (s.sweep) std::fflush(s.sweep);
+    if (s.counters) std::fflush(s.counters);
     if (s.rec) std::fflush(s.rec);
   }
 }
@@ -483,6 +492,11 @@ void Start(Host host) {
   if (s.sweep) {
     const std::string head = EncodeSweepHeader(kDataLo, kDataHi, kBlock, s.sweep_per_frame);
     std::fwrite(head.data(), 1, head.size(), s.sweep);
+  }
+  s.counters = _wfopen((s.dir / "counters.d4k").wstring().c_str(), L"wb");
+  if (s.counters) {
+    const std::string head = EncodeCountersHeader(det::CounterNames());
+    std::fwrite(head.data(), 1, head.size(), s.counters);
   }
   s.writer = std::thread(WriterLoop);
   s.writer.detach();

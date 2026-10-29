@@ -67,8 +67,9 @@ void AudioStep(uint32_t f) {
     g_audio_alive = true;
   } else if (!g_audio_alive) {
     rex_audio_lockstep(1);  // no audio client yet: drop the budget again
-  } else if (g_audio_late++ < 20) {
-    LogLine("audio: frame " + std::to_string(f) + ": callbacks not done after 250 ms");
+  } else {
+    Count(kFbAudioLate);
+    if (g_audio_late++ < 20) LogLine("audio: frame " + std::to_string(f) + ": callbacks not done after 250 ms");
   }
 }
 
@@ -104,6 +105,7 @@ void LoaderBoundary(uint8_t* base, uint32_t frame) {
   while (g_loader_busy > 0 || LoaderPending(base)) {
     waited = true;
     if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+      Count(kFbLoaderIdle);
       if (g_loader_timeouts++ < 10) LogLine("loader: frame " + std::to_string(frame) + ": not idle after 5 s");
       break;
     }
@@ -144,6 +146,7 @@ std::vector<std::pair<uint32_t, uint32_t>> g_spin_lrs;  // main thread: tick-rea
 
 void CriPass(PPCContext& ctx, uint8_t* base) {
   if (!g_cri_ready.load(std::memory_order_acquire)) return;
+  Count(kPrCriPasses);
   const PPCContext saved = ctx;  // a call inside a hook: every register as it was
   const unsigned csr = _mm_getcsr();
   t_on_main_pass = true;
@@ -217,10 +220,13 @@ void SpinRead(PPCContext& ctx, uint8_t* base, uint32_t lr) {
     if (site == lr) {
       ++n;
       if (g_spin_steps_frame < 20000) {
+        Count(kPrSpinSteps);
         ++g_spin_steps_frame;
         ++g_spin_steps_window;
         g_spin_steps_max = std::max(g_spin_steps_max, g_spin_steps_frame);
         CriPass(ctx, base);
+      } else {
+        Count(kFbSpinCap);
       }
       return;
     }
@@ -276,12 +282,14 @@ REX_HOOK_RAW(sub_8277EFC8) {
     if (!g_loader_cv.wait_for(lk, std::chrono::milliseconds(500), [] { return g_loader_open || Stopped(); })) {
       // The main thread did not reach a boundary in time (it may be waiting for
       // this job inside a frame): run anyway, and say so.
+      Count(kFbLoaderOutside);
       if (g_loader_outside++ < 10) {
         doa4::np::LogLine("loader: a job ran outside the frame boundary (frame " + std::to_string(Frame()) + ")");
       }
     }
     ++g_loader_busy;
     ++g_loader_jobs;
+    Count(kPrLoaderJobs);
   }
   __imp__sub_8277EFC8(ctx, base);
   {
@@ -347,5 +355,6 @@ REX_HOOK_RAW(sub_829C9958) {
     doa4::np::LogLine(fmt::format("crijob: job {:08X}({:08X}) of {:08X} ran inline (frame {})", fn, arg, obj,
                                   Frame()));
   }
+  Count(kPrCriJobs);
   ctx.r3.u64 = id;
 }

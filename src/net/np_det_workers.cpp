@@ -98,6 +98,16 @@ uint32_t Be32(const uint8_t* base, uint32_t a) {
 double g_main_wait_us = 0, g_main_wait_max_us = 0;  // this 600-frame window
 double g_join_us = 0, g_join_max_us = 0;            // the frame's join on the workers (any mode)
 
+// The main thread's wait for the workers in mode 3: 2 s, or DOA4_NP_MAIN_WAIT_MS (a positive
+// control for the gate: 0 makes every wait that is not already over a counted fallback).
+std::chrono::milliseconds MainWaitTimeout() {
+  static const std::chrono::milliseconds ms([] {
+    const char* e = std::getenv("DOA4_NP_MAIN_WAIT_MS");
+    return e && *e ? std::atoi(e) : 2000;
+  }());
+  return ms;
+}
+
 void MainWaitForWorkers(bool until_done) {
   const auto t0 = std::chrono::steady_clock::now();
   struct Timed {
@@ -113,10 +123,14 @@ void MainWaitForWorkers(bool until_done) {
   auto ready = [until_done] {
     return Stopped() || g_token >= kWorkerCount || (!until_done && g_mid_waiter >= 0 && g_mid_waiter == g_token);
   };
-  if (!g_cv.wait_for(lk, std::chrono::seconds(2), ready) && g_main_timeouts++ < 20) {
-    LogLine(fmt::format("job workers: frame {}: the main thread waited 2 s for the workers ({}, token {}, "
-                        "mid waiter {})",
-                        Frame(), until_done ? "all" : "up to the mid event", g_token, g_mid_waiter));
+  if (!g_cv.wait_for(lk, MainWaitTimeout(), ready)) {
+    Count(kFbMainWait);
+    if (g_main_timeouts++ < 20) {
+      LogLine(fmt::format("job workers: frame {}: the main thread waited {} ms for the workers ({}, token {}, "
+                          "mid waiter {})",
+                          Frame(), MainWaitTimeout().count(), until_done ? "all" : "up to the mid event", g_token,
+                          g_mid_waiter));
+    }
   }
 }
 
@@ -200,6 +214,7 @@ REX_HOOK_RAW(sub_827921C0) {
     if (t_rank >= 0) {
       const int rank = t_rank;
       if (!g_cv.wait_for(lk, std::chrono::milliseconds(2000), [rank] { return g_token == rank || Stopped(); })) {
+        Count(kFbWorkerToken);
         if (g_timeouts++ < 20) {
           doa4::np::LogLine(fmt::format("job workers: frame {}: rank {} (thread {}) waited 2 s for the "
                                         "token at {}; running anyway",

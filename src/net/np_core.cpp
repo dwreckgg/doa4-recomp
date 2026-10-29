@@ -383,4 +383,24 @@ uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks) {
   return nblocks ? uint32_t((uint64_t(frame) * per_frame) % nblocks) : 0;
 }
 
+std::string EncodeCountersHeader(const std::vector<std::string>& names) {
+  std::string s = "D4NPCNT1";
+  PutLe32(&s, 1);
+  PutLe32(&s, uint32_t(names.size()));
+  for (const std::string& n : names) {
+    char name[24] = {};
+    std::memcpy(name, n.data(), std::min(n.size(), sizeof(name) - 1));
+    s.append(name, sizeof(name));
+  }
+  return s;
+}
+
+std::string EncodeCountersFrame(uint32_t frame, const std::vector<uint32_t>& values) {
+  std::string s;
+  PutLe32(&s, frame);
+  PutLe32(&s, 0);
+  for (uint32_t v : values) PutLe32(&s, v);
+  return s;
+}
+
 }  // namespace doa4::np

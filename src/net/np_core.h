@@ -158,5 +158,11 @@ std::string EncodeDigestHeader(const std::vector<Region>& regions);
 std::string EncodeSweepHeader(uint32_t lo, uint32_t hi, uint32_t block, uint32_t per_frame);
 // The first block index of `frame`'s batch.
 uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks);
+// Counter file: "D4NPCNT1", u32 version (1), u32 counter count, then per counter char name[24];
+// then per frame u32 frame, u32 0, u32 value per counter (values as they are when the frame's
+// state is hashed). Names starting "fb_" count fallbacks (a wait gave up and the game ran on: must
+// stay 0), "pr_" count progress (equal in every run of one recording).
+std::string EncodeCountersHeader(const std::vector<std::string>& names);
+std::string EncodeCountersFrame(uint32_t frame, const std::vector<uint32_t>& values);
 
 }  // namespace doa4::np

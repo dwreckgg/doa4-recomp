@@ -1,14 +1,18 @@
-"""Compares two DOA4 netplay phase-0 runs: digest (per-frame region hashes) and sweep (rolling
-64 KB .data block hashes). Formats: src/net/np_core.h.
+"""Compares two DOA4 netplay phase-0 runs: digest (per-frame region hashes), sweep (rolling
+64 KB .data block hashes) and counters (the determinism layer's fallback and progress counters).
+Formats: src/net/np_core.h.
 
   py -3 tools/np_compare.py RUN_A RUN_B [--from F] [--blocks N] [--allow-unchecked] [--sweep-advisory]
-RUN_A/RUN_B are run output folders (holding digest.d4d and sweep.d4s) or run folders (with
-out/). Prints the frames compared, the first differing frame of every region (and the first
-frame of all), and the sweep blocks that differ with the first frame each was seen to differ.
---allow-unchecked (runs without run_result.txt, e.g. the proof's)
+RUN_A/RUN_B are run output folders (holding digest.d4d, sweep.d4s and counters.d4k) or run
+folders (with out/). Prints the frames compared, the first differing frame of every region (and
+the first frame of all), the sweep blocks that differ with the first frame each was seen to
+differ, and the counters: every fallback counter (fb_*) above zero in either run (its final value
+and the first frame it was above zero) and every progress counter (pr_*) that differs between the
+runs, with the first frame it differs at.
+--allow-unchecked (runs without run_result.txt or counters.d4k, e.g. the proof's)
 --sweep-advisory (report sweep differences without failing)
-Exit status: 0 = both runs good, equal lengths, every compared frame equal; 1 = otherwise;
-2 = nothing to compare.
+Exit status: 0 = both runs good, equal lengths, every compared frame equal, no fallback, equal
+progress; 1 = otherwise; 2 = nothing to compare.
 """
 import argparse
 import os
@@ -52,6 +56,74 @@ def read_sweep(path):
         frames[f] = (first, struct.unpack_from(f"<{per}Q", d, off + 8))
         off += rec
     return (lo, hi, block, per), frames
+
+
+def read_counters(path):
+    d = open(path, "rb").read()
+    if d[:8] != b"D4NPCNT1":
+        raise SystemExit(f"{path}: not a counters file")
+    _, n = struct.unpack_from("<II", d, 8)
+    names = [d[16 + 24 * i:16 + 24 * (i + 1)].split(b"\0")[0].decode() for i in range(n)]
+    off, rec = 16 + 24 * n, 8 + 4 * n
+    frames = {}
+    while off + rec <= len(d):
+        f, _ = struct.unpack_from("<II", d, off)
+        frames[f] = struct.unpack_from(f"<{n}I", d, off + 8)
+        off += rec
+    return names, frames
+
+
+def fallbacks(label, names, frames):
+    lines = []
+    for i, name in enumerate(names):
+        if name.startswith("fb_") and frames:
+            first = next((f for f in sorted(frames) if frames[f][i]), None)
+            if first is not None:
+                lines.append(f"  run {label}: {name} = {frames[max(frames)][i]} (first at frame {first})")
+    return lines
+
+
+def judge_counters(a, b, digest_a, digest_b, start, allow_unchecked):
+    """Judges the runs' counters.d4k (np_core.h): a fallback counter (fb_*) above zero anywhere in a
+    run, a progress counter (pr_*) that differs between the runs at a frame both have (from `start`),
+    runs that counted different things, a counters file that does not have a row for every digest
+    frame (an empty one reads as a clean run otherwise), and a missing file (unless allow_unchecked:
+    then that run is not compared, but a run that has the file is still judged on its own).
+    Prints the findings; returns True if the pair fails."""
+    problems, found = [], {}
+    for label, d, digest in (("A", a, digest_a), ("B", b, digest_b)):
+        path = os.path.join(d, "counters.d4k")
+        if not os.path.exists(path):
+            if allow_unchecked:
+                print(f"run {label}: no counters.d4k (allowed)")
+            else:
+                problems.append(f"  run {label}: no counters.d4k")
+            continue
+        names, frames = read_counters(path)
+        if set(frames) != set(digest):
+            problems.append(f"  run {label}: counters.d4k has {len(frames)} rows for {len(digest)} digest frames")
+        found[label] = (names, frames)
+        problems += fallbacks(label, names, frames)
+    common = []
+    if len(found) == 2:
+        (names_a, frames_a), (names_b, frames_b) = found["A"], found["B"]
+        if names_a != names_b:
+            problems.append("  the runs counted different things")
+        else:
+            common = sorted(f for f in frames_a if f in frames_b and f >= start)
+            first = {}
+            for f in common:
+                for i, name in enumerate(names_a):
+                    if name.startswith("pr_") and frames_a[f][i] != frames_b[f][i]:
+                        first.setdefault(name, f)
+            problems += [f"  {name} first differs at frame {f}" for name, f in sorted(first.items(), key=lambda kv: kv[1])]
+        print(f"counters: {len(common)} common frames; " +
+              ("no fallbacks, progress equal" if not problems else f"{len(problems)} problems"))
+    else:
+        print("counters: not compared; " + ("no fallbacks in the run that has them" if not problems else f"{len(problems)} problems"))
+    for line in problems:
+        print(line)
+    return bool(problems)
 
 
 def run_status(d):
@@ -143,6 +215,8 @@ def main():
                     print("  (sweep differences reported only: --sweep-advisory)")
                 else:
                     result = 1
+    if judge_counters(a, b, fa, fb, args.start, args.allow_unchecked):
+        result = 1
     sys.exit(result)
 
 

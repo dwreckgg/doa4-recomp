@@ -3,8 +3,8 @@ run contract of src/net/np_session.cpp, which is what np_run.py, np_compare.py a
 without the game: nothing of the real game or its data is touched.
 
 Reads DOA4_NP (record|replay), DOA4_NP_DIR (the run's out folder) and, for a replay, DOA4_NP_REC.
-Writes digest.d4d, sweep.d4s and np_log.txt into the out folder, and for a record run rec.d4r (here
-just the frame count as text). Endings, as the real session logs them:
+Writes digest.d4d, sweep.d4s, counters.d4k and np_log.txt into the out folder, and for a record run
+rec.d4r (here just the frame count as text). Endings, as the real session logs them:
   record N frames: N digest rows, "quit at frame N-1: quit frame"
   replay of N frames: N digest rows, "quit at frame N: end of the recording"
 Test-only environment (the stand-in's own, not the game's):
@@ -13,7 +13,13 @@ Test-only environment (the stand-in's own, not the game's):
                     that run crashes halfway - partial digest, no quit line, exit code 3
   FAKE_GAME_SHORT   same form: that replay ends one frame early but cleanly (exit 0, the right
                     quit reason, one digest row short)
-Every run writes the same hashes for the same frame, so runs of equal length compare equal.
+  FAKE_GAME_FALLBACK  same form: that run reports a fallback - fb_main_wait is 1 from frame 4 on -
+                    and otherwise ends cleanly
+  FAKE_GAME_PROGRESS  same form: that run's pr_cri_passes differs from every other run's at frame 6
+                    only (+1 there)
+Every run writes the same hashes and the same counters for the same frame, so runs of equal length
+compare equal. Counters: the real file layout (np_core.h) with the real names (np_det.cpp, pinned by
+test_counter_names_match_source); fb_* are 0, pr_* are a function of the frame.
 """
 import os
 import struct
@@ -21,6 +27,11 @@ import sys
 
 REGIONS = [("game_obj", 0x8320D110, 0x63B0), ("frame_ctr", 0x831013E4, 4)]
 SWEEP_PER = 2
+COUNTERS = ["fb_worker_token", "fb_main_wait", "fb_unranked", "fb_loader_outside", "fb_loader_idle",
+            "fb_audio_late", "fb_spin_cap", "fb_cri_ready", "fb_audio_start", "pr_cri_passes",
+            "pr_spin_steps", "pr_loader_jobs", "pr_cri_jobs", "pr_reseeds", "pr_notify"]
+FALLBACK_FRAME = 4
+PROGRESS_FRAME = 6
 
 
 def write_digest(path, rows):
@@ -37,6 +48,28 @@ def write_sweep(path, rows):
         f.write(b"D4NPSWP1" + struct.pack("<IIIIII", 1, 0x82B70000, 0x835B0000, 0x10000, SWEEP_PER, 0))
         for i in range(rows):
             f.write(struct.pack("<II", i, (i * SWEEP_PER) % 164) + struct.pack(f"<{SWEEP_PER}Q", 3000 + i, 4000 + i))
+
+
+def counter_values(frame, fallback, progress):
+    values = []
+    for i, name in enumerate(COUNTERS):
+        if name.startswith("fb_"):
+            value = 1 if fallback and name == "fb_main_wait" and frame >= FALLBACK_FRAME else 0
+        else:
+            value = (i + 1) * 100 + frame
+            if progress and name == "pr_cri_passes" and frame == PROGRESS_FRAME:
+                value += 1
+        values.append(value)
+    return values
+
+
+def write_counters(path, rows, fallback, progress):
+    with open(path, "wb") as f:
+        f.write(b"D4NPCNT1" + struct.pack("<II", 1, len(COUNTERS)))
+        for name in COUNTERS:
+            f.write(name.encode().ljust(24, bytes(1)))
+        for i in range(rows):
+            f.write(struct.pack("<II", i, 0) + struct.pack(f"<{len(COUNTERS)}I", *counter_values(i, fallback, progress)))
 
 
 def listed(name, var):
@@ -61,6 +94,8 @@ def main():
     os.makedirs(out, exist_ok=True)
     write_digest(os.path.join(out, "digest.d4d"), rows)
     write_sweep(os.path.join(out, "sweep.d4s"), rows)
+    write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
+                   listed(name, "FAKE_GAME_PROGRESS"))
     log = [f"stand-in game: {mode} run {name}, {rows} frames"]
     if mode == "record":
         with open(os.path.join(out, "rec.d4r"), "w") as f:

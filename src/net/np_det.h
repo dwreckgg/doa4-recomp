@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
+#include <vector>
 
 #include <rex/ppc/context.h>
 
@@ -20,5 +22,9 @@ void OnFrame(uint32_t frame, PPCContext& ctx, uint8_t* base);
 // Called when the session ends (the game keeps running until it exits): the
 // layer stops holding threads to the frame boundary.
 void Stop();
+
+// The layer's counters (np_det_internal.h): names in file order, and their values now.
+const std::vector<std::string>& CounterNames();
+void CounterValues(std::vector<uint32_t>* out);
 
 }  // namespace doa4::np::det
