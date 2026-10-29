@@ -237,16 +237,20 @@ std::vector<Region> DigestRegions() {
   return r;
 }
 
-void Quit(State& s, const char* why) {
+// Ends the session: closes the recording and the hash files, switches the determinism layer off and
+// (ask_host) asks the host to quit. Callers: OnFrame's replay-end check and quit-frame check (the game's
+// main thread; they ask the host) and Shutdown (the host is already shutting down: it does not).
+void Quit(State& s, const std::string& why, bool ask_host = true) {
   if (s.quitting) return;
   s.quitting = true;
-  Log(std::string("quit at frame ") + std::to_string(s.frame - 1) + ": " + why);
+  Log(std::string("quit at frame ") + std::to_string(s.frame ? s.frame - 1 : 0) + ": " + why);
   if (s.rec) std::fclose(s.rec), s.rec = nullptr;
   if (s.digest) std::fclose(s.digest), s.digest = nullptr;
   if (s.sweep) std::fclose(s.sweep), s.sweep = nullptr;
   if (s.counters) std::fclose(s.counters), s.counters = nullptr;
   det::Stop();
-  if (s.host.quit) s.host.quit();
+  g_active.store(false, std::memory_order_release);  // the hooks pass through from here on
+  if (ask_host && s.host.quit) s.host.quit();
 }
 
 void PollRequests(State& s, uint32_t f) {
@@ -499,7 +503,6 @@ void Start(Host host) {
     std::fwrite(head.data(), 1, head.size(), s.counters);
   }
   s.writer = std::thread(WriterLoop);
-  s.writer.detach();
   det::Start(s.seed, s.dir);
   g_active.store(true, std::memory_order_release);
   Log(std::string("session on: ") + mode + ", sweep " + std::to_string(s.sweep_per_frame) +
@@ -508,6 +511,30 @@ void Start(Host host) {
 }
 
 void LogLine(const std::string& line) { Log(line); }
+
+// The writer captures through the presenter, so it must be done before the presenter goes. The race this
+// closes (a queued shot captured while the presenter is torn down) cannot be forced by a test: the check
+// is a GUARD, not a proof. A record run that quits on a shot frame must log that shot line before the
+// "session writer joined" line, and the join line must be the last line. Probe, 3 runs each, writer slowed
+// by 3 s: joined 0/3 leaked, detached 3/3 leaked (the capture ran after Shutdown had returned).
+// The host's shutdown watchdog (5 s, armed in OnShutdown just before this) ends the process if the drain
+// is slower: 36 queued shots took 1.9 s.
+void Shutdown() {
+  State& s = S();
+  if (s.mode == Mode::kOff) return;
+  Quit(s, "shutdown", /*ask_host=*/false);  // nothing if the session already quit
+  size_t left = 0;
+  {
+    std::lock_guard lk(s.job_mu);
+    s.stop = true;
+    left = s.jobs.size();
+  }
+  s.job_cv.notify_all();
+  if (s.writer.joinable()) s.writer.join();  // writes what is queued, then returns
+  Log("session writer joined (" + std::to_string(left) + " jobs were queued at shutdown)");
+  std::lock_guard lk(s.log_mu);
+  if (s.log) std::fclose(s.log), s.log = nullptr;
+}
 
 }  // namespace doa4::np
 

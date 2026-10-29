@@ -19,8 +19,9 @@ namespace doa4::np::det {
 void Start(uint64_t seed, const std::filesystem::path& dir);
 // Called by the frame hook (main thread, loop head) with the frame about to run.
 void OnFrame(uint32_t frame, PPCContext& ctx, uint8_t* base);
-// Called when the session ends (the game keeps running until it exits): the
-// layer stops holding threads to the frame boundary.
+// Called when the session ends (the game keeps running until it exits): the layer stops holding
+// threads to the frame boundary and switches off everything Start switched on (lockstep audio and
+// XMA, inline completions, headless dialogs, the clock override). Idempotent.
 void Stop();
 
 // The layer's counters (np_det_internal.h): names in file order, and their values now.

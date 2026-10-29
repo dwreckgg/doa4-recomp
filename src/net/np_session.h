@@ -39,6 +39,9 @@ struct Host {
 
 // Reads the configuration; called once before any guest code runs.
 void Start(Host host);
+// Ends the session (if one runs), writes the shots and dumps still queued, joins the writer and
+// closes the session log. Called first in OnShutdown, while the presenter still exists.
+void Shutdown();
 bool Active();
 
 // For the other netplay files (np_det.cpp).

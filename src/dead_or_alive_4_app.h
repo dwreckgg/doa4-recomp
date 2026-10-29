@@ -279,6 +279,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
+    doa4::np::Shutdown();  // first: the session's writer captures frames through the presenter
     rex::ui::UnregisterBind("bind_doa4_menu");
     rex::ui::UnregisterBind("bind_doa4_photo");
     photo_closing_.store(true, std::memory_order_release);

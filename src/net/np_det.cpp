@@ -54,8 +54,9 @@ REX_EXTERN(__imp__sub_82790138);
 REX_EXTERN(__imp__sub_82792660);
 REX_EXTERN(__imp__sub_82790130);
 REX_EXTERN(__imp__sub_82793B68);
-// SDK netplay export (sdk-np0 src/system/kernel_state.cpp).
+// SDK netplay exports (sdk-np0 src/system/kernel_state.cpp, src/audio/audio_system.cpp).
 __declspec(dllimport) void rex_overlapped_inline(int on);
+__declspec(dllimport) void rex_audio_lockstep(int on);
 }
 
 namespace doa4::np::det {
@@ -73,6 +74,7 @@ constexpr FixName kFixNames[] = {
 std::atomic<uint32_t> g_fixes{0};
 std::atomic<uint32_t> g_frame{0};
 std::atomic<bool> g_stopped{false};
+std::string g_headless_before = "false";  // the headless cvar as Start found it; Stop puts it back
 uint64_t g_seed = 1;
 std::atomic<uint32_t> g_counters[kCounterCount];
 constexpr const char* kCounterNames[] = {
@@ -214,6 +216,7 @@ void Start(uint64_t seed, const std::filesystem::path& dir) {
   }
   LogLine("determinism fixes: " + (names.empty() ? std::string("none") : names));
   if (fixes & kSdkClock) rex::chrono::Clock::set_guest_time_override(&GuestTime);
+  g_headless_before = rex::cvar::GetFlagByName("headless");
   if (fixes & kXam) {
     rex_overlapped_inline(1);
     rex::cvar::SetFlagByName("headless", "true");
@@ -229,8 +232,20 @@ void OnFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
 }
 
 void Stop() {
-  g_stopped.store(true, std::memory_order_release);
+  if (g_stopped.exchange(true, std::memory_order_acq_rel)) return;  // once
   WorkersStop();
+  const uint32_t fixes = g_fixes.load(std::memory_order_acquire);
+  if (fixes & kAudio) rex_audio_lockstep(0);  // audio and XMA lockstep off (sdk-np0 audio_system.cpp:420)
+  if (fixes & kXam) {
+    rex_overlapped_inline(0);
+    rex::cvar::SetFlagByName("headless", g_headless_before);
+  }
+  if (fixes & kSdkClock) rex::chrono::Clock::set_guest_time_override(nullptr);
+  const auto state = [&](uint32_t bit) { return (fixes & bit) ? "released" : "never held"; };
+  LogLine(fmt::format(
+      "determinism layer off: lockstep audio {}, inline completions and headless {} (headless is now '{}', was '{}'), "
+      "clock override {}",
+      state(kAudio), state(kXam), rex::cvar::GetFlagByName("headless"), g_headless_before, state(kSdkClock)));
 }
 
 }  // namespace doa4::np::det
