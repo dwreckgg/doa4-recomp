@@ -194,6 +194,14 @@ void MiddlewareStart() {
   if (On(kAudio)) rex_audio_lockstep(1);
 }
 
+// The loader gate's waiter (the sub_8277EFC8 hook, g_loader_cv.wait_for with the predicate
+// g_loader_open || Stopped()) is woken here. Taking the mutex first closes the window in which a job
+// has tested the predicate (false) but not yet blocked: it holds g_loader_mu until it blocks, so the
+// notify below cannot be lost.
+void MiddlewareStop() {
+  { std::lock_guard lk(g_loader_mu); }
+  g_loader_cv.notify_all();
+}
 
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base) {
   g_watch.Check(base, frame, nullptr);  // the frame's own changes: not reported

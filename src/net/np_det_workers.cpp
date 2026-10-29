@@ -179,6 +179,13 @@ void WorkersStop() {
 using namespace doa4::np::det;
 
 REX_HOOK_RAW(sub_827921C0) {
+  // Mode 1's lock is given back first, also once the session has ended: a worker that kept it through
+  // the pass-through below would hold it for good while it waits for its next start event, and every
+  // other worker blocked on it (DOA4_NP_SERIAL=1) would never run again.
+  if (t_held) {
+    t_held = false;
+    g_serial_mu.unlock();
+  }
   if (!doa4::np::Active()) {
     __imp__sub_827921C0(ctx, base);
     return;
@@ -198,10 +205,6 @@ REX_HOOK_RAW(sub_827921C0) {
     }
   }
   const int mode = main ? 0 : Mode();
-  if (t_held) {  // mode 1 (or a mode that ended): give the lock back
-    t_held = false;
-    g_serial_mu.unlock();
-  }
   if (mode >= 2 && t_rank >= 0) {
     std::lock_guard lk(g_mu);
     if (g_token == t_rank) {

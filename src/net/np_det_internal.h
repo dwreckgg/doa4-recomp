@@ -56,6 +56,9 @@ void Count(Counter c, uint32_t n = 1);
 // np_det_middleware.cpp
 void MiddlewareStart();
 void MiddlewareFrame(uint32_t frame, PPCContext& ctx, uint8_t* base);
+// Called by Stop() once Stopped() is true: wakes a loader job waiting at the frame-boundary gate so it
+// sees Stopped() at once.
+void MiddlewareStop();
 // The tick-count hook's spin detector (main thread, after the frame's first
 // read from a call site): one middleware step.
 void SpinRead(PPCContext& ctx, uint8_t* base, uint32_t lr);

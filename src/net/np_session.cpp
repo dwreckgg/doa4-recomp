@@ -113,6 +113,13 @@ struct State {
   std::condition_variable job_cv;
   std::deque<Job> jobs;
   bool stop = false;
+
+  // A game-requested exit() (HalReturnToFirmware, "return to the dashboard": sdk xboxkrnl_hal.cpp:34)
+  // runs the static destructors without OnShutdown, so the writer may still be joinable here, and a
+  // joinable std::thread's destructor calls std::terminate. Detach it: the process is going away.
+  ~State() {
+    if (writer.joinable()) writer.detach();
+  }
 };
 
 State& S() {

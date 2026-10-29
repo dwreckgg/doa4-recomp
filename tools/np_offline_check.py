@@ -1,7 +1,8 @@
 """Offline run of a build (no DOA4_NP): the game's own photo test takes photos at 20/40/60/80 s into a
 run folder, then this script ends its own process. Shows that a netplay build plays as before when no
-session runs: the game.log has no [NP] line (and no "session writer joined" line), and the photos show
-the title and the attract demo.
+session runs: the game.log has no [NP] line and no "skipped at frame" line, and the photos show the title
+and the attract demo. Startup and attract play only; shutdown is not exercised (the run ends with
+TerminateProcess, which never runs the application's shutdown hook).
 
   py -3 -I tools/np_offline_check.py EXE NAME
 
@@ -40,5 +41,5 @@ p.terminate()
 p.wait()
 print("photos:", sorted(os.listdir(photos)) if os.path.isdir(photos) else "none")
 log = open(os.path.join(run, "game.log"), encoding="utf-8", errors="replace").read()
-print("[NP] lines:", log.count("[doa4][NP]"), "| session writer joined lines:", log.count("session writer joined"),
-      "| movie skipped lines:", log.count("skipped at frame"))
+print("[NP] lines:", log.count("[doa4][NP]"), "| movie skipped lines:", log.count("skipped at frame"))
+print("startup and attract play only; shutdown is not exercised (the run ends with TerminateProcess)")
