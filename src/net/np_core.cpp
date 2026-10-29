@@ -1,0 +1,386 @@
+// See np_core.h.
+
+#include "np_core.h"
+
+#include <algorithm>
+#include <cstring>
+
+namespace doa4::np {
+
+namespace {
+
+void PutBe16(uint8_t* p, uint16_t v) {
+  p[0] = uint8_t(v >> 8);
+  p[1] = uint8_t(v);
+}
+uint16_t GetBe16(const uint8_t* p) { return uint16_t((p[0] << 8) | p[1]); }
+
+void PutLe32(std::string* s, uint32_t v) {
+  for (int i = 0; i < 4; ++i) s->push_back(char(uint8_t(v >> (8 * i))));
+}
+void PutLe64(std::string* s, uint64_t v) {
+  for (int i = 0; i < 8; ++i) s->push_back(char(uint8_t(v >> (8 * i))));
+}
+uint32_t GetLe32(const uint8_t* p) {
+  return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+}
+uint64_t GetLe64(const uint8_t* p) { return uint64_t(GetLe32(p)) | uint64_t(GetLe32(p + 4)) << 32; }
+
+std::string_view Trim(std::string_view s) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r')) s.remove_prefix(1);
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.remove_suffix(1);
+  return s;
+}
+
+std::vector<std::string_view> Words(std::string_view s) {
+  std::vector<std::string_view> out;
+  size_t i = 0;
+  while (i < s.size()) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+    size_t j = i;
+    while (j < s.size() && s[j] != ' ' && s[j] != '\t') ++j;
+    if (j > i) out.push_back(s.substr(i, j - i));
+    i = j;
+  }
+  return out;
+}
+
+bool ParseInt(std::string_view s, long long lo, long long hi, long long* out) {
+  if (s.empty()) return false;
+  bool neg = false;
+  size_t i = 0;
+  if (s[0] == '-' || s[0] == '+') {
+    neg = s[0] == '-';
+    i = 1;
+  }
+  if (i >= s.size()) return false;
+  long long v = 0;
+  for (; i < s.size(); ++i) {
+    if (s[i] < '0' || s[i] > '9') return false;
+    v = v * 10 + (s[i] - '0');
+    if (v > 4000000000ll) return false;
+  }
+  if (neg) v = -v;
+  if (v < lo || v > hi) return false;
+  *out = v;
+  return true;
+}
+
+std::string Upper(std::string_view s) {
+  std::string u(s);
+  for (char& c : u) {
+    if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+  }
+  return u;
+}
+
+// One user's item list: "-" or "A+UP+LX=-100".
+bool ParsePad(std::string_view text, Pad* pad, std::string* why) {
+  *pad = Pad{};
+  if (text == "-") return true;
+  size_t i = 0;
+  while (i <= text.size()) {
+    size_t j = text.find('+', i);
+    if (j == std::string_view::npos) j = text.size();
+    const std::string item = Upper(text.substr(i, j - i));
+    i = j + 1;
+    if (item.empty()) {
+      *why = "empty item";
+      return false;
+    }
+    static constexpr struct {
+      const char* name;
+      uint16_t bit;
+    } kButtons[] = {{"A", kA},         {"B", kB},       {"X", kX},           {"Y", kY},
+                    {"UP", kUp},       {"DOWN", kDown}, {"LEFT", kLeft},     {"RIGHT", kRight},
+                    {"START", kStart}, {"BACK", kBack}, {"LB", kLB},         {"RB", kRB},
+                    {"LS", kLThumb},   {"RS", kRThumb}};
+    bool done = false;
+    for (const auto& b : kButtons) {
+      if (item == b.name) {
+        pad->buttons |= b.bit;
+        done = true;
+      }
+    }
+    if (done) continue;
+    const size_t eq = item.find('=');
+    if (eq == std::string::npos) {
+      *why = "unknown item '" + item + "'";
+      return false;
+    }
+    const std::string key = item.substr(0, eq);
+    const std::string_view value = std::string_view(item).substr(eq + 1);
+    long long v = 0;
+    if (key == "LT" || key == "RT") {
+      if (!ParseInt(value, 0, 255, &v)) {
+        *why = key + " needs 0..255";
+        return false;
+      }
+      (key == "LT" ? pad->lt : pad->rt) = uint8_t(v);
+    } else if (key == "LX" || key == "LY" || key == "RX" || key == "RY") {
+      if (!ParseInt(value, -32768, 32767, &v)) {
+        *why = key + " needs -32768..32767";
+        return false;
+      }
+      int16_t* axis = key == "LX" ? &pad->lx : key == "LY" ? &pad->ly : key == "RX" ? &pad->rx : &pad->ry;
+      *axis = int16_t(v);
+    } else {
+      *why = "unknown item '" + item + "'";
+      return false;
+    }
+    if (j == text.size()) break;
+  }
+  return true;
+}
+
+// xorshift64*: the random fighting input of a script, a pure function of its seed.
+struct Rng {
+  uint64_t s;
+  explicit Rng(uint64_t seed) : s(seed * 0x9E3779B97F4A7C15ull + 0x2545F4914F6CDD1Dull) {
+    if (!s) s = 1;
+  }
+  uint32_t Next() {
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    return uint32_t((s * 0x2545F4914F6CDD1Dull) >> 32);
+  }
+  uint32_t Below(uint32_t n) { return Next() % n; }
+};
+
+}  // namespace
+
+void PadToGuest(const Pad& pad, uint8_t out[12]) {
+  PutBe16(out + 0, pad.buttons);
+  out[2] = pad.lt;
+  out[3] = pad.rt;
+  PutBe16(out + 4, uint16_t(pad.lx));
+  PutBe16(out + 6, uint16_t(pad.ly));
+  PutBe16(out + 8, uint16_t(pad.rx));
+  PutBe16(out + 10, uint16_t(pad.ry));
+}
+
+Pad PadFromGuest(const uint8_t in[12]) {
+  Pad pad;
+  pad.buttons = GetBe16(in + 0);
+  pad.lt = in[2];
+  pad.rt = in[3];
+  pad.lx = int16_t(GetBe16(in + 4));
+  pad.ly = int16_t(GetBe16(in + 6));
+  pad.rx = int16_t(GetBe16(in + 8));
+  pad.ry = int16_t(GetBe16(in + 10));
+  return pad;
+}
+
+bool ParseScript(std::string_view text, Script* out, std::string* error) {
+  *out = Script{};
+  error->clear();
+  uint8_t connected = 1;
+  bool connect_seen = false;
+  int line_no = 0;
+  auto fail = [&](const std::string& why) {
+    *error = "line " + std::to_string(line_no) + ": " + why;
+    return false;
+  };
+  size_t pos = 0;
+  while (pos <= text.size()) {
+    size_t nl = text.find('\n', pos);
+    if (nl == std::string_view::npos) nl = text.size();
+    std::string_view line = text.substr(pos, nl - pos);
+    pos = nl + 1;
+    ++line_no;
+    const size_t hash = line.find('#');
+    if (hash != std::string_view::npos) line = line.substr(0, hash);
+    line = Trim(line);
+    if (line.empty()) {
+      if (nl == text.size()) break;
+      continue;
+    }
+    const std::vector<std::string_view> w = Words(line);
+    const std::string head = Upper(w[0]);
+    const uint32_t now = uint32_t(out->frames.size());
+    if (head == "CONNECT") {
+      uint8_t mask = 0;
+      for (size_t i = 1; i < w.size(); ++i) {
+        long long u = 0;
+        if (!ParseInt(w[i], 0, kUsers - 1, &u)) return fail("connect takes users 0-3");
+        mask |= uint8_t(1u << u);
+      }
+      connected = mask;
+      if (!connect_seen) out->inherit_frames = out->frames.size();
+      connect_seen = true;
+    } else if (head == "SHOT" || head == "QUIT") {
+      if (w.size() != 1) return fail(head + " takes no arguments");
+      out->events.push_back({head == "SHOT" ? ScriptEvent::kShot : ScriptEvent::kQuit, now});
+    } else if (head == "RANDOM") {
+      long long frames = 0, seed = 0;
+      if (w.size() < 4 || !ParseInt(w[1], 1, 10000000, &frames) || !ParseInt(w[2], 0, 4000000000ll, &seed)) {
+        return fail("random <frames> <seed> <user> [<user> ...]");
+      }
+      uint8_t users = 0;
+      for (size_t i = 3; i < w.size(); ++i) {
+        long long u = 0;
+        if (!ParseInt(w[i], 0, kUsers - 1, &u)) return fail("random: users are 0-3");
+        users |= uint8_t(1u << u);
+      }
+      static constexpr uint16_t kDirs[] = {0,          kUp,           kDown,         kLeft,         kRight,
+                                           kUp | kLeft, kUp | kRight, kDown | kLeft, kDown | kRight};
+      static constexpr uint16_t kAttacks[] = {0, kA, kB, kX, kY, kX | kY, kA | kB};
+      Rng rng{uint64_t(seed)};
+      struct Held {
+        uint16_t buttons = 0;
+        uint32_t left = 0;
+      } held[kUsers];
+      for (long long f = 0; f < frames; ++f) {
+        FrameInput in;
+        in.connected = connected;
+        for (int u = 0; u < kUsers; ++u) {
+          if (!(users & (1u << u))) continue;
+          if (held[u].left == 0) {
+            held[u].buttons = uint16_t(kDirs[rng.Below(9)] | kAttacks[rng.Below(7)]);
+            held[u].left = 2 + rng.Below(11);
+          }
+          --held[u].left;
+          in.pad[u].buttons = held[u].buttons;
+        }
+        out->frames.push_back(in);
+      }
+    } else {
+      long long frames = 0;
+      if (!ParseInt(w[0], 1, 10000000, &frames)) return fail("unknown command '" + std::string(w[0]) + "'");
+      if (w.size() > 1 + kUsers) return fail("more than four users");
+      FrameInput in;
+      in.connected = connected;
+      for (size_t i = 1; i < w.size(); ++i) {
+        std::string why;
+        if (!ParsePad(w[i], &in.pad[i - 1], &why)) return fail(why);
+      }
+      out->frames.insert(out->frames.end(), size_t(frames), in);
+    }
+    if (nl == text.size()) break;
+  }
+  if (!connect_seen) out->inherit_frames = out->frames.size();
+  return true;
+}
+
+uint32_t InputQueue::Append(const Script& script, uint32_t now) {
+  const uint32_t start = std::max(now, end_);
+  if (end_ <= now) tail_connected_ = connected_;  // nothing still queued
+  for (size_t i = 0; i < script.frames.size(); ++i) {
+    FrameInput in = script.frames[i];
+    if (i < script.inherit_frames) in.connected = tail_connected_;
+    items_.push_back({start + uint32_t(i), in});
+  }
+  if (!items_.empty() && !script.frames.empty()) tail_connected_ = items_.back().input.connected;
+  for (const ScriptEvent& e : script.events) {
+    events_.push_back({e.kind, start + e.frame});
+  }
+  std::stable_sort(events_.begin() + ptrdiff_t(next_event_), events_.end(),
+                   [](const ScriptEvent& a, const ScriptEvent& b) { return a.frame < b.frame; });
+  end_ = start + uint32_t(script.frames.size());
+  return start;
+}
+
+FrameInput InputQueue::Next(uint32_t frame, std::vector<ScriptEvent::Kind>* fired) {
+  while (next_event_ < events_.size() && events_[next_event_].frame <= frame) {
+    fired->push_back(events_[next_event_].kind);
+    ++next_event_;
+  }
+  while (next_item_ < items_.size() && items_[next_item_].frame < frame) ++next_item_;
+  if (next_item_ < items_.size() && items_[next_item_].frame == frame) {
+    const FrameInput in = items_[next_item_++].input;
+    connected_ = in.connected;
+    return in;
+  }
+  FrameInput neutral;
+  neutral.connected = connected_;
+  return neutral;
+}
+
+std::string EncodeRecHeader(uint64_t seed, uint32_t flags) {
+  std::string s = "D4NPREC1";
+  PutLe32(&s, 1);
+  PutLe32(&s, uint32_t(kRecFrameBytes));
+  PutLe64(&s, seed);
+  PutLe32(&s, flags);
+  PutLe32(&s, 0);
+  return s;
+}
+
+std::string EncodeRecFrame(const FrameInput& input) {
+  std::string s(kRecFrameBytes, '\0');
+  s[0] = char(input.connected);
+  for (int u = 0; u < kUsers; ++u) {
+    PadToGuest(input.pad[u], reinterpret_cast<uint8_t*>(s.data()) + 4 + 12 * u);
+  }
+  return s;
+}
+
+bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error, std::string* note) {
+  *out = Recording{};
+  if (note) note->clear();
+  const auto* p = reinterpret_cast<const uint8_t*>(bytes.data());
+  if (bytes.size() < kRecHeaderBytes || bytes.substr(0, 8) != "D4NPREC1") {
+    *error = "not a DOA4 netplay recording";
+    return false;
+  }
+  if (GetLe32(p + 8) != 1 || GetLe32(p + 12) != kRecFrameBytes) {
+    *error = "unsupported recording version";
+    return false;
+  }
+  out->seed = GetLe64(p + 16);
+  out->flags = GetLe32(p + 24);
+  const size_t body = bytes.size() - kRecHeaderBytes;
+  const size_t n = body / kRecFrameBytes;
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* f = p + kRecHeaderBytes + i * kRecFrameBytes;
+    FrameInput in;
+    in.connected = f[0];
+    for (int u = 0; u < kUsers; ++u) in.pad[u] = PadFromGuest(f + 4 + 12 * u);
+    out->frames.push_back(in);
+  }
+  if (body % kRecFrameBytes && note) {
+    *note = "dropped a partial last frame (" + std::to_string(body % kRecFrameBytes) + " bytes)";
+  }
+  return true;
+}
+
+void MaskedCopy(const Region& region, const uint8_t* bytes, std::vector<uint8_t>* out) {
+  out->assign(bytes, bytes + region.length);
+  for (const Mask& m : region.masks) {
+    if (m.offset >= region.length) continue;
+    const uint32_t n = std::min(m.length, region.length - m.offset);
+    std::memset(out->data() + m.offset, 0, n);
+  }
+}
+
+std::string EncodeDigestHeader(const std::vector<Region>& regions) {
+  std::string s = "D4NPDIG1";
+  PutLe32(&s, 1);
+  PutLe32(&s, uint32_t(regions.size()));
+  for (const Region& r : regions) {
+    PutLe32(&s, r.address);
+    PutLe32(&s, r.length);
+    char name[24] = {};
+    std::memcpy(name, r.name, std::min(std::strlen(r.name), sizeof(name) - 1));
+    s.append(name, sizeof(name));
+  }
+  return s;
+}
+
+std::string EncodeSweepHeader(uint32_t lo, uint32_t hi, uint32_t block, uint32_t per_frame) {
+  std::string s = "D4NPSWP1";
+  PutLe32(&s, 1);
+  PutLe32(&s, lo);
+  PutLe32(&s, hi);
+  PutLe32(&s, block);
+  PutLe32(&s, per_frame);
+  PutLe32(&s, 0);
+  return s;
+}
+
+uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks) {
+  return nblocks ? uint32_t((uint64_t(frame) * per_frame) % nblocks) : 0;
+}
+
+}  // namespace doa4::np
