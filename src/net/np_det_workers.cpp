@@ -50,6 +50,7 @@ extern "C" {
 REX_EXTERN(__imp__sub_827921C0);
 REX_EXTERN(__imp__sub_82792140);
 REX_EXTERN(__imp__sub_82791190);
+REX_EXTERN(__imp__sub_827922E0);
 }
 
 namespace doa4::np::det {
@@ -94,7 +95,19 @@ uint32_t Be32(const uint8_t* base, uint32_t a) {
 // the token holder is blocked on the mid event, or all are done) or the mid
 // event (until all are done): the workers' work never overlaps the main
 // thread's own update code.
+double g_main_wait_us = 0, g_main_wait_max_us = 0;  // this 600-frame window
+double g_join_us = 0, g_join_max_us = 0;            // the frame's join on the workers (any mode)
+
 void MainWaitForWorkers(bool until_done) {
+  const auto t0 = std::chrono::steady_clock::now();
+  struct Timed {
+    std::chrono::steady_clock::time_point t0;
+    ~Timed() {
+      const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+      g_main_wait_us += us;
+      g_main_wait_max_us = std::max(g_main_wait_max_us, us);
+    }
+  } timed{t0};
   std::unique_lock lk(g_mu);
   if (g_ranked < kWorkerCount) return;
   auto ready = [until_done] {
@@ -110,6 +123,13 @@ void MainWaitForWorkers(bool until_done) {
 }  // namespace
 
 void WorkersFrame() {
+  const uint32_t frame = Frame();
+  if (frame % 600 == 599) {
+    LogLine(fmt::format("job workers: main thread waited for them avg {:.1f} us max {:.1f} us a frame in the "
+                        "update half, join avg {:.1f} us max {:.1f} us (600 frames)",
+                        g_main_wait_us / 600, g_main_wait_max_us, g_join_us / 600, g_join_max_us));
+    g_main_wait_us = g_main_wait_max_us = g_join_us = g_join_max_us = 0;
+  }
   std::lock_guard lk(g_mu);
   g_token = 0;
 }
@@ -223,4 +243,19 @@ REX_HOOK_RAW(sub_82791190) {
   __imp__sub_82791190(ctx, base);
   std::lock_guard lk(g_mu);
   if (g_mid_waiter == t_rank) g_mid_waiter = -1;
+}
+
+// sub_827922E0 = WaitForMultipleObjects: the update/draw function's join on the
+// five chains (call site 0x824F4AE8) is timed on the main thread, in every mode,
+// so the cost of the ordered modes can be read beside the parallel one.
+REX_HOOK_RAW(sub_827922E0) {
+  if (!doa4::np::Active() || uint32_t(ctx.lr) != 0x824F4AE8u) {
+    __imp__sub_827922E0(ctx, base);
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  __imp__sub_827922E0(ctx, base);
+  const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+  g_join_us += us;
+  g_join_max_us = std::max(g_join_max_us, us);
 }
