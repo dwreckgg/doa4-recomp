@@ -211,6 +211,45 @@ static void TestMaskedCopy() {
   CHECK(out.size() == 4 && out[1] == 2 && out[2] == 0 && out[3] == 0);
 }
 
+static void TestBlockMasks() {
+  const auto m = BlockMasks(0x82B70000, 0x10000, 4, {{0x82B70010, 4}, {0x82B8FFFE, 4}, {0x82BB0000, 8}});
+  CHECK(m.size() == 4);
+  if (m.size() == 4) {
+    CHECK(m[0].size() == 1 && m[0][0].offset == 0x10 && m[0][0].length == 4);
+    CHECK(m[1].size() == 1 && m[1][0].offset == 0xFFFE && m[1][0].length == 2);  // split at the border
+    CHECK(m[2].size() == 1 && m[2][0].offset == 0 && m[2][0].length == 2);
+    CHECK(m[3].empty());  // 0x82BB0000 is past the 4 blocks
+  }
+  // Wrong versions this excludes: a block size or base taken from the sweep's constants instead of the
+  // arguments (0x100-byte blocks at 0x1000), a range starting below lo (index underflow, or dropped
+  // instead of clipped), a range covering a whole block and running past the end (not clipped at hi),
+  // a zero-length range (an empty mask), two ranges in one block (one lost, or reordered).
+  // (helpers, not size guards: every check below runs whatever BlockMasks returns, so a mutant cannot
+  // shrink the check count)
+  const auto n = BlockMasks(0x1000, 0x100, 3, {{0x0FF8, 0x10}, {0x10F0, 0x220}, {0x1020, 0}, {0x1040, 2}});
+  const std::vector<Mask> none;
+  auto block = [&](size_t k) -> const std::vector<Mask>& { return k < n.size() ? n[k] : none; };
+  auto has = [&](size_t k, size_t j, uint32_t offset, uint32_t length) {
+    return j < block(k).size() && block(k)[j].offset == offset && block(k)[j].length == length;
+  };
+  CHECK(n.size() == 3);
+  CHECK(block(0).size() == 3);
+  CHECK(has(0, 0, 0, 8));        // 0x0FF8..0x1008 clipped to lo
+  CHECK(has(0, 1, 0xF0, 0x10));  // 0x10F0..0x1100
+  CHECK(has(0, 2, 0x40, 2));     // in input order; the empty range adds nothing
+  CHECK(block(1).size() == 1 && has(1, 0, 0, 0x100));  // the whole block
+  CHECK(block(2).size() == 1 && has(2, 0, 0, 0x100));  // 0x1310 clipped at 0x1300
+  CHECK(BlockMasks(0x1000, 0x100, 0, {{0x1000, 4}}).empty());  // no blocks, no masks (and no write past them)
+  // The sweep's use: MaskedCopy of a block with its masks zeroes exactly the masked bytes.
+  std::vector<uint8_t> mem(0x300, 0xAA);
+  std::vector<uint8_t> out;
+  MaskedCopy(Region{"", 0x1100, 0x100, block(1)}, mem.data() + 0x100, &out);
+  CHECK(out.size() == 0x100 && std::all_of(out.begin(), out.end(), [](uint8_t b) { return b == 0; }));
+  MaskedCopy(Region{"", 0x1000, 0x100, block(0)}, mem.data(), &out);
+  CHECK(out.size() == 0x100 && out[7] == 0 && out[8] == 0xAA && out[0x3F] == 0xAA && out[0x40] == 0 &&
+        out[0x41] == 0 && out[0x42] == 0xAA && out[0xEF] == 0xAA && out[0xF0] == 0 && out[0xFF] == 0);
+}
+
 static void TestSweep() {
   CHECK(SweepFirst(0, 4, 10) == 0);
   CHECK(SweepFirst(1, 4, 10) == 4);
@@ -376,6 +415,7 @@ int main() {
   TestQueue();
   TestRecording();
   TestMaskedCopy();
+  TestBlockMasks();
   TestSweep();
   TestCounters();
   TestVirtualClocks();

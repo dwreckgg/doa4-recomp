@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace doa4::np {
@@ -160,6 +161,10 @@ std::string EncodeDigestHeader(const std::vector<Region>& regions);
 std::string EncodeSweepHeader(uint32_t lo, uint32_t hi, uint32_t block, uint32_t per_frame);
 // The first block index of `frame`'s batch.
 uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks);
+// Per sweep block (lo + i * block, i < nblocks), the masks of the guest ranges {address, length}
+// that touch it, as offsets within the block; a range across a block border is split.
+std::vector<std::vector<Mask>> BlockMasks(uint32_t lo, uint32_t block, uint32_t nblocks,
+                                          const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
 // Counter file: "D4NPCNT1", u32 version (1), u32 counter count, then per counter char name[24];
 // then per frame u32 frame, u32 0, u32 value per counter (values as they are when the frame's
 // state is hashed). Names starting "fb_" count fallbacks (a wait gave up and the game ran on: must

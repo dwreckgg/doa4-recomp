@@ -37,6 +37,7 @@
 #include "../doa4_photo_win.h"
 #include "np_core.h"
 #include "np_det.h"
+#include "np_det_internal.h"
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -98,6 +99,8 @@ struct State {
   uint32_t sweep_per_frame = 4;
   std::vector<uint8_t> scratch;
   std::vector<uint64_t> row;
+  std::vector<std::vector<Mask>> block_masks;  // per sweep block: kSweepMasks inside it
+  bool timing_logged = false;                  // HoldFrameTiming's one log line
 
   // timing (QPC ticks)
   double qpc_us = 0;
@@ -223,6 +226,29 @@ void WriterLoop() {
   }
 }
 
+// Host bookkeeping inside the .data sweep, hashed as zero: each range is touched only by middleware,
+// driver or lock code and never by the game's update (classification: notes/research/
+// netplay_phase0_results.md, "Sweep words"). One exception, by judgement: the vblank count is also read
+// by game code, but only as a wait's exit condition (nothing derived from it is stored); a frame-keyed
+// value would never advance inside that wait.
+struct SweepMask {
+  uint32_t address;
+  uint32_t length;
+  const char* why;
+};
+constexpr SweepMask kSweepMasks[] = {
+    {0x82F6C9D0, 8, "CRI server threads B and A: loop-pass counters (sub_829BC8F8, sub_829BC458; zeroed by "
+                    "sub_829BCAC8), counted by their host-timed idle loops"},
+    {0x830ADBCC, 0x1C, "critical section of the 16-slot request table 0x830ADB08 (initialised in sub_824F4560, "
+                       "entered by sub_823FC5A0..sub_823FC808): lock count, recursion count, owner thread"},
+    {0x831A7AC0, 4, "vblank count stored by the D3D vblank callback sub_82766400 on the host vblank interrupt; "
+                    "read only as the wait condition of the vsync wait sub_824F1360 (via sub_824F0C60)"},
+    {0x8357A560, 0x400, "GPU timestamp ring 2 of the graphics object 0x83579C28 (+1292): 64 start and 64 end "
+                        "slots stored by the GPU-interrupt callback sub_82765540; read only by sub_82765EF8, "
+                        "whose result HoldFrameTiming replaces"},
+    {0x8357D520, 4, "D3D resource id counter (atomic increment in sub_8275D658): ids for D3D state caching"},
+};
+
 std::vector<Region> DigestRegions() {
   std::vector<Region> r;
   r.push_back({"game_obj", 0x8320D110, 0x63B0, {}});  // + 5 x 4336 B fighter blocks at +3836
@@ -309,7 +335,14 @@ void HashFrame(State& s, uint8_t* base, uint32_t f) {
     s.row.assign(s.sweep_per_frame, 0);
     for (uint32_t i = 0; i < s.sweep_per_frame; ++i) {
       const uint32_t k = (first + i) % nblocks;
-      s.row[i] = XXH3_64bits(base + kDataLo + k * kBlock, kBlock);
+      const uint32_t lo = kDataLo + k * kBlock;
+      if (s.block_masks[k].empty()) {
+        s.row[i] = XXH3_64bits(base + lo, kBlock);
+      } else {
+        const Region r{"", lo, kBlock, s.block_masks[k]};
+        MaskedCopy(r, base + lo, &s.scratch);
+        s.row[i] = XXH3_64bits(s.scratch.data(), s.scratch.size());
+      }
     }
     const uint32_t head[2] = {f, first};
     std::fwrite(head, sizeof(head), 1, s.sweep);
@@ -325,6 +358,40 @@ void HashFrame(State& s, uint8_t* base, uint32_t f) {
     if (s.sweep) std::fflush(s.sweep);
     if (s.counters) std::fflush(s.counters);
     if (s.rec) std::fflush(s.rec);
+  }
+}
+
+// sub_824F4498 (the frame function; its pre-wrap is the frame hook) measures the GPU's last frame from
+// timestamp ring 2 of the graphics object 0x83579C28 (sub_82765EF8: end - start of the newest complete
+// slot pair; the slots are stored by the GPU-interrupt callback sub_82765540 on the host's GPU
+// interrupt thread, so the frame they read is host-timed) and stores it into 0x831008E8 as percent of a
+// 59.94 Hz frame (100 * ticks / (KeQueryPerformanceFrequency * 0x822BC600)), and 0x822BC828 / that,
+// capped at 0x82166944 (60), into 0x831008E4. The game reads 0x831008E8 in sub_826BF030 (compared with
+// 0x8204FEF8 and a threshold table: a flag at +48 of its object) and sub_8271B318 (compared with the
+// thresholds at 0x8215E740..0x8215E748: which of r5 = 4..7 it passes on). In a session both words
+// hold what a 60 fps frame gives: the game's own arithmetic on one frame of the virtual timebase
+// (kTimebaseHz / 60 ticks), with the constants read from the image - 99.9 (0x42C7CCC7) and 60, the
+// values the replays showed whenever the measured slot pair was exactly one virtual frame apart.
+void HoldFrameTiming(uint8_t* base) {
+  State& s = S();
+  const float period = rex::memory::load_and_swap<float>(base + 0x822BC600);
+  const float percent = rex::memory::load_and_swap<float>(base + 0x8204FEF8);
+  const float fps_num = rex::memory::load_and_swap<float>(base + 0x822BC828);
+  const float fps_cap = rex::memory::load_and_swap<float>(base + 0x82166944);
+  const float measure = float(kTimebaseHz / 60) / (float(kTimebaseHz) * period);  // sub_82765EF8
+  const float gpu = measure * percent;                                              // sub_824F4498
+  float fps = fps_num / gpu;
+  if (fps > fps_cap) fps = fps_cap;
+  rex::memory::store_and_swap<float>(base + 0x831008E8, gpu);
+  rex::memory::store_and_swap<float>(base + 0x831008E4, fps);
+  if (!s.timing_logged) {
+    s.timing_logged = true;
+    uint32_t bits;
+    std::memcpy(&bits, &gpu, 4);
+    char line[160];
+    std::snprintf(line, sizeof(line), "frame timing held: 0x831008E8 = %.6g (%08X), 0x831008E4 = %.6g", gpu, bits,
+                  fps);
+    Log(line);
   }
 }
 
@@ -504,6 +571,18 @@ void Start(Host host) {
     const std::string head = EncodeSweepHeader(kDataLo, kDataHi, kBlock, s.sweep_per_frame);
     std::fwrite(head.data(), 1, head.size(), s.sweep);
   }
+  {
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    for (const SweepMask& m : kSweepMasks) ranges.push_back({m.address, m.length});
+    s.block_masks = BlockMasks(kDataLo, kBlock, (kDataHi - kDataLo) / kBlock, ranges);
+    uint32_t masked = 0, blocks = 0;
+    for (const auto& b : s.block_masks) {
+      blocks += b.empty() ? 0 : 1;
+      for (const Mask& m : b) masked += m.length;
+    }
+    Log("sweep masks: " + std::to_string(std::size(kSweepMasks)) + " ranges, " + std::to_string(masked) +
+        " bytes in " + std::to_string(blocks) + " blocks hashed as zero");
+  }
   s.counters = _wfopen((s.dir / "counters.d4k").wstring().c_str(), L"wb");
   if (s.counters) {
     const std::string head = EncodeCountersHeader(det::CounterNames());
@@ -550,6 +629,9 @@ void Shutdown() {
 REX_HOOK_RAW(sub_824F4498) {
   if (doa4::np::Active()) doa4::np::OnFrame(ctx, base);
   __imp__sub_824F4498(ctx, base);
+  // The frame function stores the host-timed GPU frame time into 0x831008E8 / 0x831008E4, which the
+  // game reads (HoldFrameTiming): in a session they hold a 60 fps frame's values.
+  if (doa4::np::Active() && doa4::np::det::On(doa4::np::det::kClock)) doa4::np::HoldFrameTiming(base);
 }
 
 // r3 = user (0-3), r4 = X_INPUT_STATE* (be32 packet number, then the 12-byte

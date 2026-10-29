@@ -383,6 +383,24 @@ uint32_t SweepFirst(uint32_t frame, uint32_t per_frame, uint32_t nblocks) {
   return nblocks ? uint32_t((uint64_t(frame) * per_frame) % nblocks) : 0;
 }
 
+std::vector<std::vector<Mask>> BlockMasks(uint32_t lo, uint32_t block, uint32_t nblocks,
+                                          const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  std::vector<std::vector<Mask>> out(nblocks);
+  const uint64_t hi = uint64_t(lo) + uint64_t(block) * nblocks;
+  for (const auto& [address, length] : ranges) {
+    uint64_t a = std::max<uint64_t>(address, lo);
+    const uint64_t end = std::min<uint64_t>(uint64_t(address) + length, hi);
+    while (a < end) {
+      const uint32_t i = uint32_t((a - lo) / block);
+      const uint64_t block_end = uint64_t(lo) + uint64_t(i + 1) * block;
+      const uint64_t stop = std::min(end, block_end);
+      out[i].push_back({uint32_t(a - (uint64_t(lo) + uint64_t(i) * block)), uint32_t(stop - a)});
+      a = stop;
+    }
+  }
+  return out;
+}
+
 std::string EncodeCountersHeader(const std::vector<std::string>& names) {
   std::string s = "D4NPCNT1";
   PutLe32(&s, 1);
