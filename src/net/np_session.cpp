@@ -35,6 +35,7 @@
 
 #include "generated/default/dead_or_alive_4_init.h"
 
+#include "../doa4_gamefiles.h"
 #include "../doa4_photo_win.h"
 #include "../doa4_tweaks.h"
 #include "np_core.h"
@@ -172,7 +173,8 @@ bool ReadFile(const std::filesystem::path& path, std::string* out) {
 }
 
 // The exe and the runtime DLL beside it (XXH3), as 16 hex digits: two PCs replay one recording only
-// with the same build.
+// with the same build. A file that cannot be read makes the id "unreadable", which agrees with nothing
+// (MetaMismatch), so a recording is never replayed on the strength of a hash of nothing.
 std::string BuildId() {
   std::wstring path(32768, L'\0');
   const DWORD n = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
@@ -180,22 +182,39 @@ std::string BuildId() {
   uint64_t h = 0;
   for (const std::filesystem::path& p : {exe, exe.parent_path() / "rexruntime.dll"}) {
     std::string bytes;
-    if (ReadFile(p, &bytes)) h = XXH3_64bits_withSeed(bytes.data(), bytes.size(), h);
+    if (!ReadFile(p, &bytes) || bytes.empty()) {
+      Log("build: " + p.string() + " cannot be read; build=unreadable (a recording made or replayed here is refused)");
+      return "unreadable";
+    }
+    h = XXH3_64bits_withSeed(bytes.data(), bytes.size(), h);
   }
   return fmt::format("{:016x}", h);
 }
 
+// default.xex of the game folder the session runs on (XXH3, 16 hex digits): two PCs replay one recording
+// only on the same dump of the game. Unreadable (no folder, no file, an empty file) is "unreadable", as
+// for the build.
+std::string DataId(const std::filesystem::path& game_data_root) {
+  const std::filesystem::path xex = game_data_root / doa4::gamefiles::kXexName;
+  std::string bytes;
+  if (game_data_root.empty() || !ReadFile(xex, &bytes) || bytes.empty()) {
+    Log("game data: " + xex.string() + " cannot be read; data=unreadable (a recording made or replayed here is refused)");
+    return "unreadable";
+  }
+  return fmt::format("{:016x}", XXH3_64bits(bytes.data(), bytes.size()));
+}
+
 // The recording's meta text (np_core.h): what a replay must match to run at all. The tweaks patch the
 // game's tables at boot (SetUpExtras, before this runs), so their state is part of the build.
-std::string CurrentMeta(uint32_t sweep_per_frame) {
+std::string CurrentMeta(const std::filesystem::path& game_data_root, uint32_t sweep_per_frame) {
   std::string tweaks;
   for (const auto& t : doa4::tweaks::AllTweaks()) {
     tweaks += fmt::format("{}{}={}", tweaks.empty() ? "" : ",", t.cvar, rex::cvar::Query<bool>(t.cvar) ? 1 : 0);
   }
   const std::string serial = Env("DOA4_NP_SERIAL");
-  return "build=" + BuildId() + "\nfixes=" + det::FixSetName() + "\nserial=" +
-         (serial.empty() ? std::string("default") : serial) + "\nsweep=" + std::to_string(sweep_per_frame) +
-         "\ntweaks=" + tweaks + "\n";
+  return "build=" + BuildId() + "\ndata=" + DataId(game_data_root) + "\nfixes=" + det::FixSetName() +
+         "\nserial=" + (serial.empty() ? std::string("default") : serial) + "\nsweep=" +
+         std::to_string(sweep_per_frame) + "\ntweaks=" + tweaks + "\n";
 }
 
 // Reads and deletes a request file; false if it is not there.
@@ -555,21 +574,24 @@ void Start(Host host) {
   } else if (!sweep.empty()) {
     s.sweep_per_frame = std::clamp<uint32_t>(std::strtoul(sweep.c_str(), nullptr, 10), 1, nblocks);
   }
-  const std::string meta = CurrentMeta(s.sweep_per_frame);
+  const std::string meta = CurrentMeta(s.host.game_data_root, s.sweep_per_frame);
 
   std::string error;
   if (s.mode == Mode::kReplay) {
     std::string bytes, note;
     const std::filesystem::path rec = Env("DOA4_NP_REC");
     if (!ReadFile(rec, &bytes) || !DecodeRecording(bytes, &s.replay, &error, &note)) {
+      // A replay that cannot start ends the run like a refusal does: left running it would boot a normal
+      // game and wait at the title for a test tool's timeout (or for a person).
       Log("cannot replay " + rec.string() + ": " + (error.empty() ? "unreadable" : error));
       s.mode = Mode::kOff;
+      if (s.host.quit) s.host.quit();
       return;
     }
     s.seed = s.replay.seed;
     Log("replay " + rec.string() + ": " + std::to_string(s.replay.frames.size()) + " frames, seed " +
         std::to_string(s.seed) + (note.empty() ? "" : " (" + note + ")"));
-    // A recording made by another build, fix set, worker mode, sweep setting or tweak state would end in
+    // A recording made by another build, game data, fix set, worker mode, sweep setting or tweak state would end in
     // a desync nobody can read: refuse it, with the reason (DOA4_NP_ALLOW_MISMATCH=1 is for hunting).
     if (const std::string why = MetaMismatch(s.replay.meta, meta); !why.empty()) {
       if (Env("DOA4_NP_ALLOW_MISMATCH") != "1") {

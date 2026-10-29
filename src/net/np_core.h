@@ -115,7 +115,7 @@ class InputQueue {
 // ---- Recordings ----
 // Header (32 bytes): "D4NPREC1", u32 version (2; 1 = the proof's, still read), u32 frame bytes (52),
 // u64 session seed, u32 flags, u32 meta bytes (0 in version 1). Version 2 then holds the meta text
-// ("key=value" lines: build, fixes, serial, sweep, tweaks) before the frames. Then one 52-byte record
+// ("key=value" lines: build, data, fixes, serial, sweep, tweaks) before the frames. Then one 52-byte record
 // per frame from frame 0: u8 connected mask, 3 zero bytes, 4 x 12 guest gamepad bytes.
 // A recording cut short by a crash is still readable (whole frames only).
 inline constexpr size_t kRecHeaderBytes = 32;
@@ -135,9 +135,10 @@ struct Recording {
 // dropped (reported in *note).
 bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error,
                      std::string* note = nullptr);
-// "" when the keys build, fixes, serial, sweep and tweaks of two meta texts agree (a key missing from
-// one text, as in a version-1 recording, reads "(none)"); else "<key> <recorded> vs <current>; ..." in
-// that key order. Other keys are ignored.
+// "" when the keys build, data, fixes, serial, sweep and tweaks of two meta texts agree (a key missing
+// from one text, as in a version-1 recording, reads "(none)"); else "<key> <recorded> vs <current>; ..."
+// in that key order. Other keys are ignored. The value "unreadable" (the exe or the game data could not
+// be hashed) agrees with nothing, itself included.
 std::string MetaMismatch(std::string_view recorded, std::string_view current);
 
 // ---- Digest regions ----

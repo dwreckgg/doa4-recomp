@@ -264,6 +264,10 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.quit = [this] {
       app_context().CallInUIThreadDeferred([this] { app_context().QuitFromUIThread(); });
     };
+    // The folder the game was loaded from (the one MountDiscRoot mounts as the disc), else the one the
+    // setup chose: the session hashes its default.xex into the recording's meta.
+    if (auto* rt = runtime()) host.game_data_root = std::filesystem::absolute(rt->game_data_root());
+    if (host.game_data_root.empty()) host.game_data_root = game_files_;
     doa4::np::Start(std::move(host));
   }
   void OnPreLaunchModule() override {

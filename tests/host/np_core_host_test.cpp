@@ -234,34 +234,54 @@ static void TestRecording() {
 }
 
 static void TestMetaMismatch() {
-  const std::string cur = "build=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n";
+  // The meta text the session writes: six keys, in this order.
+  auto meta = [](const char* build = "aa", const char* data = "dd", const char* fixes = "all",
+                 const char* serial = "default", const char* sweep = "4", const char* tweaks = "x=0") {
+    return std::string("build=") + build + "\ndata=" + data + "\nfixes=" + fixes + "\nserial=" + serial +
+           "\nsweep=" + sweep + "\ntweaks=" + tweaks + "\n";
+  };
+  const std::string cur = meta();
+  CHECK(cur == "build=aa\ndata=dd\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n");
   CHECK(!cur.empty() && MetaMismatch(cur, cur).empty());
-  CHECK(MetaMismatch("build=bb\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur) == "build bb vs aa");
-  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=3\nsweep=4\ntweaks=x=1\n", cur) ==
-        "serial 3 vs default; tweaks x=1 vs x=0");
+  CHECK(MetaMismatch(meta("bb"), cur) == "build bb vs aa");
+  CHECK(MetaMismatch(meta("aa", "dd", "all", "3", "4", "x=1"), cur) == "serial 3 vs default; tweaks x=1 vs x=0");
   CHECK(MetaMismatch("", cur).find("build (none) vs aa") == 0);  // a version-1 recording
-  CHECK(MetaMismatch("other=1\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0", cur).empty());
+  CHECK(MetaMismatch("other=1\n" + meta().substr(0, meta().size() - 1), cur).empty());  // no final newline
+  // A key that neither text has reads "(none)" in both and agrees ("(none)" is a missing key, not a value
+  // that disagrees like "unreadable").
+  CHECK(MetaMismatch("", "").empty() && MetaMismatch("other=1\n", "other=2\n").empty());
 
   // Beyond the brief: wrong versions this excludes.
-  // Every one of the five keys is compared on its own (a key dropped from the list survives the
-  // brief's build / serial / tweaks fixtures).
-  CHECK(MetaMismatch("build=aa\nfixes=none\nserial=default\nsweep=4\ntweaks=x=0\n", cur) == "fixes none vs all");
-  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=all\ntweaks=x=0\n", cur) == "sweep all vs 4");
-  // A version-1 recording names all five keys, in the fixed order, with the whole current value.
+  // Every one of the six keys is compared on its own (a key dropped from the list survives fixtures that
+  // only vary the others).
+  CHECK(MetaMismatch(meta("aa", "dd", "none"), cur) == "fixes none vs all");
+  CHECK(MetaMismatch(meta("aa", "dd", "all", "default", "all"), cur) == "sweep all vs 4");
+  CHECK(MetaMismatch(meta("aa", "ee"), cur) == "data ee vs dd");  // the game data: a different dump
+  // A version-1 recording names all six keys, in the fixed order, with the whole current value; a version-2
+  // recording from before the data key names only the data key as missing.
   CHECK(MetaMismatch("", cur) ==
-        "build (none) vs aa; fixes (none) vs all; serial (none) vs default; sweep (none) vs 4; tweaks (none) vs x=0");
-  // Keys are whole names at the start of a line: "xbuild" and "build2" are other keys (a substring find
-  // or a prefix compare reads their values), and a key with a value that holds '=' keeps all of it.
-  CHECK(MetaMismatch("xbuild=zz\nbuild2=yy\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur).empty());
-  CHECK(MetaMismatch("xbuild=aa\nbuild2=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur) ==
-        "build (none) vs aa");
-  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0,y=1\n", cur) ==
-        "tweaks x=0,y=1 vs x=0");
-  // Keys outside the five never count, whatever their values; an empty value is a value, not "(none)".
-  CHECK(MetaMismatch("other=2\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n",
-                     "other=1\nbuild=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n").empty());
-  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=\nsweep=4\ntweaks=x=0\n", cur) == "serial  vs default");
-  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=4\n", cur) == "tweaks (none) vs x=0");
+        "build (none) vs aa; data (none) vs dd; fixes (none) vs all; serial (none) vs default; sweep (none) vs 4; "
+        "tweaks (none) vs x=0");
+  CHECK(MetaMismatch("build=aa\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur) == "data (none) vs dd");
+  // Keys are whole names at the start of a line: "xbuild", "build2", "xdata" and "data2" are other keys (a
+  // substring find or a prefix compare reads their values), and a key with a value that holds '=' keeps
+  // all of it.
+  CHECK(MetaMismatch("xbuild=zz\nbuild2=yy\nxdata=zz\ndata2=yy\n" + cur, cur).empty());
+  CHECK(MetaMismatch("xbuild=aa\nbuild2=aa\nxdata=dd\ndata2=dd\nfixes=all\nserial=default\nsweep=4\ntweaks=x=0\n", cur) ==
+        "build (none) vs aa; data (none) vs dd");
+  CHECK(MetaMismatch(meta("aa", "dd", "all", "default", "4", "x=0,y=1"), cur) == "tweaks x=0,y=1 vs x=0");
+  // Keys outside the six never count, whatever their values; an empty value is a value, not "(none)".
+  CHECK(MetaMismatch("other=2\n" + cur, "other=1\n" + cur).empty());
+  CHECK(MetaMismatch(meta("aa", "dd", "all", ""), cur) == "serial  vs default");
+  CHECK(MetaMismatch(meta("aa", "", "all"), cur) == "data  vs dd");
+  CHECK(MetaMismatch("build=aa\ndata=dd\nfixes=all\nserial=default\nsweep=4\n", cur) == "tweaks (none) vs x=0");
+  // "unreadable" (the build or the game data could not be hashed) agrees with nothing, itself included: two
+  // PCs that both failed to read their files must not replay each other's recordings.
+  CHECK(MetaMismatch(meta("aa", "unreadable"), cur) == "data unreadable vs dd");
+  CHECK(MetaMismatch(cur, meta("aa", "unreadable")) == "data dd vs unreadable");
+  CHECK(MetaMismatch(meta("aa", "unreadable"), meta("aa", "unreadable")) == "data unreadable vs unreadable");
+  CHECK(MetaMismatch(meta("unreadable"), meta("unreadable")) == "build unreadable vs unreadable");
+  CHECK(MetaMismatch(meta("aa", "unreadable"), meta("aa", "unreadable")).find("build") == std::string::npos);
 }
 
 static void TestMaskedCopy() {
