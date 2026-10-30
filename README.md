@@ -289,7 +289,7 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 
 | Bug | Status |
 |---|---|
-| Choosing **Ryu Hayabusa** or **Zack** crashes the game. Seen with either one as player 1 in Single Battle, on every build so far; Ryu also crashed the attract demo once (Ryu vs Christie). | Open: avoid both characters for now. It is not a missing function: the game's own code reads bad data (Zack in the animation reader, Ryu in a per-fighter update), and finding where that data goes wrong needs a memory trace. |
+| Choosing **Ryu Hayabusa** (or **Brad Wong**, first reported as Zack) as player 1 crashed the game; Ryu also crashed the attract demo (Ryu vs Christie). | Fixed: the runtime put the game's data pool at guest address 0x00010000, so low that the game's "already relocated?" test (a table entry above the buffer address counts as a pointer) skipped Ryu's move-script table; Brad Wong's character-select model read a bad motion record from the same low pool (gone with the fix, not traced to its table). The game now keeps guest 0x00010000-0x0FFFFFFF unused (`src/doa4_lowmem.cpp`; the log says `[doa4][MEM] reserved guest ...`). |
 | A rare crash with `Call to invalid or unregistered function at guest address 0x...` in the log, at one particular move or moment. | A function the recompiler missed. Add the address to `hints.toml` and regenerate (step 8). |
 
 ## Building from a fresh GitHub clone
