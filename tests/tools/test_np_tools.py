@@ -570,6 +570,160 @@ def test_np_run_refusal(root):
           "unsupported recording version\n", f"np_run, an unreadable recording: result {result(runs, 'cant')!r}")
 
 
+def own_affinity():
+    """The CPU mask of this test process."""
+    import ctypes
+    mine, system = ctypes.c_size_t(), ctypes.c_size_t()
+    ctypes.windll.kernel32.GetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.byref(mine), ctypes.byref(system))
+    return mine.value
+
+
+def logged_affinity(runs, name):
+    """The CPU mask the stand-in game logged for a run (None: the run has no such line)."""
+    path = os.path.join(runs, name, "out", "np_log.txt")
+    found = re.search(r"^stand-in game: affinity (0x[0-9a-f]+)$", open(path).read(), re.M) if os.path.exists(path) else None
+    return int(found.group(1), 16) if found else None
+
+
+def command_tail(runs, name):
+    """The last line of the run's command.txt (None: the run has none)."""
+    path = os.path.join(runs, name, "command.txt")
+    return open(path).read().splitlines()[-1] if os.path.exists(path) else None
+
+
+def suspended_leftovers(run_dir):
+    """How many cmd.exe processes (the stand-in game's launcher) have the run folder on their command line:
+    -1 if the listing failed. A refused --affinity run must leave none; the same count is 1 while one runs."""
+    script = ("(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -like '*"
+              + run_dir.replace("'", "''") + "*' } | Measure-Object).Count")
+    p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                       capture_output=True, text=True, timeout=120)
+    return int(p.stdout.strip()) if p.stdout.strip().isdigit() else -1
+
+
+def test_np_run_affinity(root):
+    # --affinity limits the game process to the given CPUs before any of its threads runs (the stand-in logs
+    # the mask it finds itself with). The control is a run without the option, which keeps this process's CPUs.
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+    own = own_affinity()
+    one = own & -own  # the lowest CPU this test may use
+    check(own != one, f"np_run --affinity: the test needs at least two CPUs to tell a limit from none (own {own:#x})")
+
+    def np_run(name, *extra):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60", *extra],
+                           capture_output=True, text=True, env=stand_in_env(), timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    code, out = np_run("free")
+    check(code == 0 and result(runs, "free") == REC_OK, f"np_run, no --affinity: exit {code}\n{out}")
+    check(logged_affinity(runs, "free") == own, f"np_run, no --affinity: the game keeps this process's CPUs {own:#x}, got {logged_affinity(runs, 'free')}")
+    check(not (command_tail(runs, "free") or "").startswith("affinity"), "np_run, no --affinity: command.txt has no affinity line")
+    code, out = np_run("cut", "--affinity", hex(one))
+    check(code == 0 and result(runs, "cut") == REC_OK, f"np_run --affinity: the limited run was resumed and ended well: exit {code}\n{out}")
+    check(logged_affinity(runs, "cut") == one, f"np_run --affinity {one:#x}: the game ran on {logged_affinity(runs, 'cut')}")
+    check(command_tail(runs, "cut") == f"affinity {hex(one)}", f"np_run --affinity: command.txt ends with {command_tail(runs, 'cut')!r}")
+    # a mask of no CPU is refused by Windows: the run stops there, before the game runs at all
+    code, out = np_run("none", "--affinity", "0x0")
+    check(code != 0 and "SetProcessAffinityMask failed" in out, f"np_run --affinity 0x0: exit {code}\n{out}")
+    check(logged_affinity(runs, "none") is None and result(runs, "none") is None, "np_run --affinity 0x0: the game must not run")
+    # ... and the process np_run created suspended is ended, not left behind (a suspended game would hold its memory)
+    left = suspended_leftovers(os.path.join(runs, "none"))
+    check(left == 0, f"np_run --affinity 0x0: {left} process(es) of the refused run left behind (-1: the listing failed)")
+
+
+def test_gate_affinity(root):
+    # the gate hands --affinity to every run it starts: the record, the sequential and the concurrent replays
+    own = own_affinity()
+    one = own & -own
+    code, out, runs = gate(root, "af", "--script", SCRIPT, "--replays", "1", "--concurrent", "1", "--affinity", hex(one))
+    check(code == 0, f"gate --affinity: exit {code}\n{out}")
+    for n in ("af_rec", "af_rep1", "af_con1"):
+        check(logged_affinity(runs, n) == one, f"gate --affinity {one:#x}: run {n} ran on {logged_affinity(runs, n)}")
+        check(command_tail(runs, n) == f"affinity {hex(one)}", f"gate --affinity: {n} command.txt ends with {command_tail(runs, n)!r}")
+
+
+def test_compare_final_progress(root):
+    # each run's progress counters (pr_*) at the last counters row are printed: the compare judges that the
+    # runs agree, never what the value is, so a counter that is 0 in every run passes and only the printed
+    # value shows it. Fallback counters (fb_*) are not progress and are not printed here.
+    def pair(root, tag, a_rows, b_rows):
+        names = ["fb_main_wait", "pr_cri_passes", "pr_notify"]
+        runs = []
+        for label, rows in (("a", a_rows), ("b", b_rows)):
+            run = make_run(root, f"{tag}{label}")
+            write_counters(os.path.join(run, "out", "counters.d4k"), rows, names)
+            runs.append(run)
+        return runs
+
+    rising = [(0, 10 + i, 5 + i) for i in range(10)]
+    code, out = compare(*pair(root, "e", rising, rising))
+    check(code == 0, f"final progress, equal runs: exit {code}\n{out}")
+    check("  run A final progress: pr_cri_passes=19 pr_notify=14\n" in out, f"final progress, run A line\n{out}")
+    check("  run B final progress: pr_cri_passes=19 pr_notify=14\n" in out, f"final progress, run B line\n{out}")
+    # B differs from A at its last row only: each line carries its own run's LAST row
+    ends_low = rising[:-1] + [(0, 19, 0)]
+    code, out = compare(*pair(root, "d", rising, ends_low))
+    check(code == 1 and "pr_notify first differs at frame 9" in out, f"final progress, differing runs: exit {code}\n{out}")
+    check("  run A final progress: pr_cri_passes=19 pr_notify=14\n" in out, f"final progress, differing runs: run A line\n{out}")
+    check("  run B final progress: pr_cri_passes=19 pr_notify=0\n" in out, f"final progress, differing runs: run B line\n{out}")
+    # a counter that never moves in either run is equal, so the compare passes: the printed 0 is what shows it
+    zero = [(0, 10 + i, 0) for i in range(10)]
+    code, out = compare(*pair(root, "z", zero, zero))
+    check(code == 0, f"final progress, zeroed counter in both runs: exit {code}\n{out}")
+    check("  run A final progress: pr_cri_passes=19 pr_notify=0\n" in out, f"final progress, zeroed counter: the printed value\n{out}")
+    # a run without a counters file has nothing to print (the compare fails it on its own)
+    a, b = make_run(root, "ma"), make_run(root, "mb")
+    os.remove(os.path.join(b, "out", "counters.d4k"))
+    code, out = compare(a, b)
+    check(code == 1 and "run B: no counters.d4k" in out and "final progress" in out and "run B final progress" not in out,
+          f"final progress, a run without counters: exit {code}\n{out}")
+
+
+def test_gate_final_progress(root):
+    # the gate prints every run's final progress counters once (not once per pair), so the values a good
+    # build ends with are in the gate's own output
+    final = "pr_cri_passes=1011 pr_spin_steps=1111 pr_loader_jobs=1211 pr_cri_jobs=1311 pr_reseeds=1411 pr_notify=1511"
+    code, out, runs = gate(root, "fp", "--script", SCRIPT, "--replays", "1", "--concurrent", "1")
+    check(code == 0, f"gate, final progress: exit {code}\n{out}")
+    for n in ("fp_rec", "fp_rep1", "fp_con1"):
+        check(f"{n} final progress: {final}\n" in out, f"gate, final progress: the line of {n}\n{out}")
+    check(out.count("final progress: ") == 3, f"gate, final progress: one line per run, not per pair\n{out}")
+    # the gate imports np_compare: that must not leave bytecode behind in the tools folder (a tracked tree)
+    check(not os.path.exists(os.path.join(TOOLS, "__pycache__")), "gate: no __pycache__ in tools after a gate run")
+    # a run that left no counters file is named, not skipped
+    code, out, runs = gate(root, "fq", "--script", SCRIPT, "--replays", "1", FAKE_GAME_CANNOT="_rep1")
+    check(code == 1, f"gate, final progress, an unreadable recording: exit {code}\n{out}")
+    check("fq_rep1 final progress: none (no counters.d4k)\n" in out, f"gate, final progress: the run without counters\n{out}")
+    check(f"fq_rec final progress: {final}\n" in out, f"gate, final progress: the good run still printed\n{out}")
+    # each line comes from its own run: one concurrent replay ends with pr_notify 1512 (+1 at its last row only),
+    # the others with 1511; the pairs that include it differ and fail the gate
+    code, out, runs = gate(root, "fr", "--script", SCRIPT, "--replays", "1", "--concurrent", "2", FAKE_GAME_PROGRESS_END="_con2")
+    check(code == 1 and "pr_notify first differs at frame 11" in out, f"gate, final progress, runs that end apart: exit {code}\n{out}")
+    for n, notify in (("fr_rec", 1511), ("fr_rep1", 1511), ("fr_con1", 1511), ("fr_con2", 1512)):
+        line = final.replace("pr_notify=1511", f"pr_notify={notify}")
+        check(f"{n} final progress: {line}\n" in out, f"gate, final progress, runs that end apart: the line of {n}\n{out}")
+    # the helper alone: runs of different values, a missing file, a file that is not a counters file
+    gate_final_progress = load("np_gate").final_progress
+
+    def final_progress(name):  # a raise (SystemExit included) is a failed check, not the end of the suite
+        try:
+            return gate_final_progress(root, name)
+        except BaseException as e:
+            return f"raised {type(e).__name__}: {e}"
+
+    make_run(root, "ha"), make_run(root, "hb", progress_change=9)
+    c = make_run(root, "hc")
+    os.remove(os.path.join(c, "out", "counters.d4k"))
+    check(final_progress("ha") == "pr_cri_passes=19", f"final_progress, run a: {final_progress('ha')!r}")
+    check(final_progress("hb") == "pr_cri_passes=99", f"final_progress, run b: {final_progress('hb')!r}")
+    check(final_progress("hc") == "none (no counters.d4k)", f"final_progress, no file: {final_progress('hc')!r}")
+    with open(os.path.join(c, "out", "counters.d4k"), "wb") as f:
+        f.write(b"not a counters file at all")
+    check(final_progress("hc").startswith("none (") and "not a counters file" in final_progress("hc"),
+          f"final_progress, a file that is not a counters file: {final_progress('hc')!r}")
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     for name, fn in tests:

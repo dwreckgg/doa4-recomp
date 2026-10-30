@@ -9,7 +9,10 @@ timeout.
   py -3 tools/np_run.py replay NAME --rec runs/NAME0/out/rec.d4r
 Options: --exe, --game, --userdata (the pristine source), --runs (where run folders go),
 --cache (shared shader cache), --sweep N|all, --dump f,f, --shot-every N,
---env KEY=VALUE (repeatable: extra environment, e.g. DOA4_NP_FIX=none), --timeout seconds.
+--env KEY=VALUE (repeatable: extra environment, e.g. DOA4_NP_FIX=none), --timeout seconds,
+--affinity MASK (logical CPU mask, e.g. 0x3: the game is started suspended, limited to those CPUs
+before any of its threads runs, then resumed; only the run's own process; command.txt ends with
+"affinity MASK").
 Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
 A replay the session refuses (another build, fix set, game data or settings than the recording's) or cannot read is
 never a good run: run_result.txt then has "status failed" and "quit refused: ..." / "quit cannot replay ...", or
@@ -85,6 +88,7 @@ def main():
     ap.add_argument("--log-level", default=None, help="the game's log_level (info by default)")
     ap.add_argument("--arg", action="append", default=[], help="extra game argument, e.g. --arg=--headless=true")
     ap.add_argument("--timeout", type=float, default=900)
+    ap.add_argument("--affinity", help="logical CPU mask, e.g. 0x3 (two logical CPUs)")
     a = ap.parse_args()
 
     run = os.path.join(a.runs, a.name)
@@ -127,8 +131,19 @@ def main():
                 f.write(f"{k}={env[k]}\n")
 
     t0 = time.time()
-    p = subprocess.Popen(args, env=env, cwd=os.path.dirname(a.exe),
+    flags = 0x00000004 if a.affinity else 0  # CREATE_SUSPENDED: limit the CPUs before any thread runs
+    p = subprocess.Popen(args, env=env, cwd=os.path.dirname(a.exe), creationflags=flags,
                          stdout=open(os.path.join(run, "stdout.txt"), "w"), stderr=subprocess.STDOUT)
+    if a.affinity:
+        import ctypes
+        k32, ntdll = ctypes.windll.kernel32, ctypes.windll.ntdll
+        handle = ctypes.c_void_p(int(p._handle))
+        if not k32.SetProcessAffinityMask(handle, ctypes.c_size_t(int(a.affinity, 0))):
+            p.kill()
+            sys.exit(f"SetProcessAffinityMask failed: {ctypes.GetLastError()}")
+        ntdll.NtResumeProcess(handle)
+        with open(os.path.join(run, "command.txt"), "a") as f:
+            f.write(f"affinity {a.affinity}\n")
     with open(os.path.join(run, "pid.txt"), "w") as f:
         f.write(str(p.pid))
     print(f"run {run} pid {p.pid}", flush=True)

@@ -85,6 +85,15 @@ def fallbacks(label, names, frames):
     return lines
 
 
+def final_progress(names, frames):
+    """The progress counters (pr_*) at the last counters row, as `name=value` words in file order.
+    Judging only compares the runs with each other, so this is how the value a run ended with is read."""
+    if not frames:
+        return "no rows"
+    last = frames[max(frames)]
+    return " ".join(f"{name}={last[i]}" for i, name in enumerate(names) if name.startswith("pr_"))
+
+
 def judge_counters(a, b, digest_a, digest_b, start, allow_unchecked):
     """Judges the runs' counters.d4k (np_core.h): a fallback counter (fb_*) above zero anywhere in a
     run, a progress counter (pr_*) that differs between the runs at a frame both have (from `start`),
@@ -123,6 +132,8 @@ def judge_counters(a, b, digest_a, digest_b, start, allow_unchecked):
               ("no fallbacks, progress equal" if not problems else f"{len(problems)} problems"))
     else:
         print("counters: not compared; " + ("no fallbacks in the run that has them" if not problems else f"{len(problems)} problems"))
+    for label in sorted(found):
+        print(f"  run {label} final progress: {final_progress(*found[label])}")
     for line in problems:
         print(line)
     return bool(problems)

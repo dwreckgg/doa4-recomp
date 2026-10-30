@@ -17,6 +17,8 @@ Test-only environment (the stand-in's own, not the game's):
                     and otherwise ends cleanly
   FAKE_GAME_PROGRESS  same form: that run's pr_cri_passes differs from every other run's at frame 6
                     only (+1 there)
+  FAKE_GAME_PROGRESS_END  same form: that run's pr_notify differs from every other run's at its last
+                    counters row only (+1 there), so the runs END with different progress values
   FAKE_GAME_SWEEP   same form: that run's sweep row of frame 5 differs from every other run's (its
                     first block, 0x82C10000) and otherwise ends cleanly
   FAKE_GAME_REFUSE  same form, replays: that replay refuses its recording as the real session does
@@ -26,6 +28,9 @@ Test-only environment (the stand-in's own, not the game's):
                     line and no quit line, exit 0
   FAKE_GAME_CANNOT  same form, replays: that replay cannot read its recording: one "cannot replay" line,
                     no other file, exit 0 (the host was asked to quit)
+Every run also logs the CPUs it may run on ("stand-in game: affinity 0x..", GetProcessAffinityMask), which is
+how the tests see that np_run.py --affinity took effect: a child process inherits its creator's mask, and
+this one is started behind fake_game.cmd.
 Every run writes the same hashes and the same counters for the same frame, so runs of equal length
 compare equal. Counters: the real file layout (np_core.h) with the real names (np_det.cpp, pinned by
 test_counter_names_match_source); fb_* are 0, pr_* are a function of the frame.
@@ -61,7 +66,7 @@ def write_sweep(path, rows, differ=False):
             f.write(struct.pack("<II", i, (i * SWEEP_PER) % 164) + struct.pack(f"<{SWEEP_PER}Q", first, 4000 + i))
 
 
-def counter_values(frame, fallback, progress):
+def counter_values(frame, fallback, progress, bump_notify=False):
     values = []
     for i, name in enumerate(COUNTERS):
         if name.startswith("fb_"):
@@ -70,17 +75,27 @@ def counter_values(frame, fallback, progress):
             value = (i + 1) * 100 + frame
             if progress and name == "pr_cri_passes" and frame == PROGRESS_FRAME:
                 value += 1
+            if bump_notify and name == "pr_notify":
+                value += 1
         values.append(value)
     return values
 
 
-def write_counters(path, rows, fallback, progress):
+def write_counters(path, rows, fallback, progress, progress_end=False):
     with open(path, "wb") as f:
         f.write(b"D4NPCNT1" + struct.pack("<II", 1, len(COUNTERS)))
         for name in COUNTERS:
             f.write(name.encode().ljust(24, bytes(1)))
         for i in range(rows):
-            f.write(struct.pack("<II", i, 0) + struct.pack(f"<{len(COUNTERS)}I", *counter_values(i, fallback, progress)))
+            f.write(struct.pack("<II", i, 0) + struct.pack(f"<{len(COUNTERS)}I", *counter_values(i, fallback, progress, progress_end and i == rows - 1)))
+
+
+def process_affinity():
+    """The CPU mask this process may run on (GetProcessAffinityMask)."""
+    import ctypes
+    mine, system = ctypes.c_size_t(), ctypes.c_size_t()
+    ctypes.windll.kernel32.GetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.byref(mine), ctypes.byref(system))
+    return mine.value
 
 
 def listed(name, var):
@@ -119,8 +134,8 @@ def main():
     write_digest(os.path.join(out, "digest.d4d"), rows)
     write_sweep(os.path.join(out, "sweep.d4s"), rows, listed(name, "FAKE_GAME_SWEEP"))
     write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
-                   listed(name, "FAKE_GAME_PROGRESS"))
-    log = [f"stand-in game: {mode} run {name}, {rows} frames"]
+                   listed(name, "FAKE_GAME_PROGRESS"), listed(name, "FAKE_GAME_PROGRESS_END"))
+    log = [f"stand-in game: {mode} run {name}, {rows} frames", f"stand-in game: affinity {process_affinity():#x}"]
     if mode == "record":
         with open(os.path.join(out, "rec.d4r"), "w") as f:
             f.write(f"{frames}\n")
