@@ -190,6 +190,27 @@ std::vector<std::vector<Mask>> BlockMasks(uint32_t lo, uint32_t block, uint32_t 
 // nothing; the bytes hashed are those of Region{"", lo + k * block, block, BlockMasks(...)[k]}.
 std::vector<Region> BlockRegions(uint32_t lo, uint32_t block, uint32_t nblocks,
                                  const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+
+// ---- The SDK's handle stash in guest object headers (left out of the .data sweep, Task 11c) ----
+// The first time the SDK uses a guest dispatcher object (an event, mutant or semaphore in guest memory) it creates a
+// host object and stashes its handle in the guest header (sdk-np0 include/rex/system/xobject.h StashHandle):
+// wait_list_flink = kXObjSignature = make_fourcc('R', 'E', 'X', '\0') = 0x52455800, stored big-endian, so the bytes
+// "REX\0" lie in guest memory, and the next word, wait_list_blink, = the handle. The handle is the object table's next
+// free slot, a host-timed number at boot (single_b con3: 0x82B74778 = F800005C against F8000054), and only the SDK
+// reads it back (no guest code reads it). So the sweep hashes every 4-aligned word that follows the signature as
+// zero, by structure (no address list). The signature word itself is hashed as it is.
+inline constexpr uint8_t kStashSignature[4] = {0x52, 0x45, 0x58, 0x00};
+// `bytes` = `length` bytes of guest memory from a 4-aligned guest address (length a multiple of 4); `before` = the 4
+// guest bytes just before bytes[0], or null where there are none. True if some word of `bytes` follows a signature
+// (a signature in the last word belongs to the next range's first word).
+bool HasStashWords(const uint8_t* bytes, size_t length, const uint8_t* before);
+// Zeroes every word of `bytes` that follows a signature, deciding from the bytes as they were before any was zeroed
+// (a signature that is itself a stash word still marks the word after it). Returns the number of words zeroed.
+uint32_t ZeroStashWords(uint8_t* bytes, size_t length, const uint8_t* before);
+// The bytes the sweep hashes for one block: a copy of the region's guest bytes, its stash words zeroed (decided on the
+// copy as made), then its masks zeroed (as MaskedCopy). Returns the number of stash words zeroed.
+uint32_t SweepBlockCopy(const Region& region, const uint8_t* bytes, const uint8_t* before, std::vector<uint8_t>* out);
+
 // Counter file: "D4NPCNT1", u32 version (1), u32 counter count, then per counter char name[24];
 // then per frame u32 frame, u32 0, u32 value per counter (values as they are when the frame's
 // state is hashed). Names starting "fb_" count fallbacks (a wait gave up and the game ran on: must

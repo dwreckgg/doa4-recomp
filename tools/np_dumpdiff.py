@@ -3,7 +3,8 @@
 
   py -3 tools/np_dumpdiff.py A.bin B.bin [--gap 16] [--max 200] [--words]
 Ranges closer than --gap bytes are merged. Each range is printed with its guest address,
-length, the known region it falls in, and (with --words) the big-endian u32 values on both
+length, the known region it falls in (or "SDK handle stash" when every differing word in it is the word after a
+"REX\\0" header signature in both dumps: stash_words), and (with --words) the big-endian u32 values on both
 sides for its first words.
 """
 import argparse
@@ -31,6 +32,29 @@ KNOWN = [  # (start, length, name): phase0_facts.md 10, rollback_doa4_fit.md
     (0x83579C28, 0x4000, "graphics object (GPU)"),
     (0x8341FAA0, 0x100, "job pool"),
 ]
+
+
+# The SDK's handle stash in guest object headers (np_core.h kStashSignature; sdk-np0 include/rex/system/xobject.h
+# StashHandle): wait_list_flink = "REX\0" (0x52455800 stored big-endian), wait_list_blink = a host handle number, which
+# only the SDK reads. The in-game sweep hashes every such word as zero (np_core.cpp ZeroStashWords); dump checks leave
+# out a word that is a stash word in both dumps.
+STASH_SIGNATURE = b"REX\x00"
+
+
+def stash_words(data, before=None):
+    """Offsets of the SDK handle stash words in `data` (guest memory from a 4-aligned guest address, e.g. a .data dump):
+    every 4-aligned word whose preceding aligned word is STASH_SIGNATURE, decided on the data as it is (a signature that
+    is itself a stash word still marks the word after it). `before` = the 4 bytes just before data[0], or None. A
+    signature in the last word marks nothing here (its stash word is beyond the data)."""
+    out = set()
+    if before == STASH_SIGNATURE and len(data) >= 4:
+        out.add(0)
+    at = data.find(STASH_SIGNATURE)
+    while at != -1:
+        if at % 4 == 0 and at + 8 <= len(data):
+            out.add(at + 4)
+        at = data.find(STASH_SIGNATURE, at + 1)
+    return out
 
 
 def region(addr):
@@ -66,9 +90,12 @@ def main():
             i += 1
     total = sum(e - s for s, e in ranges)
     print(f"{len(ranges)} differing ranges, {total} bytes in ranges (dump sizes {len(a)}, {len(b)})")
+    stash = stash_words(a) & stash_words(b)
     for s, e in ranges[:args.max]:
         addr = LO + s
-        line = f"  {addr:08X} +{e - s:<6d} {region(addr)}"
+        only_stash = all(w in stash for w in range(s & ~3, e, 4) if a[w:w + 4] != b[w:w + 4])
+        label = region(addr) or ("SDK handle stash (the sweep hashes it as zero)" if only_stash else "")
+        line = f"  {addr:08X} +{e - s:<6d} {label}"
         if args.words:
             w0 = s & ~3
             wa = [struct.unpack_from(">I", a, k)[0] for k in range(w0, min(e, w0 + 16), 4)]

@@ -323,6 +323,75 @@ def fake_game_module():
     return fake
 
 
+def stash_memory(flink, handle, after=0x11223344, signal=0):
+    """Guest memory with a KEVENT header at +8 (np_core_host_test.cpp StashMemory, the same bytes): type word,
+    signal_state, wait_list_flink, wait_list_blink = handle, then a word `after`."""
+    m = bytearray((0xA0 + i) & 0xFF for i in range(48))
+    m[8:12] = bytes([0, 0, 4, 0])
+    m[12:16] = struct.pack(">I", signal)
+    m[16:20] = flink
+    m[20:24] = struct.pack(">I", handle)
+    m[24:28] = struct.pack(">I", after)
+    return bytes(m)
+
+
+def words_left(a, b, stash_words):
+    """Offsets of the 4-aligned words that differ between dumps a and b and are not a stash word in both: what a dump
+    check reports once the SDK handle stash is left out (np_runs/t11c/t11c_dump_check.py, t11_dump_check.py)."""
+    ignored = stash_words(a) & stash_words(b)
+    return {w for w in range(0, min(len(a), len(b)) - 3, 4) if a[w:w + 4] != b[w:w + 4] and w not in ignored}
+
+
+def test_stash_words(root):
+    # Task 11c ruling: the SDK's handle stash (sdk-np0 include/rex/system/xobject.h StashHandle: wait_list_flink =
+    # "REX\0", wait_list_blink = handle) is left out of dump checks by structure, as the in-game sweep does
+    # (np_core.cpp ZeroStashWords). The same fixtures as np_core_host_test.cpp TestStashMask.
+    mod = load("np_dumpdiff")
+    stash_words = getattr(mod, "stash_words", None)
+    check(getattr(mod, "STASH_SIGNATURE", None) == b"REX\x00", "np_dumpdiff.STASH_SIGNATURE is the bytes in guest memory")
+    check(stash_words is not None, "np_dumpdiff.stash_words exists")
+    if stash_words is None:
+        stash_words = lambda data, before=None: set()  # noqa: E731 - lets every check below report (T1.7)
+    sig, other, sig1 = b"REX\x00", b"REY\x00", b"REX\x01"
+    # (1) the stash word differs, the signature is in both: ignored; the signature itself is not a stash word
+    a, b = stash_memory(sig, 0xF8000054), stash_memory(sig, 0xF800005C)
+    check(stash_words(a) == {20}, f"stash_words: the word after the signature only: {stash_words(a)}")
+    check(words_left(a, b, stash_words) == set(), f"a differing stash word with the signature in both is ignored: {words_left(a, b, stash_words)}")
+    # (2) the same difference without the signature still fails
+    a, b = stash_memory(other, 0xF8000054), stash_memory(other, 0xF800005C)
+    check(words_left(a, b, stash_words) == {20}, f"without the signature the difference stays: {words_left(a, b, stash_words)}")
+    # (3) a difference in the signature word itself still fails (also with equal, zero handles)
+    a, b = stash_memory(sig, 0xF8000054), stash_memory(sig1, 0xF8000054)
+    check(16 in words_left(a, b, stash_words), f"a difference in the signature word stays: {words_left(a, b, stash_words)}")
+    a, b = stash_memory(sig, 0), stash_memory(sig1, 0)
+    check(words_left(a, b, stash_words) == {16}, f"only the signature word differs: reported {words_left(a, b, stash_words)}")
+    # (4) a non-stash word next to a stash still fails: the word after it, and signal_state before the signature
+    a, b = stash_memory(sig, 0xF8000054, 0x11223344), stash_memory(sig, 0xF800005C, 0x11223345)
+    check(words_left(a, b, stash_words) == {24}, f"the word after a stash stays: {words_left(a, b, stash_words)}")
+    a, b = stash_memory(sig, 0xF8000054, signal=0), stash_memory(sig, 0xF800005C, signal=1)
+    check(words_left(a, b, stash_words) == {12}, f"the word before the signature stays: {words_left(a, b, stash_words)}")
+    # (5) alignment and byte order: unaligned signature, reversed bytes at an aligned offset
+    m = bytearray(b"\x77" * 32)
+    m[6:10] = sig
+    check(stash_words(bytes(m)) == set(), f"an unaligned signature marks nothing: {stash_words(bytes(m))}")
+    m = bytearray(b"\x77" * 32)
+    m[8:12] = b"\x00XER"
+    check(stash_words(bytes(m)) == set(), f"the reversed bytes mark nothing: {stash_words(bytes(m))}")
+    # (6) borders: a signature in the last word marks nothing (its stash would be beyond the data); `before`
+    m = bytearray(b"\x77" * 16)
+    m[12:16] = sig
+    check(stash_words(bytes(m)) == set(), f"a signature in the last word marks nothing: {stash_words(bytes(m))}")
+    try:
+        got = stash_words(b"\x77" * 16, before=sig)
+    except TypeError as e:
+        got = f"raised {e}"
+    check(got == {0}, f"a signature just before the data marks word 0: {got}")
+    # (7) decided on the data as it is: signature, signature, X -> both following words
+    m = bytearray(b"\x77" * 16)
+    m[0:4], m[4:8] = sig, sig
+    check(stash_words(bytes(m)) == {4, 8}, f"signature, signature, X: {stash_words(bytes(m))}")
+
+
 def test_keepalive_warn_text(root):
     # The WARN the keepalive fix logs (np_det.cpp KeepAliveSkip) is the line np_run.judge fails a run on: the
     # source's format string must start with judge's prefix, and the stand-in's filled-in line must be what that

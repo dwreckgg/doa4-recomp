@@ -105,6 +105,8 @@ struct State {
   // Per sweep block k: its address range and the kSweepMasks inside it, built once in Start so that
   // hashing a block never allocates.
   std::vector<Region> block_regions;
+  // Per sweep block: 1 once its first hash with SDK handle stash words zeroed was logged (sized in Start).
+  std::vector<uint8_t> stash_logged;
   bool timing_logged = false;  // HoldFrameTiming's one log line
 
   // timing (QPC ticks)
@@ -387,11 +389,21 @@ void HashFrame(State& s, uint8_t* base, uint32_t f) {
       const uint32_t k = (first + i) % nblocks;
       const uint32_t lo = kDataLo + k * kBlock;
       const Region& r = s.block_regions[k];
-      if (r.masks.empty()) {
+      // The SDK's handle stash words (np_core.h kStashSignature) are hashed as zero; the word before the block is
+      // read only inside .data (block 0 has no `before`).
+      const uint8_t* before = lo > kDataLo ? base + lo - 4 : nullptr;
+      if (r.masks.empty() && !HasStashWords(base + lo, kBlock, before)) {
         s.row[i] = XXH3_64bits(base + lo, kBlock);
       } else {
-        MaskedCopy(r, base + lo, &s.scratch);
+        const uint32_t stash = SweepBlockCopy(r, base + lo, before, &s.scratch);
         s.row[i] = XXH3_64bits(s.scratch.data(), s.scratch.size());
+        if (stash && k < s.stash_logged.size() && !s.stash_logged[k]) {
+          s.stash_logged[k] = 1;
+          char line[128];
+          std::snprintf(line, sizeof(line), "sweep: block %08X: %u SDK handle stash words hashed as zero (frame %u)", lo,
+                        stash, f);
+          Log(line);
+        }
       }
     }
     const uint32_t head[2] = {f, first};
@@ -650,7 +662,9 @@ void Start(Host host) {
       for (const Mask& m : b.masks) masked += m.length;
     }
     Log("sweep masks: " + std::to_string(std::size(kSweepMasks)) + " ranges, " + std::to_string(masked) +
-        " bytes in " + std::to_string(blocks) + " blocks hashed as zero");
+        " bytes in " + std::to_string(blocks) + " blocks hashed as zero; and every SDK handle stash word (the word "
+        "after a \"REX\\0\" header signature) hashed as zero");
+    s.stash_logged.assign(nblocks, 0);
   }
   s.counters = _wfopen((s.dir / "counters.d4k").wstring().c_str(), L"wb");
   if (s.counters) {

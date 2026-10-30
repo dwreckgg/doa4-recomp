@@ -482,6 +482,51 @@ std::vector<Region> BlockRegions(uint32_t lo, uint32_t block, uint32_t nblocks,
   return out;
 }
 
+namespace {
+bool IsStashSignature(const uint8_t* p) { return std::memcmp(p, kStashSignature, 4) == 0; }
+}  // namespace
+
+bool HasStashWords(const uint8_t* bytes, size_t length, const uint8_t* before) {
+  if (length < 4) return false;
+  if (before && IsStashSignature(before)) return true;
+  uint32_t sig, count = 0;
+  std::memcpy(&sig, kStashSignature, 4);
+  // Every word but the last (whose follower lies beyond `bytes`). No early exit and an index loop: a count the
+  // compiler vectorises - 0.32 us for a 64 KB block against 4.9 us for a byte-offset OR loop (the sweep runs it on 4
+  // blocks a frame; measured with -march=x86-64-v3 on a real dump, Task 11c).
+  const size_t words = length / 4 - 1;
+  for (size_t i = 0; i < words; ++i) {
+    uint32_t w;
+    std::memcpy(&w, bytes + 4 * i, 4);
+    count += w == sig;
+  }
+  return count != 0;
+}
+
+uint32_t ZeroStashWords(uint8_t* bytes, size_t length, const uint8_t* before) {
+  uint32_t n = 0;
+  bool after_signature = before && IsStashSignature(before);
+  for (size_t at = 0; at + 4 <= length; at += 4) {
+    const bool signature = IsStashSignature(bytes + at);  // as the word was, before it may be zeroed below
+    if (after_signature) {
+      std::memset(bytes + at, 0, 4);
+      ++n;
+    }
+    after_signature = signature;
+  }
+  return n;
+}
+
+uint32_t SweepBlockCopy(const Region& region, const uint8_t* bytes, const uint8_t* before, std::vector<uint8_t>* out) {
+  out->assign(bytes, bytes + region.length);
+  const uint32_t n = ZeroStashWords(out->data(), out->size(), before);
+  for (const Mask& m : region.masks) {
+    if (m.offset >= region.length) continue;
+    std::memset(out->data() + m.offset, 0, std::min(m.length, region.length - m.offset));
+  }
+  return n;
+}
+
 std::string EncodeCountersHeader(const std::vector<std::string>& names) {
   std::string s = "D4NPCNT1";
   PutLe32(&s, 1);

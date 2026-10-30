@@ -653,6 +653,119 @@ static void TestReaderOutcome() {
   CHECK(ReaderOutcome(0, true, true) == ReaderWait::kNoThread);
 }
 
+// Task 11c ruling: the SDK's handle stash (sdk-np0 include/rex/system/xobject.h StashHandle) is left out of the sweep by
+// structure. Fixture: guest memory holding a KEVENT header at +8 (type word, signal_state, wait_list_flink =
+// "REX\0", wait_list_blink = handle), as at 0x82B7476C: handle F8000054 in five single_b runs, F800005C in con3.
+static std::vector<uint8_t> StashMemory(const uint8_t flink[4], uint32_t handle, uint32_t after = 0x11223344,
+                                        uint32_t signal = 0) {
+  std::vector<uint8_t> m(48);
+  for (size_t i = 0; i < m.size(); ++i) m[i] = uint8_t(0xA0 + i);  // no stray signature anywhere
+  const uint8_t type[4] = {0x00, 0x00, 0x04, 0x00};
+  std::memcpy(&m[8], type, 4);
+  auto be = [&](size_t at, uint32_t v) {
+    m[at] = uint8_t(v >> 24), m[at + 1] = uint8_t(v >> 16), m[at + 2] = uint8_t(v >> 8), m[at + 3] = uint8_t(v);
+  };
+  be(12, signal);
+  std::memcpy(&m[16], flink, 4);
+  be(20, handle);
+  be(24, after);
+  return m;
+}
+
+static void TestStashMask() {
+  const uint8_t sig[4] = {'R', 'E', 'X', 0};
+  const uint8_t other[4] = {'R', 'E', 'Y', 0};
+  const uint8_t sig1[4] = {'R', 'E', 'X', 1};
+  CHECK(std::memcmp(kStashSignature, sig, 4) == 0);  // the bytes as they lie in guest memory (big-endian 0x52455800)
+  const uint8_t zero4[4] = {};
+
+  // (1) A stash word that differs, with the signature in both runs: ignored. The signature itself stays.
+  std::vector<uint8_t> a = StashMemory(sig, 0xF8000054), b = StashMemory(sig, 0xF800005C);
+  CHECK(HasStashWords(a.data(), a.size(), nullptr) && HasStashWords(b.data(), b.size(), nullptr));
+  CHECK(ZeroStashWords(a.data(), a.size(), nullptr) == 1);
+  CHECK(ZeroStashWords(b.data(), b.size(), nullptr) == 1);
+  CHECK(a == b);
+  CHECK(std::memcmp(&a[20], zero4, 4) == 0);
+  CHECK(std::memcmp(&a[16], sig, 4) == 0);  // NOT zeroed: a difference in it must still show
+
+  // (2) The same difference without the signature: still differs.
+  a = StashMemory(other, 0xF8000054), b = StashMemory(other, 0xF800005C);
+  CHECK(!HasStashWords(a.data(), a.size(), nullptr));
+  CHECK(ZeroStashWords(a.data(), a.size(), nullptr) == 0 && ZeroStashWords(b.data(), b.size(), nullptr) == 0);
+  CHECK(a != b);
+
+  // (3) A difference in the signature word itself: still differs - also when the handle words are 0 in both runs,
+  // so zeroing the stash alone could not show it (NOT "zero the signature too").
+  a = StashMemory(sig, 0xF8000054), b = StashMemory(sig1, 0xF8000054);
+  ZeroStashWords(a.data(), a.size(), nullptr), ZeroStashWords(b.data(), b.size(), nullptr);
+  CHECK(a != b);
+  a = StashMemory(sig, 0), b = StashMemory(sig1, 0);
+  ZeroStashWords(a.data(), a.size(), nullptr), ZeroStashWords(b.data(), b.size(), nullptr);
+  CHECK(a != b);
+
+  // (4) A non-stash word next to a stash still differs: the word after it and the word before the signature
+  // (signal_state) - NOT "zero 8 bytes" or "zero the header".
+  a = StashMemory(sig, 0xF8000054, 0x11223344), b = StashMemory(sig, 0xF800005C, 0x11223345);
+  ZeroStashWords(a.data(), a.size(), nullptr), ZeroStashWords(b.data(), b.size(), nullptr);
+  CHECK(a != b);
+  a = StashMemory(sig, 0xF8000054, 0x11223344, 0), b = StashMemory(sig, 0xF800005C, 0x11223344, 1);
+  ZeroStashWords(a.data(), a.size(), nullptr), ZeroStashWords(b.data(), b.size(), nullptr);
+  CHECK(a != b);
+
+  // (5) Alignment and byte order: the signature at an unaligned offset, and its bytes reversed at an aligned one
+  // (a little-endian compare with 0x52455800 would take "\0XER"), mark nothing.
+  std::vector<uint8_t> m(32, 0x77);
+  std::memcpy(&m[6], sig, 4);
+  CHECK(!HasStashWords(m.data(), m.size(), nullptr) && ZeroStashWords(m.data(), m.size(), nullptr) == 0);
+  std::vector<uint8_t> r(32, 0x77);
+  const uint8_t rev[4] = {0, 'X', 'E', 'R'};
+  std::memcpy(&r[8], rev, 4);
+  CHECK(!HasStashWords(r.data(), r.size(), nullptr) && ZeroStashWords(r.data(), r.size(), nullptr) == 0);
+
+  // (6) Range borders: a signature in the word before the range marks word 0; without `before` nothing; a signature
+  // in the last word marks nothing here (its stash is the next range's word 0).
+  std::vector<uint8_t> c(16, 0x77);
+  CHECK(HasStashWords(c.data(), c.size(), sig) && !HasStashWords(c.data(), c.size(), nullptr));
+  CHECK(ZeroStashWords(c.data(), c.size(), sig) == 1 && std::memcmp(&c[0], zero4, 4) == 0 && c[4] == 0x77);
+  std::vector<uint8_t> d(16, 0x77);
+  std::memcpy(&d[12], sig, 4);
+  CHECK(!HasStashWords(d.data(), d.size(), nullptr) && ZeroStashWords(d.data(), d.size(), nullptr) == 0);
+  CHECK(!HasStashWords(d.data(), d.size(), other));  // a `before` that is not the signature
+
+  // (7) Decided on the bytes as they were: signature, signature, X -> the second and X are both zeroed (NOT only the
+  // second, which a scan of the half-zeroed copy would give).
+  std::vector<uint8_t> e(16, 0x77);
+  std::memcpy(&e[0], sig, 4), std::memcpy(&e[4], sig, 4);
+  CHECK(ZeroStashWords(e.data(), e.size(), nullptr) == 2);
+  CHECK(std::memcmp(&e[0], sig, 4) == 0 && std::memcmp(&e[4], zero4, 4) == 0 && std::memcmp(&e[8], zero4, 4) == 0);
+  CHECK(e[12] == 0x77);
+
+  // (8) The sweep's block copy: stash words zeroed (decided before the masks, so a mask over the signature does not
+  // hide the stash after it), then the masks. Region of the fixture at guest 0x82B74760 (its header at +8 lies at
+  // 0x82B74768), masks over the signature word and over bytes 32..35.
+  const std::vector<uint8_t> ma = StashMemory(sig, 0xF8000054), mb = StashMemory(sig, 0xF800005C);
+  Region block{"", 0x82B74760, 48, {{16, 4}, {32, 4}}};
+  std::vector<uint8_t> oa, ob;
+  CHECK(SweepBlockCopy(block, ma.data(), nullptr, &oa) == 1);
+  CHECK(SweepBlockCopy(block, mb.data(), nullptr, &ob) == 1);
+  CHECK(oa.size() == 48 && oa == ob);
+  CHECK(oa.size() == 48 && std::memcmp(&oa[16], zero4, 4) == 0 && std::memcmp(&oa[20], zero4, 4) == 0 &&
+        std::memcmp(&oa[32], zero4, 4) == 0);
+  CHECK(oa.size() == 48 && oa[24] == 0x11 && oa[36] == ma[36]);  // the rest as it was
+  Region plain{"", 0x82B74760, 48, {}};
+  std::vector<uint8_t> pa;
+  CHECK(SweepBlockCopy(plain, ma.data(), nullptr, &pa) == 1);
+  std::vector<uint8_t> want = ma;
+  ZeroStashWords(want.data(), want.size(), nullptr);
+  CHECK(pa == want);
+  // no stash: the copy is MaskedCopy's
+  const std::vector<uint8_t> mo = StashMemory(other, 0xF8000054);
+  std::vector<uint8_t> po, pm;
+  CHECK(SweepBlockCopy(block, mo.data(), nullptr, &po) == 0);
+  MaskedCopy(block, mo.data(), &pm);
+  CHECK(po == pm);
+}
+
 int main() {
   TestPadBytes();
   TestScript();
@@ -672,6 +785,7 @@ int main() {
   TestMetaFixSet();
   TestKeepAlive();
   TestReaderOutcome();
+  TestStashMask();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }
