@@ -1356,9 +1356,21 @@ def test_bundle_layout(root):
     check("about 6 minutes" in readme, "README.txt: the time is 3 minutes a recording (default --minutes-each 3) times the 2 recordings")
     # what the friend must be told (fix round 1): step 0 gets the game files with get_game_files.bat, the network prompt, the privacy note
     for what, token in (("step 0 and its file", "get_game_files.bat"), ("the test's file", "run_check.bat"), ("the disc image", ".iso"),
-                        ("the firewall prompt: Cancel is fine", "click Cancel"), ("the privacy note", "Windows user name"),
-                        ("a pasted folder with quotes", "its own quotes")):
+                        ("the firewall prompt: Cancel is fine", "click Cancel"), ("the privacy note", "Windows user name (C:\\Users\\your name"),
+                        ("the first action of step 0", "1. Double-click get_game_files.bat."), ("a pasted folder with quotes", "its own quotes")):
         check(token in readme, f"README.txt says {what} ({token!r})")
+    # fix round 2 (N1, N2, N5, N7): where to extract the zip, always change the extraction folder to C:\DOA4 and why, the Windows
+    # warning before step 0, the right-click Edit route for GAME, an & in a folder name, and a closed game during the extraction
+    for what, token in (("replace the folder in the Extract All window", "REPLACE the folder shown"), ("the zip goes to C:\\doa4test", "C:\\doa4test"),
+                        ("no accents anywhere in the path", "must not have an accent or a special letter anywhere"),
+                        ("always change the extraction folder", 'ALWAYS click "Change folder..."'), ("to C:\\DOA4", 'Extract to: C:\\DOA4'),
+                        ("why: no accent or special letter in the path", "must have no accent or special letter anywhere"),
+                        ("the Edit route for the GAME line", "right-click run_check.bat, choose Edit"), ("what GAME means", "the folder that has the file default.xex in it"),
+                        ("an & sign in the folder name", "has an & sign in it"), ("closing the game during the extraction", "removes the half copy"),
+                        ("run get_game_files.bat again after that", "just double-click get_game_files.bat again")):
+        check(token in readme, f"README.txt says {what} ({token!r})")
+    check(0 <= readme.find("Run anyway") < readme.find("Step 0"), "README.txt: the 'Windows protected your PC' hint (Run anyway) comes before step 0")
+    check("get_game_files.bat, and when the game window opens in step 0" in readme, "README.txt: the 'Windows protected your PC' hint names get_game_files.bat and the game window of step 0")
     # no CPU affinity anywhere in what runs on the friend's PC (a mask from this 16-thread PC must never reach a 12-thread CPU)
     ps1 = file_bytes(files["run_one.ps1"]).decode("ascii") if "run_one.ps1" in files else ""
     gbat = file_bytes(files["get_game_files.bat"]).decode("ascii") if "get_game_files.bat" in files else ""
@@ -1730,7 +1742,7 @@ def test_run_check_bat_preflight(root):
     os.makedirs(accent)
     shutil.copy(os.path.join(game, "default.xex"), os.path.join(accent, "default.xex"))
     code, text = ps_check(ps1, accent, exe)
-    check(code == 1 and "plain" in text, f"run_one.ps1 -Check, a non-ASCII game folder: exit {code}\n{text}")
+    check(code == 1 and "plain" in text and "caf" not in text, f"run_one.ps1 -Check, a non-ASCII game folder: exit {code} (the folder is not echoed: typed into a .bat it comes out garbled)\n{text}")
     accent_bundle = os.path.join(root, "caf\u00e9 bundle")
     os.makedirs(accent_bundle)
     shutil.copy(ps1, os.path.join(accent_bundle, "run_one.ps1"))
@@ -1926,7 +1938,7 @@ def test_find_game(root):
                 f.write(b"x")
     fwd = lambda p: p.replace("\\", "/")  # noqa: E731
 
-    def find(name, toml, stale=None):
+    def find(name, toml, stale=None, *extra):
         path, result = os.path.join(root, name + ".toml"), os.path.join(root, name + ".result.txt")
         with open(path, "wb") as f:
             f.write(toml if isinstance(toml, bytes) else toml.encode("utf-8"))
@@ -1934,7 +1946,7 @@ def test_find_game(root):
             with open(result, "w") as f:
                 f.write(stale)
         p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-FindGame", "-Toml", path,
-                            "-Result", result], capture_output=True, timeout=120)
+                            "-Result", result, *extra], capture_output=True, timeout=120)
         return p.returncode, (p.stdout + p.stderr).decode("oem", errors="replace"), (file_bytes(result).decode("utf-8") if os.path.exists(result) else None)
 
     want = os.path.normpath(games["one"]) + "\r\n"
@@ -1964,9 +1976,189 @@ def test_find_game(root):
     check(code == 1 and res is None and "has no default.xex" in text, f"find_game, the saved folder has no default.xex: exit {code}\n{text}")
     code, text, res = find("stale", f"x = 1\n", stale="C:\\stale\\folder\r\n")
     check(code == 1 and res is None, f"find_game, a failed search removes an older result: exit {code}, result {res!r}")
+    # Fix round 2, N1: a saved folder with a letter that is not plain ASCII (the setup accepts any ANSI-code-page path; "e with
+    # diaeresis" is one): exit 2, the folder named correctly in the message, and NOTHING written to the result file that
+    # run_check.bat reads with `set /p` (which would read it in the wrong code page). A folder without default.xex is exit 1.
+    accent = os.path.join(root, "g \u00eb folder")
+    os.makedirs(accent)
+    with open(os.path.join(accent, "default.xex"), "wb") as f:
+        f.write(b"x")
+    bare_accent = os.path.join(root, "g \u00eb bare")
+    os.makedirs(bare_accent)
+    code, text, res = find("accent", f'doa4_game_files = "{fwd(accent)}"\n', "C:\\stale\\folder\r\n")
+    check(code == 2 and res is None and accent in text and "not plain English" in text, f"find_game, a folder with a special letter: exit {code}, result {res!r}\n{text}")
+    check(not any(m in text for m in ("\u00c3\u00ab", "\u251c\u00ab", "\ufffd")), f"find_game, a folder with a special letter: the name is printed without garbling\n{text}")
+    code, text, res = find("accent_bare", f'doa4_game_files = "{fwd(bare_accent)}"\n')
+    check(code == 1 and res is None and "has no default.xex" in text, f"find_game, a special-letter folder without default.xex is exit 1: exit {code}\n{text}")
+    # -Quiet: nothing is said when nothing is saved (the first run of get_game_files.bat); -Prefix words the first line of a success
+    code, text, res = find("quiet", "x = 1\n", None, "-Quiet")
+    check(code == 1 and text.strip() == "", f"find_game -Quiet, nothing saved: exit {code}, output {text!r}")
+    code, text, res = find("quiet_found", f'doa4_game_files = "{fwd(games["one"])}"\n', None, "-Quiet", "-Prefix", "Game files already set up")
+    check(code == 0 and text.strip() == f"Game files already set up: {os.path.normpath(games['one'])}", f"find_game -Quiet -Prefix, a saved folder: exit {code}, output {text!r}")
+    code, text, res = find("quiet_accent", f'doa4_game_files = "{fwd(accent)}"\n', None, "-Quiet")
+    check(code == 2 and accent in text, f"find_game -Quiet still explains a special-letter folder: exit {code}\n{text}")
     p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-FindGame", "-Toml", os.path.join(root, "nope.toml"),
                         "-Result", os.path.join(root, "nope.result.txt")], capture_output=True, timeout=120)
     check(p.returncode == 1 and not os.path.exists(os.path.join(root, "nope.result.txt")), f"find_game, no toml file: exit {p.returncode}")
+
+
+def write_saved_toml(bundle, folder):
+    """bin\\dead_or_alive_4.toml as the game's setup leaves it (fake_setup.py): other keys, the folder with forward slashes in UTF-8
+    (Utf8Generic), then a table with a decoy key of the same name."""
+    text = folder.replace("\\", "/")
+    with open(os.path.join(bundle, "bin", "dead_or_alive_4.toml"), "w", newline="", encoding="utf-8") as f:
+        f.write(f'fullscreen = true\r\ndoa4_game_files = "{text}"\r\nresolution_scale = 4\r\n\r\n[net]\r\ndoa4_game_files = "decoy"\r\n')
+
+
+def setup_bundle(root, names=("gg",), game_name="game dir (x86)"):
+    """runnable_bundle + the setup stand-in in bin\\ and get_game_files.bat pointed at it. Returns the runnable_bundle dict."""
+    b = runnable_bundle(root, names, game_name=game_name)
+    for f in ("fake_setup.cmd", "fake_setup.py"):
+        shutil.copy(os.path.join(HERE, f), os.path.join(b["dir"], "bin", f))
+    old, problems = patch_bat(b["dir"], _file="get_game_files.bat", EXE="%~dp0bin\\fake_setup.cmd")
+    check(not problems, f"setup_bundle: get_game_files.bat EXE line: {problems}")
+    return b
+
+
+MOJIBAKE = ("\u00c3\u00ab", "\u251c\u00ab", "\ufffd")  # an e with diaeresis read as UTF-8 in Latin-1, in the OEM code page 437, a replacement char
+
+
+def test_get_game_files_second_run(root):
+    # Fix round 2, N6: a second run with game files already set up says so (the folder named) and does not open the setup window again
+    b = setup_bundle(root)
+    bundle, game = b["dir"], b["game"]
+    log_path = os.path.join(bundle, "setup_ud", "fake_setup.txt")
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game)
+    check(code == 0 and "Game files found: " in text and "No game files found" not in text, f"get_game_files.bat, first run: exit {code}\n{text}")
+    check("The game's setup window opens now" in text and 'ALWAYS click "Change folder..."' in text and "Extract to: C:\\DOA4" in text,
+          f"get_game_files.bat, first run: the instructions (always change the folder to C:\\DOA4)\n{text}")
+    check(os.path.exists(log_path), "get_game_files.bat, first run: the setup was started")
+    os.remove(log_path)
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game)
+    check(code == 0 and f"Game files already set up: {os.path.normpath(game)}" in text and "Now double-click run_check.bat" in text,
+          f"get_game_files.bat, second run: says the files are set up, naming the folder: exit {code}\n{text}")
+    check("setup window opens" not in text and not os.path.exists(log_path), f"get_game_files.bat, second run: the setup window is not opened again\n{text}")
+
+
+def test_get_game_files_special_letters(root):
+    # Fix round 2, N1: the setup accepts any folder the ANSI code page can write ("e with diaeresis" is one), this test does not.
+    # The saved folder is named correctly (no garbled letters), nothing reads it in the wrong code page (game_path.txt is never
+    # written), the setup is made to appear again (the line is removed from the toml), and run_check.bat says the same.
+    b = setup_bundle(root)
+    bundle, game = b["dir"], b["game"]
+    bad = os.path.join(root, "g\u00eb ames")
+    os.makedirs(bad)
+    with open(os.path.join(bad, "default.xex"), "wb") as f:
+        f.write(b"x")
+    toml, result = os.path.join(bundle, "bin", "dead_or_alive_4.toml"), os.path.join(bundle, "game_path.txt")
+    log_path = os.path.join(bundle, "setup_ud", "fake_setup.txt")
+    # (1) the setup saves a folder with the letter: get_game_files.bat explains, clears the saved folder, and ends
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=bad)
+    check(code == 1 and bad in text and "special letter" in text and "Now double-click" not in text, f"get_game_files.bat, a saved folder with a special letter: exit {code}\n{text}")
+    check('click "Choose extracted folder..." and pick C:\\DOA4' in text and 'pick your .iso, click "Change folder..."' in text,
+          f"get_game_files.bat, a special-letter folder: the two ways out (the first-run instructions also say Change folder: the exact words of each route are checked)\n{text}")
+    check(not any(m in text for m in MOJIBAKE), f"get_game_files.bat, a special-letter folder: no garbled letters in any message\n{text}")
+    saved = file_bytes(toml).decode("utf-8") if os.path.exists(toml) else ""
+    check('fullscreen = true\r\n' in saved and 'resolution_scale = 4\r\n' in saved and '[net]\r\ndoa4_game_files = "decoy"\r\n' in saved and 'doa4_game_files = "' + bad.replace("\\", "/") not in saved,
+          f"get_game_files.bat, a special-letter folder: the saved line is gone, the rest of the file is as it was:\n{saved!r}")
+    check(not os.path.exists(result), "get_game_files.bat, a special-letter folder: game_path.txt is never written")
+    # (2) run_check.bat with its GAME line unset and the special-letter folder saved: says why, runs nothing
+    write_saved_toml(bundle, bad)
+    patch_bat(bundle, GAME=b["shipped_game"])
+    code, text = run_bat(bundle)
+    check(code == 1 and bad in text and "not plain English" in text and "Run get_game_files.bat" in text and "default.xex was not found" not in text and not os.path.exists(os.path.join(bundle, "out")),
+          f"run_check.bat, a saved folder with a special letter: names it, runs nothing: exit {code}\n{text}")
+    check(not any(m in text for m in MOJIBAKE) and not os.path.exists(result), f"run_check.bat, a saved folder with a special letter: no garbled letters, no game_path.txt\n{text}")
+    # (3) get_game_files.bat again with that folder still saved: explains and clears it WITHOUT starting the setup
+    os.path.exists(log_path) and os.remove(log_path)
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game)
+    check(code == 1 and bad in text and not os.path.exists(log_path), f"get_game_files.bat, a special-letter folder still saved: explains, does not start the setup: exit {code}\n{text}")
+    # (4) the next run opens the setup (nothing saved any more) and, with a plain folder chosen, succeeds
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game)
+    check(code == 0 and "Game files found: " in text and os.path.exists(log_path), f"get_game_files.bat, after the saved folder was cleared: the setup opens again: exit {code}\n{text}")
+    # (5) a special-letter extraction whose folder was deleted afterwards is "no game files", not a special-letter explanation
+    shutil.rmtree(bad)
+    write_saved_toml(bundle, bad)
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game, FAKE_SETUP_MODE="cancel")
+    check(code == 1 and "No game files found" in text and "has no default.xex" in text, f"get_game_files.bat, a saved special-letter folder that is gone: exit {code}\n{text}")
+
+
+def test_get_game_files_setup_exit(root):
+    # Fix round 2, N4: the setup is where a missing Visual C++ runtime shows first; it gets the same hints as a replay, and stops.
+    # Any other exit code (the game closed with Alt+F4) is not an error: the next step looks for the saved folder.
+    b = setup_bundle(root)
+    bundle, game = b["dir"], b["game"]
+    missing, old = "a Windows component is missing", "runtime is too old"
+    for what, exit_code, want, other in (("0xC0000135", "-1073741515", missing, old), ("0xC0000139", "-1073741511", old, missing)):
+        code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game, FAKE_SETUP_EXIT=exit_code)
+        check(code == 1 and want in text and other not in text and "The game's setup could not be started" in text and "Now double-click" not in text,
+              f"get_game_files.bat, the setup exits {what}: the hint, then stops: exit {code}\n{text}")
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game, FAKE_SETUP_EXIT="3")
+    check(code == 1 and missing not in text and old not in text and "could not be started" not in text and "No game files found" in text,
+          f"get_game_files.bat, the setup exits 3 (closed): no hint, the next step reports the missing game files: exit {code}\n{text}")
+
+
+def test_forget_game(root):
+    # run_one.ps1 -ForgetGame removes the top-level doa4_game_files line and nothing else (BOM, line ends, other keys, tables, other letters)
+    script = os.path.join(TOOLS, "np_bundle", "run_one.ps1")
+    e = "\u00eb"
+
+    def forget(name, data):
+        path = os.path.join(root, name + ".toml")
+        if data is not None:
+            with open(path, "wb") as f:
+                f.write(data)
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-ForgetGame", "-Toml", path],
+                           capture_output=True, timeout=120)
+        return p.returncode, (p.stdout + p.stderr).decode("oem", errors="replace"), (file_bytes(path) if os.path.exists(path) else None)
+
+    bom = bytes([0xEF, 0xBB, 0xBF])
+    a = f"a = 1\r\n# {e} comment\r\n".encode("utf-8")
+    line = b'doa4_game_files = "C:/x y/DOA4"\r\n'
+    c = b'resolution_scale = 4\r\n\r\n[net]\r\ndoa4_game_files = "decoy"\r\n'
+    for what, data, want in (("with a BOM, CRLF, other keys and a table", bom + a + line + c, bom + a + c),
+                             ("LF line ends", b"a = 1\n" + line.replace(b"\r\n", b"\n") + b"b = 2\n", b"a = 1\nb = 2\n"),
+                             ("as the last line without a line end", b"a = 1\r\n" + line.rstrip(b"\r\n"), b"a = 1\r\n"),
+                             ("two top-level lines", line + a + line, a),
+                             ("only a table's line", b"[net]\r\n" + line, b"[net]\r\n" + line),
+                             ("no such line", a + c, a + c),
+                             ("another case of the key", b'DOA4_GAME_FILES = "x"\r\n', b'DOA4_GAME_FILES = "x"\r\n')):
+        code, text, got = forget("g", data)
+        check(code == 0 and got == want, f"forget_game, {what}: exit {code}\n got {got!r}\nwant {want!r}")
+        check(not os.path.exists(os.path.join(root, "g.toml.tmp")), f"forget_game, {what}: no temporary file is left")
+        if os.path.exists(os.path.join(root, "g.toml")):
+            os.remove(os.path.join(root, "g.toml"))
+    code, text, got = forget("missing", None)
+    check(code == 0 and got is None, f"forget_game, no toml file: nothing is created: exit {code}, {got!r}")
+    code, text, got = forget("said", line + a)
+    check("will ask again" in text, f"forget_game says the setup will ask again when it removed the line: {text!r}")
+    code, text, got = forget("quiet_when_nothing", a)
+    check("will ask again" not in text, f"forget_game says nothing when there was no line: {text!r}")
+
+
+def test_run_check_bat_ampersand(root):
+    # Fix round 2, N2/N3: a folder name with an & sign. Typed between the quotes of the GAME line it works. Pasted WITH its own quotes the
+    # line itself breaks before the batch can do anything (cmd ends the command at the & outside the quotes): the README says so; the
+    # batch then stops at its preflight with a message, never at DONE. The saved-folder route echoes the folder in quotes (N3).
+    b = setup_bundle(root, ("am",), game_name="A & B (x)")
+    bundle, game = b["dir"], b["game"]
+    patch_bat(bundle, GAME=game)
+    code, text = run_bat(bundle)
+    log_path = os.path.join(bundle, "out", "am", "out", "np_log.txt")
+    log = file_bytes(log_path).decode("utf-8", "replace") if os.path.exists(log_path) else ""
+    args = (stand_in_lines(log, "args") or [""])[0].split("|")
+    check(code == 0 and "DONE. Send" in text and args[0] == f"--game_data_root={game}", f"GAME with an & sign, typed between the quotes: exit {code}, {args[:1]}\n{text}")
+    shutil.rmtree(os.path.join(bundle, "out"), ignore_errors=True)
+    patch_bat(bundle, GAME=f'"{game}"')
+    code, text = run_bat(bundle)
+    check(code == 1 and "DONE. Send" not in text and not os.path.exists(os.path.join(bundle, "out")), f"GAME with an & sign, pasted with its own quotes: stops before running: exit {code}\n{text}")
+    patch_bat(bundle, GAME=b["shipped_game"])
+    code, text = run_bat(bundle, "get_game_files.bat", FAKE_SETUP_GAME=game)
+    check(code == 0 and "Game files found: " in text, f"get_game_files.bat, a folder with an & sign: exit {code}\n{text}")
+    code, text = run_bat(bundle)
+    args = (stand_in_lines(file_bytes(log_path).decode("utf-8", "replace") if os.path.exists(log_path) else "", "args") or [""])[0].split("|")
+    check(code == 0 and f'found: "{game}"' in text and "is not recognized" not in text and args[0] == f"--game_data_root={game}",
+          f"run_check.bat, the saved folder has an & sign: the echo is quoted and nothing breaks: exit {code}, {args[:1]}\n{text}")
 
 
 def test_crosscheck_unfinished_runs(root):

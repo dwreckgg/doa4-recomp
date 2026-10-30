@@ -10,14 +10,23 @@
 #               a command line with several quoted arguments when the program is a .cmd (the tests' stand-in).
 #   -FindGame   finds the game folder the game's first-run setup saved (get_game_files.bat): the line
 #               doa4_game_files = "..." before the first [table] of bin\dead_or_alive_4.toml (the setup writes it there,
-#               src/dead_or_alive_4_app.h SaveGameFiles, forward slashes, \ and " escaped). If that folder holds
-#               default.xex, writes it to game_path.txt (a line run_check.bat reads) and exits 0; else exits 1.
+#               src/dead_or_alive_4_app.h SaveGameFiles, forward slashes, \ and " escaped). Exit 0: the folder holds default.xex
+#               and its name is plain ASCII: it is written to game_path.txt (a line run_check.bat reads with `set /p`, which
+#               only reads ASCII correctly: a folder with any other letter is never written there). Exit 1: nothing usable
+#               saved (-Quiet: say nothing; -Prefix words the first line of an exit 0). Exit 2: the saved folder is fine but its name has an accent or another letter that
+#               is not plain ASCII (the setup accepts any ANSI-code-page path, this test does not): the folder is named in the
+#               message (printed by PowerShell itself, so the letters come out right) and nothing is written.
 #               -Toml and -Result name other files (the tests).
+#   -ForgetGame removes the doa4_game_files line (the top-level one only) from the toml, so that the game's first-run setup
+#               screen appears again; every other byte of the file stays (BOM, line ends, other keys, tables).
 # The game's environment (DOA4_NP*, SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT) is set by run_check.bat and inherited here.
 # Nothing here limits which CPUs the game may use.
 param(
     [switch]$Check,
     [switch]$FindGame,
+    [switch]$Quiet,
+    [string]$Prefix = 'Game files found',
+    [switch]$ForgetGame,
     [switch]$Setup,
     [string]$UserData,
     [string]$Toml,
@@ -35,8 +44,8 @@ $ErrorActionPreference = 'Stop'
 # NP_BUNDLE_NO_WINDOW=1 is set only by this bundle's own tests (tests/tools/test_np_tools.py): Start-Process then uses the console it
 # already has instead of opening a new window for a console program (the tests' stand-in game). Unset on the friend's PC: the
 # game is started exactly as before.
-$quiet = @{}
-if ($env:NP_BUNDLE_NO_WINDOW) { $quiet['NoNewWindow'] = $true }
+$noWindow = @{}
+if ($env:NP_BUNDLE_NO_WINDOW) { $noWindow['NoNewWindow'] = $true }
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $notPlain = '[^\x20-\x7E]'
 
@@ -93,13 +102,28 @@ function Get-Verdict([string[]]$lines, [int]$code, [bool]$timedOut, [string]$out
     return @('failed', $shown)
 }
 
+function Write-StartHint([int]$code) {
+    # The game could not start: a Windows error status says why (a missing or old Visual C++ runtime). True if a hint was printed.
+    if ($code -eq -1073741515) {
+        Write-Host 'The game could not start: a Windows component is missing. Install the Microsoft Visual C++ 2015-2022 x64 runtime (vc_redist.x64.exe from Microsoft) and run this again.'
+        return $true
+    }
+    if ($code -eq -1073741511) {
+        # 0xC0000139: an old Visual C++ 2015-2022 runtime lacks a function (rexruntime.dll imports msvcp140_atomic_wait.dll)
+        Write-Host 'The game could not start: your Microsoft Visual C++ 2015-2022 x64 runtime is too old. Install the newest vc_redist.x64.exe from Microsoft and run this again.'
+        return $true
+    }
+    return $false
+}
+
 if ($Check) {
     $problems = @()
     if ($PSScriptRoot -cmatch $notPlain) {
         $problems += "This folder has a letter that is not plain English (a-z, 0-9) in its path: $PSScriptRoot . Move the whole folder to a plain path such as C:\doa4test and run it again; the game cannot read other paths."
     }
     if ($Game -cmatch $notPlain) {
-        $problems += "The GAME folder has a letter that is not plain English (a-z, 0-9) in its path: $Game . Copy the game folder to a plain path such as C:\DOA4 and use that."
+        # (the folder is not echoed: a path typed into the batch file in Notepad comes out of cmd in another code page, garbled)
+        $problems += "The GAME folder has a letter that is not plain English (a-z, 0-9) in its path. Copy the game folder to a plain path such as C:\DOA4 and put that in the GAME line."
     }
     if (-not (Test-Path -LiteralPath (Join-Path $Game 'default.xex'))) {
         $problems += "default.xex was not found in the GAME folder ""$Game"". Run get_game_files.bat to get your game files, or set the GAME line in run_check.bat to your DOA4 game folder (the folder that has default.xex in it)."
@@ -120,13 +144,17 @@ if ($Setup) {
     try {
         New-Item -ItemType Directory -Force -Path $UserData | Out-Null
         $cmdLine = '"--user_data_root=' + $UserData + '" "--log_file=' + (Join-Path $UserData 'setup.log') + '"'
-        $p = Start-Process @quiet -FilePath $Exe -ArgumentList $cmdLine -WorkingDirectory (Split-Path -Parent $Exe) -PassThru
+        $p = Start-Process @noWindow -FilePath $Exe -ArgumentList $cmdLine -WorkingDirectory (Split-Path -Parent $Exe) -PassThru
         $null = $p.Handle
         $p.WaitForExit()
+        $setupCode = [int]$p.ExitCode
     } catch {
         Write-Host ("The game could not be started: " + ($_.Exception.Message -replace '[\r\n]+', ' '))
         exit 1
     }
+    # The setup is where a missing Visual C++ runtime shows first. Any other exit code is not an error here (closing the game
+    # window or pressing Alt+F4 ends it with whatever code): the next step looks for the saved folder.
+    if (Write-StartHint $setupCode) { exit 1 }
     exit 0
 }
 
@@ -155,11 +183,48 @@ if ($FindGame) {
         $folder = $null
     }
     if (-not $folder) {
-        Write-Host "No game files found: $why."
+        if (-not $Quiet) { Write-Host "No game files found: $why." }
         exit 1
     }
+    if ($folder -cmatch $notPlain) {
+        # The setup accepts any folder the ANSI code page can write; this test does not (the batch file would read the name in the
+        # wrong code page, and the game decodes its arguments in the ANSI code page). Nothing is written to $Result.
+        Write-Host "Your game files are in this folder: $folder"
+        Write-Host 'Its name has a letter that is not plain English (an accent or another special letter), so the test cannot use it.'
+        exit 2
+    }
     [System.IO.File]::WriteAllText($Result, $folder + "`r`n", $utf8)
-    Write-Host "Game files found: $folder"
+    Write-Host "${Prefix}: $folder"
+    exit 0
+}
+
+if ($ForgetGame) {
+    if (-not $Toml) { $Toml = Join-Path $PSScriptRoot 'bin\dead_or_alive_4.toml' }
+    if (-not (Test-Path -LiteralPath $Toml)) { exit 0 }
+    $bytes = [System.IO.File]::ReadAllBytes($Toml)
+    $bomLength = 0
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $bomLength = 3 }
+    $text = $utf8.GetString($bytes, $bomLength, $bytes.Length - $bomLength)
+    $kept = New-Object System.Text.StringBuilder
+    $inTable = $false
+    $removed = 0
+    foreach ($m in [regex]::Matches($text, '[^\n]*\n|[^\n]+$')) {
+        $line = $m.Value
+        if (-not $inTable) {
+            if ($line -match '^\s*\[') { $inTable = $true }
+            elseif ($line -cmatch '^\s*doa4_game_files\s*=') { $removed++; continue }
+        }
+        [void]$kept.Append($line)
+    }
+    if ($removed -eq 0) { exit 0 }
+    $body = $utf8.GetBytes($kept.ToString())
+    $out = New-Object byte[] ($bomLength + $body.Length)
+    [Array]::Copy($bytes, 0, $out, 0, $bomLength)
+    [Array]::Copy($body, 0, $out, $bomLength, $body.Length)
+    $tmp = $Toml + '.tmp'
+    [System.IO.File]::WriteAllBytes($tmp, $out)
+    Move-Item -LiteralPath $tmp -Destination $Toml -Force
+    Write-Host 'The saved game folder was removed from the settings file, so the game setup will ask again.'
     exit 0
 }
 
@@ -247,7 +312,7 @@ try {
     [System.IO.File]::WriteAllLines((Join-Path $Run 'command.txt'), [string[]]$shown, $utf8)
 
     $started = Get-Date
-    $p = Start-Process @quiet -FilePath $Exe -ArgumentList $cmdLine -WorkingDirectory (Split-Path -Parent $Exe) `
+    $p = Start-Process @noWindow -FilePath $Exe -ArgumentList $cmdLine -WorkingDirectory (Split-Path -Parent $Exe) `
         -RedirectStandardOutput (Join-Path $Run 'stdout.txt') -RedirectStandardError (Join-Path $Run 'stderr.txt') -PassThru
     $null = $p.Handle   # keep the process handle: without it ExitCode can read empty after the process has ended
     [System.IO.File]::WriteAllText((Join-Path $Run 'pid.txt'), [string]$p.Id, $utf8)
@@ -266,13 +331,7 @@ try {
         $logLines = [string[]][System.IO.File]::ReadAllLines($logPath)
     } else {
         Write-Host 'no np_log.txt: the session did not start'
-        if ($code -eq -1073741515) {
-            Write-Host 'The game could not start: a Windows component is missing. Install the Microsoft Visual C++ 2015-2022 x64 runtime (vc_redist.x64.exe from Microsoft) and run this again.'
-        }
-        if ($code -eq -1073741511) {
-            # 0xC0000139: an old Visual C++ 2015-2022 runtime lacks a function (rexruntime.dll imports msvcp140_atomic_wait.dll)
-            Write-Host 'The game could not start: your Microsoft Visual C++ 2015-2022 x64 runtime is too old. Install the newest vc_redist.x64.exe from Microsoft and run this again.'
-        }
+        $null = Write-StartHint $code
     }
     $status, $quit = Get-Verdict $logLines $code $timedOut $outDir
     if ($timedOut) { $status = 'timeout' }

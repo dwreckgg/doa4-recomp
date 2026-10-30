@@ -26,6 +26,7 @@ if not defined GAME set "GAME=C:\path\to\your\DOA4 game folder"
 set "GAMEDIR=%GAME:"=%"
 if "%GAMEDIR%"=="" set "GAMEDIR=C:\path\to\your\DOA4 game folder"
 if "%GAMEDIR%"=="C:\path\to\your\DOA4 game folder" call :fromsetup
+if defined GAMEBAD goto :gamebad
 if "%GAMEDIR:~-1%"=="\" set "GAMEDIR=%GAMEDIR:~0,-1%"
 
 echo.
@@ -76,6 +77,12 @@ echo Nothing was run. Fix the problem above, then run this file again.
 pause
 exit /b 1
 
+:gamebad
+echo.
+echo Nothing was run. Run get_game_files.bat: it explains what to do and clears the saved folder, so that the game's setup window asks again.
+pause
+exit /b 1
+
 :nohelper
 echo.
 echo run_one.ps1 is missing from this folder, so nothing can be run.
@@ -88,9 +95,13 @@ exit /b 1
 rem GAME is not set (GAMEDIR is the folder to use): use the folder get_game_files.bat saved (the game's setup writes it into bin\dead_or_alive_4.toml).
 if exist "%~dp0game_path.txt" del /q "%~dp0game_path.txt"
 powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0run_one.ps1" -FindGame
-if not "%errorlevel%"=="0" exit /b 0
+set "FG=%errorlevel%"
+rem Exit 2: the saved folder has a special letter in its name (the helper has said so, naming it): nothing can be run.
+if "%FG%"=="2" set "GAMEBAD=1"
+if not "%FG%"=="0" exit /b 0
+rem game_path.txt only ever holds a plain ASCII folder name (the helper refuses to write any other), which set /p reads right.
 set /p GAMEDIR=<"%~dp0game_path.txt"
-echo Using the game files that get_game_files.bat found: %GAMEDIR%
+echo Using the game files that get_game_files.bat found: "%GAMEDIR%"
 exit /b 0
 
 :one
