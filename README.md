@@ -3,10 +3,11 @@
 > **Playtest build.** This is the `playtest` branch of a fork of
 > [parkerallan/doa4-recomp](https://github.com/parkerallan/doa4-recomp). It carries the launcher and
 > the features of [pull request #2](https://github.com/parkerallan/doa4-recomp/pull/2) while that
-> pull request is open, and its launcher builds this branch. To try it: download this repository
-> (**Code → Download ZIP**), copy `launcher\setup.bat` and the `launcher\launcher` folder into a new
-> folder such as `C:\Games\DOA4`, and follow the [Quick start](#quick-start-the-one-click-launcher)
-> below. You need your own copy of the game ([step 1](#1-the-game-version)).
+> pull request is open, and its launcher builds this branch.
+>
+> **New to this? Start with the [Easy setup guide](#easy-setup-guide) just below.** It takes you
+> from nothing to playing, one click at a time. The rest of this page is for people who want the
+> technical details.
 
 A native Windows build of **Dead or Alive 4** (Xbox 360), statically recompiled with the
 [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). The game's code is translated ahead of time
@@ -22,6 +23,91 @@ one-click launcher. It builds against the ReXGlue SDK branch
 [`doa4-recomp` of Dwreckgg/rexglue-sdk](https://github.com/Dwreckgg/rexglue-sdk/tree/doa4-recomp),
 which carries the SDK changes the port needs (frame pacing, audio fixes, controller remap, a swap
 counter) on top of rexglue-sdk `e8ce24f`, the SDK version the port's code was generated with.
+
+## Easy setup guide
+
+No programming knowledge needed. You click through a few windows and wait while your PC does the
+work. Set aside about an hour the first time; most of it is waiting for downloads.
+
+### What you need
+
+- **A Windows 10 or Windows 11 PC (64-bit).** A gaming PC from roughly the last eight years is fine:
+  the processor must support AVX2 (Intel from 2013 on, any AMD Ryzen) and the graphics card must
+  support DirectX 12.
+- **Your own copy of Dead or Alive 4 for Xbox 360, as a disc image** (a file ending in `.iso`) made
+  from a disc you own. It must be the **USA / Europe "Rev 1"** version (see
+  [The game version](#1-the-game-version)). This project does not include or provide the game.
+- **About 20 GB of free disk space** (about 7 GB for the game files, the rest for the tools and the
+  build).
+- **An internet connection** for the first setup.
+- **A controller** is recommended (an Xbox-style one works best). A keyboard also works: press
+  **Esc** in the game, open **Controls** and tick **Use keyboard as controller**.
+
+### Step 1: Download the launcher
+
+1. At the top of this page, click the green **Code** button, then **Download ZIP**.
+2. Open your **Downloads** folder. Right-click the ZIP file (`doa4-recomp-playtest.zip`), choose
+   **Extract All...**, then click **Extract**. A folder with the same name opens.
+3. Make a new, empty folder for the game, for example **`C:\Games\DOA4`**.
+   - Use a short, simple location. Its name may only contain plain letters (A-Z), numbers and spaces.
+     The game cannot start from a folder whose path has accented or non-English letters.
+   - Do not use your Desktop, Documents or OneDrive folders. OneDrive would try to upload several GB
+     of build files.
+4. In the extracted folder, open the folder called **`launcher`**. Inside it you see a file called
+   **`setup.bat`** and another folder also called **`launcher`**. Copy **both** of them into your new
+   `C:\Games\DOA4` folder.
+
+When you are done, `C:\Games\DOA4` contains exactly two things: `setup.bat` and a folder named
+`launcher`. You can delete the downloaded ZIP and the extracted folder now.
+
+### Step 2: Install
+
+1. Double-click **`setup.bat`** in `C:\Games\DOA4`.
+   - If a blue window says **"Windows protected your PC"**, click **More info**, then **Run anyway**.
+     It appears because the file was downloaded from the internet.
+2. The **DOA4 launcher** window opens. Click **Install**.
+3. The launcher checks for three free tools the build needs (Git, LLVM and Microsoft's Visual Studio
+   Build Tools) and lists the ones you are missing, with their size. Confirm, and it installs them.
+   - The Visual Studio installer opens its own window and asks for administrator permission. Click
+     **Yes**, then let it finish by itself. This is the longest wait.
+4. The launcher then downloads the game's code (about 2 GB) and builds the game. You can follow each
+   step in the window. Leave it running; do not close it.
+5. When it is finished, a **Dead or Alive 4** shortcut appears on your desktop.
+
+### Step 3: First start
+
+1. Click **Play** in the launcher (or open the **Dead or Alive 4** shortcut on your desktop, then click
+   **Play**).
+2. The first time, the game asks for your game files. Choose **your disc image** (the `.iso` file).
+   - It checks that the disc image is the right version.
+   - It asks where to put the game files. The suggested place (a `DOA4` folder next to your disc
+     image) is fine. It shows how much space is needed and how much you have.
+   - It copies the game files out of the disc image (about 7 GB, a few minutes). You only do this
+     once; afterwards the disc image is not needed.
+3. The game starts. Enjoy!
+
+### Playing
+
+- **Esc** opens the menu: video and graphics options, controls, photos, extras and game settings.
+- **F12** takes a photo. In the launcher, **Open photos** shows them.
+- To get the newest version later, open the launcher and click **Update & rebuild**.
+- **Open saves** and **Open logs** in the launcher open the folders with your saves and the log files.
+
+### If something goes wrong
+
+| What you see | What to do |
+|---|---|
+| "Windows protected your PC" | Click **More info**, then **Run anyway**. |
+| The game says the disc image is the wrong version | You need the USA / Europe Rev 1 disc image. Other regions and versions do not work. |
+| An error about the folder or its name | Move the game folder to a simple place such as `C:\Games\DOA4` (plain letters, numbers and spaces only) and run `setup.bat` from there. |
+| "Not enough space" | Free up space (about 20 GB in total), then click **Install** again. |
+| Anything else | In the launcher, click **Open logs**. Send the newest log file to the person helping you, or attach it to an issue on this page. |
+
+### Taking part in an online test
+
+If someone sent you a **netplay test package** (a ZIP with a file called `run_check.bat` in it), you do
+**not** need any of the steps above. The package already contains the game program. All you need is
+your own disc image; follow the `README.txt` inside the package.
 
 ## Quick start: the one-click launcher
 
@@ -323,3 +409,15 @@ endif()
 An upstream checkout from before this branch (`parkerallan/doa4-recomp` `1d38c03`) builds the same
 way against rexglue-sdk `e8ce24f`, but has none of the features listed at the top (Esc menu, pacing
 fixes, photos, setup screen, launcher).
+
+## AI disclosure
+
+Much of the code in this fork was written with the help of an AI coding assistant (a large language
+model). That includes the one-click launcher, the first-run setup, the Esc menu and its options, the
+frame pacing and audio changes, photo mode, the online-play work, and this README. The fork's
+maintainer decided what to build, directed the work and tested the results in the game. The code
+was also checked by automated tests and by separate review passes.
+
+The original recompilation ([parkerallan/doa4-recomp](https://github.com/parkerallan/doa4-recomp))
+and the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) are their authors' own work; this note
+covers only what this fork adds. If you find a bug, please report it as an issue on this page.
