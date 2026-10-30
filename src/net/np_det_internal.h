@@ -22,7 +22,7 @@ enum Fix : uint32_t {
   kCri = 1u << 7,       // CRI server passes on the main thread (+ spin steps)
   kCriJob = 1u << 8,    // CRI job-thread jobs inline
   kWorkers = 1u << 9,   // job workers one at a time in a fixed order
-  kNotify = 1u << 10,   // system notifications visible at frame boundaries, host input-device ones dropped
+  kNotify = 1u << 10,   // system notifications visible at frame boundaries (nothing dropped: the SDK posts none about the host's controllers)
 };
 
 bool On(uint32_t fix);

@@ -27,8 +27,9 @@
 //   audio, movie, loader, cri, crijob: np_det_middleware.cpp.
 //   workers:  np_det_workers.cpp.
 //   notify    system notifications (XNotifyGetNext) become visible at the frame boundary after they were
-//             queued; notifications about the host's own controllers are dropped (sdk-np0
-//             xnotifylistener.cpp; this SDK posts none, see its DroppedInLockstep). The boundary is in
+//             queued (sdk-np0 xnotifylistener.cpp). Nothing is dropped: this SDK posts no notification
+//             about the host's own controllers (see its DroppedInLockstep). Every enqueue today is made
+//             inside a guest call, so each is dequeued in the same frame in every run. The boundary is in
 //             np_det_middleware.cpp.
 // DOA4_NP_FIX: "all" (the default), "none", a comma list, or "all-x-y" (all but
 // x and y).
