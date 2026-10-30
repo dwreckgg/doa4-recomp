@@ -42,8 +42,33 @@ constexpr const char* kSdkSettings[] = {
     "readback_resolve", "readback_resolve_half_pixel_offset", "readback_memexport", "readback_memexport_fast",
     "d3d12_readback_resolve", "d3d12_readback_memexport", "vulkan_readback_resolve", "vulkan_readback_memexport",
     "query_occlusion_fake_sample_count", "occlusion_query_enable", "clear_memory_page_state",
+    // a draw whose pipeline is not created yet is skipped, which drops its memexport, resolve and occlusion work
+    "async_shader_compilation",
     // guest audio callbacks
     "audio_maxqframes",
+};
+
+// The TRUST class: carried settings whose NON-DEFAULT value weakens a boundary of the PC that applies it (the census
+// table in the Task 4 report says why for each). They are forced to their default on both sides of a session:
+// CaptureGuestSettings writes the default whatever the host has, and ApplyGuestSettings (and so Pack and Unpack)
+// refuses a text that carries another value. The default is the text the cvar registry prints: "true" or "false" for
+// a bool, the decimal number, the string itself. The host test checks each default against the SDK's definition.
+struct TrustedDefault {
+  const char* name;
+  const char* default_text;
+};
+constexpr TrustedDefault kTrusted[] = {
+    {"cl", ""},                          // a free text on the guest's command line
+    {"xex_apply_patches", "false"},      // loads default.xexp from disk and applies it to the guest image
+    {"kernel_debug_monitor", "false"},   // tells the guest a remote debugger is attached
+    {"kernel_cert_monitor", "false"},    // the certificate-monitor counterpart
+    {"kernel_pix", "false"},             // guest debug-monitor commands print to the host debug output
+    {"rexcrt_heap_enable", "false"},     // gates the heap below
+    {"rexcrt_heap_size_mb", "256"},      // a remote-chosen allocation size
+    {"protect_zero", "true"},            // false stops null dereferences from faulting
+    {"ignore_thread_priorities", "true"},  // false lets guest code set host thread priorities
+    {"ignore_thread_affinities", "true"},  // false lets guest code pin host threads
+    {"allow_game_relative_writes", "false"},  // true makes the game folder writable by the guest
 };
 
 // ---- bytes ----
@@ -121,7 +146,7 @@ bool IsNameChar(char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
 }
 
-// A Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9) opens the device instead of a file, with any
+// A Windows device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9) opens the device instead of a file, with any
 // extension: the base is the text before the first '.', compared without regard to case.
 bool IsDeviceName(std::string_view comp) {
   const std::string_view base = comp.substr(0, comp.find('.'));
@@ -134,7 +159,7 @@ bool IsDeviceName(std::string_view comp) {
     const char a = Upper(base[0]), b = Upper(base[1]), c = Upper(base[2]);
     const bool com = a == 'C' && b == 'O' && c == 'M';
     const bool lpt = a == 'L' && b == 'P' && c == 'T';
-    return (com || lpt) && base[3] >= '1' && base[3] <= '9';
+    return (com || lpt) && base[3] >= '0' && base[3] <= '9';
   }
   return false;
 }
@@ -187,10 +212,93 @@ size_t PackedSize(const Handoff& h) {
   return n;
 }
 
+bool PrintableAscii(std::string_view s) {
+  for (char c : s) {
+    if (c < 0x20 || c > 0x7E) return false;
+  }
+  return true;
+}
+bool PeerAddressOk(const std::array<uint8_t, 4>& ip) { return ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0; }
+
+// A name from outside as it may appear in a message: printable ASCII, at most 64 characters.
+std::string Shown(std::string_view s) {
+  std::string out;
+  for (size_t i = 0; i < s.size() && i < 64; ++i) out += (s[i] >= 0x20 && s[i] <= 0x7E) ? s[i] : '?';
+  if (s.size() > 64) out += "...";
+  return out;
+}
+
+// ---- guest-visible settings: the list, the trust class and the one parser every path goes through ----
+
+struct Registry {
+  std::vector<std::string> names;                   // GuestSettingNames()
+  std::vector<std::optional<std::string>> trusted;  // parallel to names: the default of a trust-class setting
+  std::vector<TrustedSetting> trusted_list;         // TrustedSettings()
+};
+
+const Registry& Reg() {
+  static const Registry reg = [] {
+    Registry r;
+    r.names.assign(std::begin(kSdkSettings), std::end(kSdkSettings));
+    for (const doa4::tweaks::Tweak& t : doa4::tweaks::AllTweaks()) r.names.push_back(t.cvar);
+    r.trusted.resize(r.names.size());
+    for (const TrustedDefault& t : kTrusted) {
+      const auto it = std::find(r.names.begin(), r.names.end(), t.name);
+      if (it == r.names.end()) continue;  // (the host test pins both lists, so a name that is not carried is red there)
+      r.trusted[size_t(it - r.names.begin())] = t.default_text;
+      r.trusted_list.push_back({t.name, t.default_text});
+    }
+    return r;
+  }();
+  return reg;
+}
+
+// "" and `values` filled (one per listed name, in list order), or why the text is refused: a carriage return, a line
+// that is not `name=value` or has no newline, a name that is not listed, given twice or missing, a trust-class
+// setting that is not at its default. ApplyGuestSettings, Pack and Unpack all go through it, so what the joiner would
+// refuse is refused by the host first and before any file is written.
+std::string ParseSettings(std::string_view text, std::vector<std::optional<std::string_view>>* values) {
+  const Registry& reg = Reg();
+  const std::vector<std::string>& names = reg.names;
+  if (text.find('\r') != std::string_view::npos) return "a carriage return in the guest settings";
+  values->assign(names.size(), std::nullopt);
+  for (size_t pos = 0; pos < text.size();) {
+    size_t end = text.find('\n', pos);
+    const bool unterminated = end == std::string_view::npos;  // only the last line can be
+    if (unterminated) end = text.size();
+    const std::string_view line = text.substr(pos, end - pos);
+    pos = end + 1;
+    const size_t eq = line.find('=');
+    if (eq == std::string_view::npos || eq == 0) return "a malformed guest setting line";
+    const std::string_view name = line.substr(0, eq);
+    const auto it = std::find(names.begin(), names.end(), name);
+    if (it == names.end()) return "unknown guest setting " + Shown(name);
+    std::optional<std::string_view>& slot = (*values)[size_t(it - names.begin())];
+    if (slot) return "guest setting " + *it + " given twice";
+    slot = line.substr(eq + 1);
+    if (unterminated) return "the last guest setting line has no newline";
+  }
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (!(*values)[i]) return "guest setting " + names[i] + ": missing";
+  }
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (reg.trusted[i] && *(*values)[i] != std::string_view(*reg.trusted[i])) {
+      return "guest setting " + names[i] + " may not differ from its default";
+    }
+  }
+  return {};
+}
+
 // True if Pack may write `h`: every limit and range Unpack enforces.
 bool Packable(const Handoff& h) {
   if (!RoleOk(uint8_t(h.role)) || !DelayOk(h.delay) || h.session_token == 0) return false;
+  if (h.local_port == 0 || h.peer.port == 0 || !PeerAddressOk(h.peer.ip)) return false;
   if (h.release.size() > kMaxReleaseBytes || h.guest_settings.size() > kMaxGuestBytes) return false;
+  if (!PrintableAscii(h.release)) return false;
+  {
+    std::vector<std::optional<std::string_view>> values;
+    if (!ParseSettings(h.guest_settings, &values).empty()) return false;
+  }
   if (h.files.size() > kMaxFiles) return false;
   size_t total = kFixedBytes + h.release.size() + h.guest_settings.size();
   for (const File& f : h.files) {
@@ -199,14 +307,6 @@ bool Packable(const Handoff& h) {
   }
   if (total > kMaxPackedBytes) return false;
   return FileCollision(h.files) == nullptr;
-}
-
-// A name from outside as it may appear in a message: printable ASCII, at most 64 characters.
-std::string Shown(std::string_view s) {
-  std::string out;
-  for (size_t i = 0; i < s.size() && i < 64; ++i) out += (s[i] >= 0x20 && s[i] <= 0x7E) ? s[i] : '?';
-  if (s.size() > 64) out += "...";
-  return out;
 }
 
 }  // namespace
@@ -277,6 +377,7 @@ std::string Unpack(std::span<const uint8_t> bytes, Handoff* out) {
   if (release_len > kMaxReleaseBytes) return "the release text is too long";
   if (!r.Take(release_len, &view)) return kCut;
   h.release.assign(view.begin(), view.end());
+  if (!PrintableAscii(h.release)) return "the release text is not printable ASCII";
 
   uint8_t role = 0, delay = 0;
   if (!r.U8(&role)) return kCut;
@@ -286,9 +387,12 @@ std::string Unpack(std::span<const uint8_t> bytes, Handoff* out) {
   if (!DelayOk(delay)) return "a bad input delay";
   h.delay = delay;
   if (!r.U16(&h.local_port)) return kCut;
+  if (h.local_port == 0) return "a zero local port";
   if (!r.Take(h.peer.ip.size(), &view)) return kCut;
   std::copy(view.begin(), view.end(), h.peer.ip.begin());
+  if (!PeerAddressOk(h.peer.ip)) return "a zero peer address";
   if (!r.U16(&h.peer.port)) return kCut;
+  if (h.peer.port == 0) return "a zero peer port";
   if (!r.U32(&h.session_token)) return kCut;
   if (h.session_token == 0) return "a zero session token";
   if (!r.U64(&h.seed)) return kCut;
@@ -322,6 +426,10 @@ std::string Unpack(std::span<const uint8_t> bytes, Handoff* out) {
   }
   if (!r.AtEnd()) return "extra bytes after the hand-off";
   if (const char* why = FileCollision(h.files)) return why;
+  {  // last: what ApplyGuestSettings would refuse is refused here, before the caller writes a file
+    std::vector<std::optional<std::string_view>> values;
+    if (std::string why = ParseSettings(h.guest_settings, &values); !why.empty()) return why;
+  }
 
   *out = std::move(h);
   return {};
@@ -329,21 +437,18 @@ std::string Unpack(std::span<const uint8_t> bytes, Handoff* out) {
 
 // ---- guest-visible settings ----
 
-const std::vector<std::string>& GuestSettingNames() {
-  static const std::vector<std::string> names = [] {
-    std::vector<std::string> v(std::begin(kSdkSettings), std::end(kSdkSettings));
-    for (const doa4::tweaks::Tweak& t : doa4::tweaks::AllTweaks()) v.push_back(t.cvar);
-    return v;
-  }();
-  return names;
-}
+const std::vector<std::string>& GuestSettingNames() { return Reg().names; }
+
+const std::vector<TrustedSetting>& TrustedSettings() { return Reg().trusted_list; }
 
 std::string CaptureGuestSettings(const std::function<std::string(const std::string& name)>& query) {
+  const Registry& reg = Reg();
   std::string text;
-  for (const std::string& name : GuestSettingNames()) {
-    const std::string value = query(name);
+  for (size_t i = 0; i < reg.names.size(); ++i) {
+    // a trust-class setting is written at its default whatever the host has (and is not asked for)
+    const std::string value = reg.trusted[i] ? *reg.trusted[i] : query(reg.names[i]);
     if (value.find_first_of("\r\n") != std::string::npos) return {};
-    text += name;
+    text += reg.names[i];
     text += '=';
     text += value;
     text += '\n';
@@ -353,28 +458,9 @@ std::string CaptureGuestSettings(const std::function<std::string(const std::stri
 
 std::string ApplyGuestSettings(std::string_view text,
                                const std::function<bool(const std::string& name, const std::string& value)>& set) {
-  if (text.find('\r') != std::string_view::npos) return "a carriage return in the guest settings";
+  std::vector<std::optional<std::string_view>> values;
+  if (std::string why = ParseSettings(text, &values); !why.empty()) return why;
   const std::vector<std::string>& names = GuestSettingNames();
-  std::vector<std::optional<std::string_view>> values(names.size());
-  for (size_t pos = 0; pos < text.size();) {
-    size_t end = text.find('\n', pos);
-    const bool unterminated = end == std::string_view::npos;  // only the last line can be
-    if (unterminated) end = text.size();
-    const std::string_view line = text.substr(pos, end - pos);
-    pos = end + 1;
-    const size_t eq = line.find('=');
-    if (eq == std::string_view::npos || eq == 0) return "a malformed guest setting line";
-    const std::string_view name = line.substr(0, eq);
-    const auto it = std::find(names.begin(), names.end(), name);
-    if (it == names.end()) return "unknown guest setting " + Shown(name);
-    std::optional<std::string_view>& slot = values[size_t(it - names.begin())];
-    if (slot) return "guest setting " + *it + " given twice";
-    slot = line.substr(eq + 1);
-    if (unterminated) return "the last guest setting line has no newline";
-  }
-  for (size_t i = 0; i < names.size(); ++i) {
-    if (!values[i]) return "guest setting " + names[i] + ": missing";
-  }
   for (size_t i = 0; i < names.size(); ++i) {
     if (!set(names[i], std::string(*values[i]))) return "the game refused guest setting " + names[i];
   }

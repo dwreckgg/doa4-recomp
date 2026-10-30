@@ -39,8 +39,8 @@ struct Handoff {
   std::string release;
   Role role = Role::kHost;
   uint8_t delay = 2;            // frames, 1..8
-  uint16_t local_port = 0;      // this side's UDP port before the restart (the session binds it again)
-  rules::Endpoint peer;         // the other side as this side last heard it
+  uint16_t local_port = 0;      // this side's UDP port before the restart (the session binds it again); non-zero
+  rules::Endpoint peer;         // the other side as this side last heard it; address not 0.0.0.0, port non-zero
   uint32_t session_token = 0;   // non-zero
   uint64_t seed = 0;            // the session seed (np_session SessionSeed)
   std::string guest_settings;   // CaptureGuestSettings text
@@ -49,7 +49,8 @@ struct Handoff {
 
 // True if a joiner may write a file of this name below its session folder: starts with kSavePrefix; components of
 // [A-Za-z0-9._-] only; no empty, "." or ".." component; no trailing dot; no Windows device name (CON, PRN, AUX, NUL,
-// COM1-9, LPT1-9, with or without an extension); at most 6 components; at most kMaxNameBytes.
+// COM1-9, LPT1-9, with or without an extension; COM0 and LPT0 too, which newer Windows lists as reserved);
+// at most 6 components; at most kMaxNameBytes.
 // (A component with a trailing dot or space is another file on Windows: "a." is "a". The name character set has no
 // ':' (alternate data streams), '\\', '~' (8.3 names), wildcard or control character, and the prefix is
 // case-sensitive.)
@@ -58,8 +59,10 @@ bool NameOk(std::string_view name);
 // The bytes of `h`; empty if a limit is broken, the packed total included. What breaks one: more than kMaxFiles
 // files; a file over kMaxFileBytes or a name NameOk refuses; two names that are one file on Windows (equal but for
 // the case of a letter) or a name that is also a folder of another (a/b with a/b/c); a release over
-// kMaxReleaseBytes or guest settings over kMaxGuestBytes; a role that is neither; a delay outside 1..8; a zero
-// session token; a packed total over kMaxPackedBytes.
+// kMaxReleaseBytes or guest settings over kMaxGuestBytes; a release that is not printable ASCII (0x20..0x7E); a role
+// that is neither; a delay outside 1..8; a zero session token, local port or peer port; the peer address 0.0.0.0;
+// guest settings text that ApplyGuestSettings would refuse (empty, a malformed line, a missing or unknown name, a
+// trust-class setting off its default: the host fails early); a packed total over kMaxPackedBytes.
 std::vector<uint8_t> Pack(const Handoff& h);
 // "" (and *out filled) or why not (and *out empty). Refuses exactly what Pack refuses, and bytes that are cut short,
 // have a wrong magic or another version, or have bytes left after the last file; whatever it accepts, Pack gives
@@ -69,15 +72,29 @@ std::string Unpack(std::span<const uint8_t> bytes, Handoff* out);
 // Guest-visible settings (R7). The names, in a fixed order: the SDK cvars of Task 4's census, then every
 // tweaks::AllTweaks() cvar.
 const std::vector<std::string>& GuestSettingNames();
-// "name=value\n" in list order, one query per name. Empty if a value holds a newline or a carriage return (no line
-// can carry it; the session is not started with settings that cannot be handed over).
+// The TRUST class (fix round 1): carried settings whose non-default value weakens a boundary of the PC that applies
+// it (the guest-writable game folder, patches loaded from disk, debug monitors, memory protection, host thread
+// priority and affinity, a remote command line, a remote heap size). They are forced to their default on both
+// sides: Capture writes the default whatever the host has, and an incoming text that carries another value is
+// refused by Apply, Pack and Unpack with "guest setting <name> may not differ from its default". The default is the
+// text the cvar registry prints ("true", "false", a decimal number, the string itself).
+struct TrustedSetting {
+  std::string name;
+  std::string default_text;
+};
+const std::vector<TrustedSetting>& TrustedSettings();  // in GuestSettingNames() order
+
+// "name=value\n" in list order, one query per name except the trust-class ones (written at their default, not asked
+// for). Empty if a value holds a newline or a carriage return (no line can carry it; the session is not started
+// with settings that cannot be handed over).
 std::string CaptureGuestSettings(const std::function<std::string(const std::string& name)>& query);
 // Sets every listed name through `set` (which returns false if the value is refused); "" or the first failure.
 // A name missing from `text` or not in GuestSettingNames() is a failure.
 // The whole text is checked before anything is set (a refused text sets nothing): every line is "name=value\n"
 // (the name ends at the first '='; the value is the rest, empty allowed), a known name appears once, every listed
-// name appears, and no carriage return. The sets then go in list order, whatever order the lines came in, and stop
-// at the first one `set` refuses (the settings already set stay set).
+// name appears, no carriage return, and a trust-class setting is at its default. The sets then go in list order,
+// whatever order the lines came in (the trust-class ones too, at their default: that is how the joiner's own value is
+// forced), and stop at the first one `set` refuses (the settings already set stay set).
 std::string ApplyGuestSettings(std::string_view text,
                                const std::function<bool(const std::string& name, const std::string& value)>& set);
 
