@@ -412,6 +412,8 @@ static std::string ShapeOf(const Update& u) {
 }
 
 // The shape the brief states: nothing, or exactly [Advance f, Save f].
+static bool ShapeOkAfterStartSave(const Update& u);
+
 static bool BriefShape(const Update& u) {
   if (u.ev.empty()) return true;
   return u.ev.size() == 2 && u.ev[0].type == GekkoAdvanceEvent && u.ev[1].type == GekkoSaveEvent &&
@@ -420,6 +422,16 @@ static bool BriefShape(const Update& u) {
 
 // A byte of a buffer, or -1 past its end: failure messages must not index out of range.
 static int ByteAt(const Bytes& b, size_t i) { return i < b.size() ? int(b[i]) : -1; }
+
+// The rule as amended: the first update of the started session may begin with exactly one Save of frame -1
+// (the library's start-up save, game_session.cpp:619-623); what follows it is nothing or [Advance f, Save f].
+static bool ShapeOkAfterStartSave(const Update& u) {
+  if (u.ev.empty() || u.ev[0].type != GekkoSaveEvent || u.ev[0].frame != -1) return false;
+  Update rest;
+  rest.tick = u.tick;
+  rest.ev.assign(u.ev.begin() + 1, u.ev.end());
+  return BriefShape(rest);
+}
 
 // What a Save-less, Load-less, one-Advance update looks like in general (the claims that hold on every run).
 static void CheckOrder(const Run& r, const char* label) {
@@ -528,20 +540,27 @@ static void TestCleanRun() {
   RunPair(r);
   InfoShapes(r, "clean");
   CheckOrder(r, "clean");
-  // The brief's claim: every update yields either nothing or exactly [Advance f, Save f]. It does NOT hold on the
-  // vendored library: the first update of the started session also saves frame -1, the state before frame 0
-  // (game_session.cpp:619-623, HandleRollback: _last_saved_frame starts at -2). This check is kept as the brief
-  // states it and is red on the vendored code for that reason; it is reported, not bent. The next block pins the
-  // shape that was really observed.
+  // Every update yields nothing or [Advance f, Save f], except that the first update that saves frame -1 (and only
+  // that one) begins with that Save: the library's start-up save, game_session.cpp:619-623 (_last_saved_frame starts
+  // at -2). The brief had stated the rule without the exception; the ruling amended it.
   for (int side = 0; side < 2; ++side) {
     int odd = 0;
     std::string first;
-    for (size_t i = 0; i < r.s[side].updates.size(); ++i)
-      if (!BriefShape(r.s[side].updates[i])) {
-        if (!odd) first = "update " + std::to_string(i + 1) + " (tick " + std::to_string(r.s[side].updates[i].tick) + ") yielded " + ShapeOf(r.s[side].updates[i]);
+    bool start_used = false;
+    for (size_t i = 0; i < r.s[side].updates.size(); ++i) {
+      const Update& u = r.s[side].updates[i];
+      bool has_m1 = false;
+      for (const GEvent& e : u.ev)
+        if (e.type == GekkoSaveEvent && e.frame == -1) has_m1 = true;
+      bool ok = BriefShape(u);
+      if (!ok && has_m1 && !start_used && ShapeOkAfterStartSave(u)) ok = true;
+      if (has_m1) start_used = true;
+      if (!ok) {
+        if (!odd) first = "update " + std::to_string(i + 1) + " (tick " + std::to_string(u.tick) + ") yielded " + ShapeOf(u);
         ++odd;
       }
-    CHECKF(odd == 0, "side %d: %d updates are neither [] nor [Advance f, Save f]; first: %s", side, odd, first.c_str());
+    }
+    CHECKF(odd == 0, "side %d: %d updates break the rule; first: %s", side, odd, first.c_str());
   }
   // The shape observed: exactly one update per side is outside the brief's shape; it is the update that raised
   // SessionStarted, it starts with Save -1 and carries either nothing more or [Advance 0, Save 0] (when the other
