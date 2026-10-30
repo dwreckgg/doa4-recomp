@@ -28,9 +28,11 @@ Test-only environment (the stand-in's own, not the game's):
                     line and no quit line, exit 0
   FAKE_GAME_CANNOT  same form, replays: that replay cannot read its recording: one "cannot replay" line,
                     no other file, exit 0 (the host was asked to quit)
-Every run also logs the CPUs it may run on ("stand-in game: affinity 0x..", GetProcessAffinityMask), which is
-how the tests see that np_run.py --affinity took effect: a child process inherits its creator's mask, and
-this one is started behind fake_game.cmd.
+Like the real runtime at startup (rexglue-sdk src/system/runtime.cpp: thread::EnableAffinityConfiguration sets
+the process mask to the SYSTEM mask, result ignored) every run first tries to widen its own CPU mask, then
+logs the mask it ends up with ("stand-in game: affinity 0x.."). That is how the tests see whether
+np_run.py --affinity survives the game's own startup: a plain SetProcessAffinityMask on the suspended
+process does not, a job object's affinity limit does. The stand-in is started behind fake_game.cmd.
 Every run writes the same hashes and the same counters for the same frame, so runs of equal length
 compare equal. Counters: the real file layout (np_core.h) with the real names (np_det.cpp, pinned by
 test_counter_names_match_source); fb_* are 0, pr_* are a function of the frame.
@@ -91,10 +93,15 @@ def write_counters(path, rows, fallback, progress, progress_end=False):
 
 
 def process_affinity():
-    """The CPU mask this process may run on (GetProcessAffinityMask)."""
+    """What the real runtime does at startup (thread::EnableAffinityConfiguration): set the process mask to
+    the system mask, ignoring the result. Returns the CPU mask the process ends up with."""
     import ctypes
+    k32 = ctypes.windll.kernel32
+    me = ctypes.c_void_p(-1)  # the current process
     mine, system = ctypes.c_size_t(), ctypes.c_size_t()
-    ctypes.windll.kernel32.GetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.byref(mine), ctypes.byref(system))
+    k32.GetProcessAffinityMask(me, ctypes.byref(mine), ctypes.byref(system))
+    k32.SetProcessAffinityMask(me, system)
+    k32.GetProcessAffinityMask(me, ctypes.byref(mine), ctypes.byref(system))
     return mine.value
 
 

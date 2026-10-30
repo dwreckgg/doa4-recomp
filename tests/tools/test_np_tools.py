@@ -570,12 +570,12 @@ def test_np_run_refusal(root):
           "unsupported recording version\n", f"np_run, an unreadable recording: result {result(runs, 'cant')!r}")
 
 
-def own_affinity():
-    """The CPU mask of this test process."""
+def system_affinity():
+    """The CPU mask of the whole system (what the stand-in widens its own mask to, like the real runtime)."""
     import ctypes
     mine, system = ctypes.c_size_t(), ctypes.c_size_t()
     ctypes.windll.kernel32.GetProcessAffinityMask(ctypes.c_void_p(-1), ctypes.byref(mine), ctypes.byref(system))
-    return mine.value
+    return system.value
 
 
 def logged_affinity(runs, name):
@@ -602,12 +602,13 @@ def suspended_leftovers(run_dir):
 
 
 def test_np_run_affinity(root):
-    # --affinity limits the game process to the given CPUs before any of its threads runs (the stand-in logs
-    # the mask it finds itself with). The control is a run without the option, which keeps this process's CPUs.
+    # --affinity limits the game process to the given CPUs before any of its threads runs, and the limit holds
+    # when the game tries to widen it at startup (the stand-in does what the real runtime does and logs the mask it
+    # ends up with). The control is a run without the option: the widened mask is the system's.
     ud, runs = make_userdata(root), os.path.join(root, "runs")
-    own = own_affinity()
-    one = own & -own  # the lowest CPU this test may use
-    check(own != one, f"np_run --affinity: the test needs at least two CPUs to tell a limit from none (own {own:#x})")
+    system = system_affinity()
+    one = system & -system  # the lowest CPU of the system
+    check(system != one, f"np_run --affinity: the test needs at least two CPUs to tell a limit from none (system {system:#x})")
 
     def np_run(name, *extra):
         p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
@@ -617,7 +618,7 @@ def test_np_run_affinity(root):
 
     code, out = np_run("free")
     check(code == 0 and result(runs, "free") == REC_OK, f"np_run, no --affinity: exit {code}\n{out}")
-    check(logged_affinity(runs, "free") == own, f"np_run, no --affinity: the game keeps this process's CPUs {own:#x}, got {logged_affinity(runs, 'free')}")
+    check(logged_affinity(runs, "free") == system, f"np_run, no --affinity: the game ends on the system's CPUs {system:#x}, got {logged_affinity(runs, 'free')}")
     check(not (command_tail(runs, "free") or "").startswith("affinity"), "np_run, no --affinity: command.txt has no affinity line")
     code, out = np_run("cut", "--affinity", hex(one))
     check(code == 0 and result(runs, "cut") == REC_OK, f"np_run --affinity: the limited run was resumed and ended well: exit {code}\n{out}")
@@ -625,17 +626,21 @@ def test_np_run_affinity(root):
     check(command_tail(runs, "cut") == f"affinity {hex(one)}", f"np_run --affinity: command.txt ends with {command_tail(runs, 'cut')!r}")
     # a mask of no CPU is refused by Windows: the run stops there, before the game runs at all
     code, out = np_run("none", "--affinity", "0x0")
-    check(code != 0 and "SetProcessAffinityMask failed" in out, f"np_run --affinity 0x0: exit {code}\n{out}")
+    check(code != 0 and "affinity 0x0 refused, the game was not run" in out, f"np_run --affinity 0x0: exit {code}\n{out}")
     check(logged_affinity(runs, "none") is None and result(runs, "none") is None, "np_run --affinity 0x0: the game must not run")
     # ... and the process np_run created suspended is ended, not left behind (a suspended game would hold its memory)
     left = suspended_leftovers(os.path.join(runs, "none"))
     check(left == 0, f"np_run --affinity 0x0: {left} process(es) of the refused run left behind (-1: the listing failed)")
+    # a mask that is not a number is refused before a run folder or a process exists
+    code, out = np_run("junk", "--affinity", "abc")
+    check(code != 0 and "not a number" in out and not os.path.exists(os.path.join(runs, "junk")),
+          f"np_run --affinity abc: exit {code}\n{out}")
 
 
 def test_gate_affinity(root):
     # the gate hands --affinity to every run it starts: the record, the sequential and the concurrent replays
-    own = own_affinity()
-    one = own & -own
+    system = system_affinity()
+    one = system & -system
     code, out, runs = gate(root, "af", "--script", SCRIPT, "--replays", "1", "--concurrent", "1", "--affinity", hex(one))
     check(code == 0, f"gate --affinity: exit {code}\n{out}")
     for n in ("af_rec", "af_rep1", "af_con1"):

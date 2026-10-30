@@ -67,6 +67,41 @@ def judge(mode, code, timed_out, log_lines, out_dir=None):
     return ("ok" if ok else "failed"), (quit_line or "none")
 
 
+def limit_cpus(process, mask):
+    """Puts the (suspended) process, a Windows process handle as an int, into a new job object whose affinity
+    limit is `mask`, and returns the job handle (closing the last handle of a job with live processes keeps the
+    limit). OSError if Windows refuses (a mask of no CPU of the system, a job the process cannot join).
+    A job limit is used instead of SetProcessAffinityMask because the game's runtime widens its own mask to the
+    system's at startup (rexglue-sdk src/system/runtime.cpp: thread::EnableAffinityConfiguration), which undoes a
+    plain process mask but cannot lift a job's."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = BasicLimits()
+    limits.LimitFlags = 0x00000010  # JOB_OBJECT_LIMIT_AFFINITY
+    limits.Affinity = mask
+    if not k32.SetInformationJobObject(job, 2, ctypes.byref(limits), ctypes.sizeof(limits)):  # JobObjectBasicLimitInformation
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not k32.AssignProcessToJobObject(job, process):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return job
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["record", "replay"])
@@ -90,6 +125,12 @@ def main():
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--affinity", help="logical CPU mask, e.g. 0x3 (two logical CPUs)")
     a = ap.parse_args()
+    affinity = None
+    if a.affinity:
+        try:
+            affinity = int(a.affinity, 0)
+        except ValueError:
+            sys.exit(f"--affinity {a.affinity!r}: not a number (e.g. 0x3)")
 
     run = os.path.join(a.runs, a.name)
     if os.path.exists(run):
@@ -135,13 +176,13 @@ def main():
     p = subprocess.Popen(args, env=env, cwd=os.path.dirname(a.exe), creationflags=flags,
                          stdout=open(os.path.join(run, "stdout.txt"), "w"), stderr=subprocess.STDOUT)
     if a.affinity:
-        import ctypes
-        k32, ntdll = ctypes.windll.kernel32, ctypes.windll.ntdll
-        handle = ctypes.c_void_p(int(p._handle))
-        if not k32.SetProcessAffinityMask(handle, ctypes.c_size_t(int(a.affinity, 0))):
+        try:
+            job = limit_cpus(int(p._handle), affinity)  # the job handle stays open as long as this script runs
+        except OSError as e:
             p.kill()
-            sys.exit(f"SetProcessAffinityMask failed: {ctypes.GetLastError()}")
-        ntdll.NtResumeProcess(handle)
+            sys.exit(f"affinity {a.affinity} refused, the game was not run: {e}")
+        import ctypes
+        ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(p._handle)))
         with open(os.path.join(run, "command.txt"), "a") as f:
             f.write(f"affinity {a.affinity}\n")
     with open(os.path.join(run, "pid.txt"), "w") as f:
