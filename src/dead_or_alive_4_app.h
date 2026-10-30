@@ -47,6 +47,7 @@
 #include "doa4_extras.h"
 #include "doa4_gamefiles.h"
 #include "doa4_graphics.h"
+#include "doa4_lowmem.h"
 #include "doa4_photo_hook.h"
 #include "doa4_photo_notice.h"
 #include "doa4_photo_service.h"
@@ -252,6 +253,9 @@ class DeadOrAlive4App : public rex::ReXApp {
   void OnPostLoadXexImage() override {
     REXLOG_INFO("[doa4][LIFE] OnPostLoadXexImage: XEX mapped into guest memory");
     DumpGuestStrings();
+    // Before any guest code allocates: keeps fighter data out of low addresses,
+    // where the game's relocation test skips tables (Ryu Hayabusa / Brad Wong crash).
+    doa4::ReserveLowGuestMemory(runtime() ? runtime()->memory() : nullptr);
     SetUpExtras();  // before any guest code runs: the tweaks patch tables read at boot
     SetUpSnapshotWatcher();  // before the first guest swap, so the swap counts start together
     StartNetplaySession();   // DOA4_NP only: record / replay / hash from the first frame
