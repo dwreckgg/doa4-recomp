@@ -58,6 +58,7 @@ The rest of this README is the same process by hand.
 8. [Regenerating the recompiled code](#8-regenerating-the-recompiled-code)
 9. [Host tests](#9-host-tests)
 10. [Troubleshooting](#10-troubleshooting)
+11. [Known bugs](#11-known-bugs)
 
 ## 1. The game version
 
@@ -283,6 +284,13 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 | The setup screen keeps coming back | The saved location could not be written to `dead_or_alive_4.toml` (the log says why), or the folder has moved. |
 | "This path has characters that this build cannot use" | The game folder's path has characters outside the Windows code page (for example Japanese on an English Windows); the runtime cannot start from it. Use a folder whose path has plain letters and digits. |
 | "This folder holds an unfinished extraction" | An earlier extraction was interrupted (the game was killed or the PC lost power). Delete that folder and extract again. |
+
+## 11. Known bugs
+
+| Bug | Status |
+|---|---|
+| Choosing **Ryu Hayabusa** (or **Brad Wong**, first reported as Zack) as player 1 crashed the game; Ryu also crashed the attract demo (Ryu vs Christie). | Fixed: the runtime put the game's data pool at guest address 0x00010000, so low that the game's "already relocated?" test (a table entry above the buffer address counts as a pointer) skipped Ryu's move-script table; Brad Wong's character-select model read a bad motion record from the same low pool (gone with the fix, not traced to its table). The game now keeps guest 0x00010000-0x0FFFFFFF unused (`src/doa4_lowmem.cpp`; the log says `[doa4][MEM] reserved guest ...`). |
+| A rare crash with `Call to invalid or unregistered function at guest address 0x...` in the log, at one particular move or moment. | A function the recompiler missed. Add the address to `hints.toml` and regenerate (step 8). |
 
 ## Building from a fresh GitHub clone
 

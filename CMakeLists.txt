@@ -25,6 +25,7 @@ set(DEADORALIVE4_SOURCES
     src/doa4_cvars.cpp
     src/doa4_graphics.cpp
     src/doa4_lowmem.cpp
+    src/doa4_speakers.cpp
     src/doa4_photo.cpp
     src/doa4_photo_win.cpp
     src/doa4_photo_service.cpp
@@ -71,3 +72,7 @@ endif()
 if(TARGET xxhash)
     target_include_directories(dead_or_alive_4 PRIVATE $<TARGET_PROPERTY:xxhash,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()
+# Netplay (spec section 4, FMA row): no floating-point contraction anywhere in the game target, so no
+# compiler or flag change can fuse a*b+c differently on one player's build. Phase 0 measured no
+# contraction without it (phase0_facts.md 3); this keeps it that way.
+target_compile_options(dead_or_alive_4 PRIVATE -ffp-contract=off)
