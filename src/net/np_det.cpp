@@ -31,8 +31,21 @@
 //             about the host's own controllers (see its DroppedInLockstep). Every enqueue today is made
 //             inside a guest call, so each is dequeued in the same frame in every run. The boundary is in
 //             np_det_middleware.cpp.
+//   keepalive the D3D runtime's kick thread (0x8275BD18) no longer re-presents the last frame when its 30 ms
+//             HOST wait for a pending swap times out: sub_8275AD70 and sub_8275AEE0 return at once when the
+//             kick thread calls them from that branch (lr 0x8275BD9C / 0x8275BDAC; np_core.h ClassifyKeepAlive).
+//             Each re-present advanced the D3D CPU fence counter, which the main thread stamps into static
+//             texture headers and into a pointer the dynamic-buffer allocator reads (0x8357C190), so the
+//             count per frame followed host speed (Task 11a). The kick thread calling them from any other site
+//             runs the call, logs one "WARN keep-alive" line (np_run.py fails such a run) and is counted; the
+//             skip count is host-timed, so it is logged at the session's end, never a counter of the gate.
+//   reader    after sub_82731790 started the save manager's one-shot file thread (0x82731758: one file
+//             operation, then exit), the caller waits up to 2 s until that thread's host thread has ended;
+//             the game polls the thread with a zero wait every frame, so under load the save manager went on
+//             a frame later (Task 11a: the save-slot time 0x831B99D0 and the thread's state block 0x82E476A0).
+//             A thread not found or not ended after 2 s is a fallback (fb_reader).
 // DOA4_NP_FIX: "all" (the default), "none", a comma list, or "all-x-y" (all but
-// x and y).
+// x and y); names and bits: np_core.h kFixNames.
 
 #include "np_det.h"
 
@@ -59,12 +72,20 @@
 #include "np_det_internal.h"
 #include "np_session.h"
 
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 extern "C" {
 REX_EXTERN(__imp__sub_82334C60);
 REX_EXTERN(__imp__sub_82790138);
 REX_EXTERN(__imp__sub_82792660);
 REX_EXTERN(__imp__sub_82790130);
 REX_EXTERN(__imp__sub_82793B68);
+REX_EXTERN(__imp__sub_8275AD70);
+REX_EXTERN(__imp__sub_82731790);
 // SDK netplay exports (sdk-np0 src/system/kernel_state.cpp, src/audio/audio_system.cpp,
 // src/system/xnotifylistener.cpp).
 __declspec(dllimport) void rex_overlapped_inline(int on);
@@ -76,14 +97,16 @@ __declspec(dllimport) int rex_audio_worker_callback(uint64_t* index);
 namespace doa4::np::det {
 namespace {
 
-struct FixName {
-  const char* name;
-  uint32_t bit;
-};
-constexpr FixName kFixNames[] = {
-    {"seed", kSeed},     {"clock", kClock},   {"sdkclock", kSdkClock}, {"xam", kXam},
-    {"audio", kAudio},   {"movie", kMovie},   {"loader", kLoader},     {"cri", kCri},
-    {"crijob", kCriJob}, {"workers", kWorkers}, {"notify", kNotify}};
+// The Fix bits (np_det_internal.h) are the indices of np_core.h kFixNames, which DOA4_NP_FIX and the meta use.
+constexpr bool FixIs(Fix bit, int i, std::string_view name) {
+  return i < kFixCount && bit == 1u << i && std::string_view(kFixNames[i]) == name;
+}
+static_assert(FixIs(kSeed, 0, "seed") && FixIs(kClock, 1, "clock") && FixIs(kSdkClock, 2, "sdkclock") &&
+                  FixIs(kXam, 3, "xam") && FixIs(kAudio, 4, "audio") && FixIs(kMovie, 5, "movie") &&
+                  FixIs(kLoader, 6, "loader") && FixIs(kCri, 7, "cri") && FixIs(kCriJob, 8, "crijob") &&
+                  FixIs(kWorkers, 9, "workers") && FixIs(kNotify, 10, "notify") &&
+                  FixIs(kKeepAlive, 11, "keepalive") && FixIs(kReader, 12, "reader") && kFixCount == 13,
+              "one Fix bit per kFixNames entry, in that order");
 
 std::atomic<uint32_t> g_fixes{0};
 std::atomic<uint32_t> g_frame{0};
@@ -94,34 +117,19 @@ SeedSeries g_seeds;  // seedings so far per MT in the session (np_core.h; Start 
 std::atomic<uint32_t> g_counters[kCounterCount];
 constexpr const char* kCounterNames[] = {
     "fb_worker_token", "fb_main_wait",  "fb_unranked",    "fb_loader_outside", "fb_loader_idle",
-    "fb_audio_late",   "fb_spin_cap",   "fb_cri_ready",   "fb_audio_start",    "pr_cri_passes",
-    "pr_spin_steps",   "pr_loader_jobs", "pr_cri_jobs",   "pr_reseeds",        "pr_notify"};
+    "fb_audio_late",   "fb_spin_cap",   "fb_cri_ready",   "fb_audio_start",    "fb_reader",
+    "pr_cri_passes",   "pr_spin_steps", "pr_loader_jobs", "pr_cri_jobs",       "pr_reseeds",
+    "pr_notify"};
 static_assert(std::size(kCounterNames) == kCounterCount, "one name per Counter, in enum order");
 
-uint32_t ParseFixes(const char* text) {
-  if (!text || !*text || std::string_view(text) == "all") return ~0u;
-  if (std::string_view(text) == "none") return 0;
-  std::string_view s(text);
-  uint32_t bits = 0;
-  char sep = ',';
-  bool minus = false;
-  if (s.substr(0, 4) == "all-") {  // "all-x-y": everything but x and y
-    bits = ~0u;
-    s.remove_prefix(4);
-    sep = '-';
-    minus = true;
-  }
-  while (!s.empty()) {
-    const size_t at = s.find(sep);
-    const std::string_view item = s.substr(0, at);
-    for (const FixName& f : kFixNames) {
-      if (item == f.name) bits = minus ? (bits & ~f.bit) : (bits | f.bit);
-    }
-    if (at == std::string_view::npos) break;
-    s.remove_prefix(at + 1);
-  }
-  return bits;
-}
+// ---- keepalive ----
+// Calls of the kick thread's timeout re-present skipped, per function (sub_8275AD70, sub_8275AEE0), and calls of
+// the two by the kick thread from any other site (run, not skipped). Host-timed: logged at Stop, never a counter.
+std::atomic<uint32_t> g_keepalive_skips[2];
+std::atomic<uint32_t> g_keepalive_unexpected{0};
+
+// ---- reader ----
+std::atomic<uint32_t> g_reader_threads{0}, g_reader_fallbacks{0};
 
 // ---- Virtual clocks ----
 // The formulas and the never-backwards rule are in np_core.h; each thread keeps its own clock.
@@ -149,7 +157,65 @@ bool GuestTime(int kind, uint64_t* value) {
   return true;
 }
 
+// The keepalive fix for one call of sub_8275AD70 / sub_8275AEE0: true = return at once.
+bool KeepAliveSkip(KeepAliveFn fn, uint32_t lr) {
+  if (!doa4::np::Active() || !On(kKeepAlive)) return false;
+  switch (ClassifyKeepAlive(fn, ThreadStart(), lr)) {
+    case KeepAliveCall::kPass:
+      return false;
+    case KeepAliveCall::kSkip:
+      g_keepalive_skips[fn == KeepAliveFn::kAd70 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+      return true;
+    case KeepAliveCall::kUnexpected:
+      // The fix assumes the timeout branch is the kick thread's only call site of the two; another one runs as
+      // the game wrote it, and the run fails the gate (np_run.py: a "WARN " line).
+      if (g_keepalive_unexpected.fetch_add(1, std::memory_order_relaxed) == 0) {
+        LogLine(fmt::format("WARN keep-alive: {} called on the D3D kick thread {:08X} from lr {:08X}, not from {:08X} "
+                            "(frame {}): run, not skipped; the fix's assumption does not hold",
+                            fn == KeepAliveFn::kAd70 ? "sub_8275AD70" : "sub_8275AEE0", kD3dKickThreadStart, lr,
+                            KeepAliveLr(fn), Frame()));
+      }
+      return false;
+  }
+  return false;
+}
+
+// The reader fix, after sub_82731790 returned `ret` (on the thread that called it).
+void ReaderStarted(int32_t ret, uint8_t* base) {
+  bool found = false, ended = false;
+  uint32_t handle = 0;
+  if (ret == 1) {
+    handle = rex::memory::load_and_swap<uint32_t>(base + kReaderThreadHandle);
+    auto* ks = rex::system::kernel_state();
+    if (ks && handle) {
+      auto thread = ks->object_table()->LookupObject<rex::system::XThread>(handle);
+      if (thread && thread->thread()) {
+        found = true;
+        ended = WaitForSingleObject(thread->thread()->native_handle(), DWORD(kReaderWaitMs)) == WAIT_OBJECT_0;
+      }
+    }
+  }
+  const ReaderWait w = ReaderOutcome(ret, found, ended);
+  if (w == ReaderWait::kNoThread) {
+    LogLine(fmt::format("reader: frame {}: sub_82731790 returned {}: no file thread to wait for", Frame(), ret));
+    return;
+  }
+  const uint32_t n = g_reader_threads.fetch_add(1, std::memory_order_relaxed);
+  if (w == ReaderWait::kFallback) {
+    Count(kFbReader);
+    g_reader_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (n < 20 || w == ReaderWait::kFallback) {
+    LogLine(fmt::format("reader: frame {}: file thread (handle {:08X}) {}", Frame(), handle,
+                        w == ReaderWait::kEnded ? "ended before the caller went on"
+                        : found                 ? "not ended after 2 s: the game runs on (fb_reader)"
+                                                : "not found: the game runs on (fb_reader)"));
+  }
+}
+
 }  // namespace
+
+bool SkipKeepAliveSwap(uint32_t lr) { return KeepAliveSkip(KeepAliveFn::kAee0, lr); }
 
 bool On(uint32_t fix) {
   return (g_fixes.load(std::memory_order_relaxed) & fix) != 0 &&
@@ -191,20 +257,13 @@ void ThreadCreated(uint32_t start, uint32_t tid) {
   MiddlewareThreadCreated(start);
 }
 
-std::string FixSetName() {
-  const uint32_t fixes = ParseFixes(std::getenv("DOA4_NP_FIX"));
-  std::string names;
-  for (const FixName& f : kFixNames) {
-    if (fixes & f.bit) names += std::string(names.empty() ? "" : ",") + f.name;
-  }
-  return names.empty() ? std::string("none") : names;
-}
+std::string FixSetName() { return FixSetText(ParseFixSet(std::getenv("DOA4_NP_FIX"))); }
 
 void Start(uint64_t seed, const std::filesystem::path& dir) {
   g_seed = seed;
   g_seeds.Reset();  // the series counts the seedings of this session
   TraceStart(dir);
-  const uint32_t fixes = ParseFixes(std::getenv("DOA4_NP_FIX"));
+  const uint32_t fixes = ParseFixSet(std::getenv("DOA4_NP_FIX"));
   g_fixes.store(fixes, std::memory_order_release);
   LogLine("determinism fixes: " + FixSetName());
   if (fixes & kSdkClock) rex::chrono::Clock::set_guest_time_override(&GuestTime);
@@ -242,6 +301,13 @@ void Stop() {
       "clock override {}, notification lockstep {}",
       state(kAudio), state(kXam), rex::cvar::GetFlagByName("headless"), g_headless_before, state(kSdkClock),
       state(kNotify)));
+  // Host-timed counts (how often the 30 ms timeout fired depends on the host's speed): logged, never gated on.
+  LogLine(fmt::format("keep-alive ({}): {} calls skipped on the D3D kick thread (sub_8275AD70 {}, sub_8275AEE0 {}), "
+                      "{} from another site",
+                      (fixes & kKeepAlive) ? "on" : "off", g_keepalive_skips[0].load() + g_keepalive_skips[1].load(),
+                      g_keepalive_skips[0].load(), g_keepalive_skips[1].load(), g_keepalive_unexpected.load()));
+  LogLine(fmt::format("reader ({}): {} file threads waited for, {} fallbacks", (fixes & kReader) ? "on" : "off",
+                      g_reader_threads.load(), g_reader_fallbacks.load()));
 }
 
 }  // namespace doa4::np::det
@@ -330,4 +396,17 @@ REX_HOOK_RAW(sub_82793B68) {
   }
   doa4::np::LogLine(fmt::format("thread created: start {:08X} id {} (frame {})", start, tid, Frame()));
   ThreadCreated(start, tid);
+}
+
+// sub_8275AD70(device r3): the D3D runtime's flush before a swap; the kick thread's keep-alive re-present calls it
+// first (keepalive fix). sub_8275AEE0, the second call, is hooked in doa4_photo_hook.cpp (SkipKeepAliveSwap).
+REX_HOOK_RAW(sub_8275AD70) {
+  if (KeepAliveSkip(doa4::np::KeepAliveFn::kAd70, uint32_t(ctx.lr))) return;
+  __imp__sub_8275AD70(ctx, base);
+}
+
+// sub_82731790: starts the save manager's one-shot file thread; returns 1, or -1 if it could not (reader fix).
+REX_HOOK_RAW(sub_82731790) {
+  __imp__sub_82731790(ctx, base);
+  if (doa4::np::Active() && On(kReader)) ReaderStarted(ctx.r3.s32, base);
 }

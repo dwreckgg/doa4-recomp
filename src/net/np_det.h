@@ -33,4 +33,9 @@ void CounterValues(std::vector<uint32_t>* out);
 // before and after Start.
 std::string FixSetName();
 
+// The "keepalive" fix for sub_8275AEE0, whose hook lives in doa4_photo_hook.cpp (sub_8275AD70's is in np_det.cpp):
+// true = the caller returns at once (the D3D kick thread's timeout re-present, in a session with the fix on).
+// False outside a session, so the hook runs the original exactly as before. lr = the call's return address.
+bool SkipKeepAliveSwap(uint32_t lr);
+
 }  // namespace doa4::np::det

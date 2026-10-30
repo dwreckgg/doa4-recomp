@@ -299,7 +299,10 @@ def test_counter_names_match_source(root):
     src = open(os.path.join(net, "np_det.cpp"), encoding="utf-8").read()
     table = re.search(r"kCounterNames\[\]\s*=\s*\{(.*?)\};", src, re.S)
     names = re.findall(r'"([^"]*)"', table.group(1)) if table else []
-    check(len(names) == 15, f"np_det.cpp: expected 15 counter names, found {len(names)}")
+    # 16 since Task 11c: fb_reader (the reader fix's fallback) - a fallback counter, so np_compare's "no fallbacks"
+    # judges it (NOT a pr_ name, which would only be compared between runs)
+    check(len(names) == 16, f"np_det.cpp: expected 16 counter names, found {len(names)}")
+    check("fb_reader" in names, f"np_det.cpp: the reader fix's fallback counter fb_reader: {names}")
     check(all(re.fullmatch(r"(fb|pr)_[a-z_]+", n) and len(n) <= 23 for n in names),
           f"np_det.cpp: every name is fb_/pr_ and fits the file's 23 characters: {names}")
     enum = re.search(r"enum Counter : int \{(.*?)kCounterCount", open(os.path.join(net, "np_det_internal.h"),
@@ -311,6 +314,58 @@ def test_counter_names_match_source(root):
     fake = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fake)
     check(fake.COUNTERS == names, f"fake_game.COUNTERS vs np_det.cpp:\n{fake.COUNTERS}\n{names}")
+
+
+def fake_game_module():
+    spec = importlib.util.spec_from_file_location("fake_game", os.path.join(HERE, "fake_game.py"))
+    fake = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fake)
+    return fake
+
+
+def test_keepalive_warn_text(root):
+    # The WARN the keepalive fix logs (np_det.cpp KeepAliveSkip) is the line np_run.judge fails a run on: the
+    # source's format string must start with judge's prefix, and the stand-in's filled-in line must be what that
+    # format string produces (T4.2: the needle comes from the code's own message).
+    src = open(os.path.join(HERE, "..", "..", "src", "net", "np_det.cpp"), encoding="utf-8").read()
+    fmts = re.findall(r'LogLine\(fmt::format\("(WARN[^"]*)"\s*"([^"]*)"', src)
+    check(len(fmts) == 1, f"np_det.cpp: one WARN format string (two literal halves), found {fmts}")
+    if len(fmts) != 1:
+        return
+    fmt_text = fmts[0][0] + fmts[0][1]
+    prefix = getattr(load("np_run"), "WARN_PREFIX", None)
+    check(isinstance(prefix, str) and prefix.strip() == "WARN" and fmt_text.startswith(prefix),
+          f"np_det.cpp's WARN line starts with np_run.WARN_PREFIX {prefix!r}: {fmt_text!r}")
+    prefix = prefix if isinstance(prefix, str) else "WARN "
+    pattern = re.escape(fmt_text).replace(r"\{:08X\}", "[0-9A-F]{8}").replace(r"\{\}", r"\S+")
+    fake = fake_game_module()
+    check(re.fullmatch(pattern, fake.KEEPALIVE_WARN) is not None,
+          f"the stand-in's WARN line is what np_det.cpp's format produces:\n{fmt_text}\n{fake.KEEPALIVE_WARN}")
+    # the session's end-of-run summary lines (np_det.cpp Stop) are no WARN: the stand-in logs them in every good run
+    check(not any(l.startswith(prefix) for l in fake.SUMMARY), f"the summary lines are not WARN lines: {fake.SUMMARY}")
+    for needle in ('"keep-alive ({}): {} calls skipped on the D3D kick thread', '"reader ({}): {} file threads waited for'):
+        check(needle in src, f"np_det.cpp Stop still logs {needle!r} (the stand-in's SUMMARY copies it)")
+
+
+def test_judge_warn(root):
+    # A WARN line (np_det.cpp: an assumption of a fix did not hold; the session ran on) fails a run that otherwise
+    # ended well, in either mode, wherever it is in the log; the reason names the WARN and how the run ended.
+    np_run = load("np_run")
+    judge, warn = np_run.judge, fake_game_module().KEEPALIVE_WARN
+    end = "quit at frame 6995: end of the recording"
+    for log in (GOOD_REPLAY_LOG[:2] + [warn, end], GOOD_REPLAY_LOG + [warn]):
+        check(judge("replay", 0, False, log) == ("failed", f"{warn} ({end})"), f"judge: a WARN fails a replay: {judge('replay', 0, False, log)}")
+    rec = [warn, "quit at frame 9: quit frame"]
+    check(judge("record", 0, False, rec) == ("failed", f"{warn} (quit at frame 9: quit frame)"),
+          f"judge: a WARN fails a record run: {judge('record', 0, False, rec)}")
+    check(judge("replay", 0, False, [warn]) == ("failed", f"{warn} (no quit line)"), "judge: a WARN with no quit line")
+    # healthy output: a good replay with the session's summary lines, and "WARN" not at a line's start, stay ok
+    summary = GOOD_REPLAY_LOG + fake_game_module().SUMMARY
+    check(judge("replay", 0, False, summary) == ("ok", end), f"judge: the summary lines are healthy: {judge('replay', 0, False, summary)}")
+    inside = GOOD_REPLAY_LOG[:2] + ["shot 12: WARN keep-alive in the file name"] + GOOD_REPLAY_LOG[2:]
+    check(judge("replay", 0, False, inside) == ("ok", end), "judge: 'WARN' inside a line is not a WARN line")
+    # a refusal is still the reason when the refused session (wrongly) also logged a WARN
+    check(judge("replay", 0, False, REFUSAL_LOG + [warn])[1] == REFUSED, "judge: a refusal stays the reason")
 
 
 def test_judge(root):
@@ -489,6 +544,22 @@ def test_gate_fallback(root):
     code, out, runs = gate(root, "fa", "--script", SCRIPT, "--replays", "1", "--sweep-advisory", FAKE_GAME_FALLBACK="_rec")
     check(code == 1, f"gate --sweep-advisory, a fallback in the record run: exit {code}\n{out}")
     check("run A: fb_main_wait = 1 (first at frame 4)" in out, f"gate, a fallback in the record run: line\n{out}")
+
+
+def test_gate_warn(root):
+    # a WARN line fails the gate in the production mode (strict), in a replay whose hashes, counters and quit line
+    # are all good: the run itself is failed (np_run judge), so the gate counts it and every pair with it differs
+    code, out, runs = gate(root, "kw", "--script", SCRIPT, "--replays", "1", "--concurrent", "1", FAKE_GAME_WARN="_con1")
+    check(code == 1, f"gate, a WARN in a replay: exit {code}\n{out}")
+    check("kw_con1: run failed (see its out/run_result.txt)" in out, f"gate, a WARN in a replay: the run is failed\n{out}")
+    check("gate FAILED: 3 runs (1 failed), 3 pairs, 2 differ" in out, f"gate, a WARN in a replay: summary\n{out}")
+    warn = fake_game_module().KEEPALIVE_WARN
+    check(result(runs, "kw_con1") == f"status failed\nexit 0\ntimeout 0\nquit {warn} (quit at frame 12: end of the recording)\n",
+          f"gate, a WARN in a replay: run_result {result(runs, 'kw_con1')!r}")
+    check(result(runs, "kw_rep1") == REP_OK, f"gate, a WARN in another replay: rep1 untouched {result(runs, 'kw_rep1')!r}")
+    # and in the record run
+    code, out, runs = gate(root, "kr", "--script", SCRIPT, "--replays", "1", FAKE_GAME_WARN="_rec")
+    check(code == 1 and "gate FAILED: the record run failed" in out, f"gate, a WARN in the record run: exit {code}\n{out}")
 
 
 def test_gate_progress(root):
@@ -687,8 +758,9 @@ def test_compare_final_progress(root):
 
 def test_gate_final_progress(root):
     # the gate prints every run's final progress counters once (not once per pair), so the values a good
-    # build ends with are in the gate's own output
-    final = "pr_cri_passes=1011 pr_spin_steps=1111 pr_loader_jobs=1211 pr_cri_jobs=1311 pr_reseeds=1411 pr_notify=1511"
+    # build ends with are in the gate's own output. The stand-in's counter at COUNTERS index i ends at
+    # (i + 1) * 100 + 11 (12 frames); pr_cri_passes is index 10 since fb_reader (index 9) came in (Task 11c).
+    final = "pr_cri_passes=1111 pr_spin_steps=1211 pr_loader_jobs=1311 pr_cri_jobs=1411 pr_reseeds=1511 pr_notify=1611"
     code, out, runs = gate(root, "fp", "--script", SCRIPT, "--replays", "1", "--concurrent", "1")
     check(code == 0, f"gate, final progress: exit {code}\n{out}")
     for n in ("fp_rec", "fp_rep1", "fp_con1"):
@@ -701,12 +773,12 @@ def test_gate_final_progress(root):
     check(code == 1, f"gate, final progress, an unreadable recording: exit {code}\n{out}")
     check("fq_rep1 final progress: none (no counters.d4k)\n" in out, f"gate, final progress: the run without counters\n{out}")
     check(f"fq_rec final progress: {final}\n" in out, f"gate, final progress: the good run still printed\n{out}")
-    # each line comes from its own run: one concurrent replay ends with pr_notify 1512 (+1 at its last row only),
-    # the others with 1511; the pairs that include it differ and fail the gate
+    # each line comes from its own run: one concurrent replay ends with pr_notify 1612 (+1 at its last row only),
+    # the others with 1611; the pairs that include it differ and fail the gate
     code, out, runs = gate(root, "fr", "--script", SCRIPT, "--replays", "1", "--concurrent", "2", FAKE_GAME_PROGRESS_END="_con2")
     check(code == 1 and "pr_notify first differs at frame 11" in out, f"gate, final progress, runs that end apart: exit {code}\n{out}")
-    for n, notify in (("fr_rec", 1511), ("fr_rep1", 1511), ("fr_con1", 1511), ("fr_con2", 1512)):
-        line = final.replace("pr_notify=1511", f"pr_notify={notify}")
+    for n, notify in (("fr_rec", 1611), ("fr_rep1", 1611), ("fr_con1", 1611), ("fr_con2", 1612)):
+        line = final.replace("pr_notify=1611", f"pr_notify={notify}")
         check(f"{n} final progress: {line}\n" in out, f"gate, final progress, runs that end apart: the line of {n}\n{out}")
     # the helper alone: runs of different values, a missing file, a file that is not a counters file
     gate_final_progress = load("np_gate").final_progress

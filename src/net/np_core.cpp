@@ -384,6 +384,39 @@ std::string MetaMismatch(std::string_view recorded, std::string_view current) {
   return out;
 }
 
+uint32_t ParseFixSet(const char* text) {
+  if (!text || !*text || std::string_view(text) == "all") return ~0u;
+  if (std::string_view(text) == "none") return 0;
+  std::string_view s(text);
+  uint32_t bits = 0;
+  char sep = ',';
+  bool minus = false;
+  if (s.substr(0, 4) == "all-") {  // "all-x-y": everything but x and y
+    bits = ~0u;
+    s.remove_prefix(4);
+    sep = '-';
+    minus = true;
+  }
+  while (!s.empty()) {
+    const size_t at = s.find(sep);
+    const std::string_view item = s.substr(0, at);
+    for (int i = 0; i < kFixCount; ++i) {
+      if (item == kFixNames[i]) bits = minus ? (bits & ~(1u << i)) : (bits | (1u << i));
+    }
+    if (at == std::string_view::npos) break;
+    s.remove_prefix(at + 1);
+  }
+  return bits;
+}
+
+std::string FixSetText(uint32_t bits) {
+  std::string names;
+  for (int i = 0; i < kFixCount; ++i) {
+    if (bits & (1u << i)) names += std::string(names.empty() ? "" : ",") + kFixNames[i];
+  }
+  return names.empty() ? std::string("none") : names;
+}
+
 void MaskedCopy(const Region& region, const uint8_t* bytes, std::vector<uint8_t>* out) {
   out->assign(bytes, bytes + region.length);
   for (const Mask& m : region.masks) {
@@ -524,6 +557,21 @@ uint32_t SeedSeries::Next(uint64_t session_seed, uint32_t state) {
 void SeedSeries::Reset() {
   std::lock_guard lk(mu_);
   seeded_.clear();
+}
+
+uint32_t KeepAliveLr(KeepAliveFn fn) {
+  // sub_8275BD18: "bl 0x8275ad70" at 0x8275BD98, "bl 0x8275aee0" at 0x8275BDA8 (the timeout branch)
+  return fn == KeepAliveFn::kAd70 ? 0x8275BD9C : 0x8275BDAC;
+}
+
+KeepAliveCall ClassifyKeepAlive(KeepAliveFn fn, uint32_t thread_start, uint32_t lr) {
+  if (thread_start != kD3dKickThreadStart) return KeepAliveCall::kPass;
+  return lr == KeepAliveLr(fn) ? KeepAliveCall::kSkip : KeepAliveCall::kUnexpected;
+}
+
+ReaderWait ReaderOutcome(int32_t ret, bool found, bool ended) {
+  if (ret != 1) return ReaderWait::kNoThread;
+  return found && ended ? ReaderWait::kEnded : ReaderWait::kFallback;
 }
 
 }  // namespace doa4::np

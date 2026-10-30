@@ -23,6 +23,7 @@
 #include "doa4_photo.h"
 #include "doa4_photo_hook.h"
 #include "doa4_photo_watch.h"
+#include "net/np_det.h"
 
 namespace {
 std::atomic<doa4::photo::SnapshotWatcher*> g_watcher{nullptr};
@@ -40,6 +41,8 @@ REX_EXTERN(__imp__sub_823078C8);
 }
 
 REX_HOOK_RAW(sub_8275AEE0) {
+  // Netplay (keepalive fix): in a session the D3D kick thread's timeout re-present returns at once (false offline).
+  if (doa4::np::det::SkipKeepAliveSwap(uint32_t(ctx.lr))) return;
   const uint32_t state =
       rex::memory::load_and_swap<uint32_t>(base + doa4::photo::kSnapshotStateAddress);
   __imp__sub_8275AEE0(ctx, base);

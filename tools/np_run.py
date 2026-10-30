@@ -16,7 +16,8 @@ before any of its threads runs, then resumed; only the run's own process; comman
 Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
 A replay the session refuses (another build, fix set, game data or settings than the recording's) or cannot read is
 never a good run: run_result.txt then has "status failed" and "quit refused: ..." / "quit cannot replay ...", or
-"quit refusal not honoured (...): ..." when the session ran on after the refusal.
+"quit refusal not honoured (...): ..." when the session ran on after the refusal. A run whose np_log holds a
+"WARN " line (a fix's assumption did not hold, np_det.cpp) is never a good run either: "quit WARN ... (<quit line>)".
 """
 import argparse
 import os
@@ -37,16 +38,23 @@ OK_REASONS = {"record": ("quit frame",), "replay": ("end of the recording",)}
 # Either ends the run at once, with no session: no "session on" line, no hash file, exit 0.
 REFUSAL_PREFIXES = ("refused: ", "cannot replay ")
 
+# The start of the line the determinism layer logs when an assumption one of its fixes relies on did not hold and
+# the session ran on (np_det.cpp: "WARN keep-alive: ..." - the D3D kick thread called a re-present function from a
+# site other than its timeout branch). Such a run is never a good run, however it ended.
+WARN_PREFIX = "WARN "
+
 
 def judge(mode, code, timed_out, log_lines, out_dir=None):
     """(status, quit line): ok only if the game exited 0 by itself after the session quit for a
-    reason that ends a good run of this mode.
+    reason that ends a good run of this mode, and the log holds no WARN line.
 
     A run whose log holds a refusal is never ok, and its reason (the quit line of run_result.txt) is
     the refusal itself when the refusal was honoured: the game exited 0 on its own with no session
     started after it ("session on" line) and, when out_dir is given, no digest.d4d in it. Otherwise the
     reason is "refusal not honoured (<what>): <the refusal>": the status is "failed" either way, so
-    this is the line that tells a clean refusal from one the session ignored."""
+    this is the line that tells a clean refusal from one the session ignored.
+    A run whose log holds a line starting with WARN_PREFIX is failed with the reason "<the first WARN line>
+    (<the quit line, or 'no quit line'>)"."""
     at = next((i for i, l in enumerate(log_lines) if l.startswith(REFUSAL_PREFIXES)), None)
     if at is not None:
         flaws = []
@@ -62,6 +70,9 @@ def judge(mode, code, timed_out, log_lines, out_dir=None):
             return "failed", f"refusal not honoured ({'; '.join(flaws)}): {log_lines[at]}"
         return "failed", log_lines[at]
     quit_line = next((l for l in reversed(log_lines) if l.startswith("quit at frame ")), None)
+    warn = next((l for l in log_lines if l.startswith(WARN_PREFIX)), None)
+    if warn is not None:
+        return "failed", f"{warn} ({quit_line or 'no quit line'})"
     reason = quit_line.split(": ", 1)[1] if quit_line and ": " in quit_line else None
     ok = not timed_out and code == 0 and reason in OK_REASONS[mode]
     return ("ok" if ok else "failed"), (quit_line or "none")

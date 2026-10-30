@@ -28,6 +28,9 @@ Test-only environment (the stand-in's own, not the game's):
                     line and no quit line, exit 0
   FAKE_GAME_CANNOT  same form, replays: that replay cannot read its recording: one "cannot replay" line,
                     no other file, exit 0 (the host was asked to quit)
+  FAKE_GAME_WARN    same form: that run logs the determinism layer's WARN line (np_det.cpp: the keepalive fix
+                    met the D3D kick thread calling from an unexpected site, KEEPALIVE_WARN below) halfway, and
+                    otherwise ends cleanly - equal hashes, no fallback, the good quit line, exit 0
 Like the real runtime at startup (rexglue-sdk src/system/runtime.cpp: thread::EnableAffinityConfiguration sets
 the process mask to the SYSTEM mask, result ignored) every run first tries to widen its own CPU mask, then
 logs the mask it ends up with ("stand-in game: affinity 0x.."). That is how the tests see whether
@@ -44,8 +47,15 @@ import sys
 REGIONS = [("game_obj", 0x8320D110, 0x63B0), ("frame_ctr", 0x831013E4, 4)]
 SWEEP_PER = 2
 COUNTERS = ["fb_worker_token", "fb_main_wait", "fb_unranked", "fb_loader_outside", "fb_loader_idle",
-            "fb_audio_late", "fb_spin_cap", "fb_cri_ready", "fb_audio_start", "pr_cri_passes",
+            "fb_audio_late", "fb_spin_cap", "fb_cri_ready", "fb_audio_start", "fb_reader", "pr_cri_passes",
             "pr_spin_steps", "pr_loader_jobs", "pr_cri_jobs", "pr_reseeds", "pr_notify"]
+# The line np_det.cpp KeepAliveSkip logs, filled in as the real game would (pinned against the source's format
+# string by test_keepalive_warn_text).
+KEEPALIVE_WARN = ("WARN keep-alive: sub_8275AEE0 called on the D3D kick thread 8275BD18 from lr 82765D70, not from "
+                  "8275BDAC (frame 6): run, not skipped; the fix's assumption does not hold")
+# The session's last lines (np_det.cpp Stop) as a good run of the real game ends: the keep-alive and reader counts.
+SUMMARY = ["keep-alive (on): 22 calls skipped on the D3D kick thread (sub_8275AD70 11, sub_8275AEE0 11), "
+           "0 from another site", "reader (on): 3 file threads waited for, 0 fallbacks"]
 FALLBACK_FRAME = 4
 PROGRESS_FRAME = 6
 SWEEP_FRAME = 5
@@ -143,6 +153,8 @@ def main():
     write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
                    listed(name, "FAKE_GAME_PROGRESS"), listed(name, "FAKE_GAME_PROGRESS_END"))
     log = [f"stand-in game: {mode} run {name}, {rows} frames", f"stand-in game: affinity {process_affinity():#x}"]
+    if listed(name, "FAKE_GAME_WARN"):
+        log.append(KEEPALIVE_WARN)
     if mode == "record":
         with open(os.path.join(out, "rec.d4r"), "w") as f:
             f.write(f"{frames}\n")
@@ -155,6 +167,7 @@ def main():
     else:
         log.append(f"quit at frame {rows - 1}: quit frame" if mode == "record"
                    else f"quit at frame {rows}: end of the recording")
+        log += SUMMARY  # after the quit line, as np_det.cpp Stop logs them
         code = 0
     with open(os.path.join(out, "np_log.txt"), "w") as f:
         f.write("\n".join(log) + "\n")

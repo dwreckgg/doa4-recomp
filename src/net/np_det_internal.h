@@ -23,7 +23,10 @@ enum Fix : uint32_t {
   kCriJob = 1u << 8,    // CRI job-thread jobs inline
   kWorkers = 1u << 9,   // job workers one at a time in a fixed order
   kNotify = 1u << 10,   // system notifications visible at frame boundaries (nothing dropped: the SDK posts none about the host's controllers)
+  kKeepAlive = 1u << 11,  // the D3D kick thread's timeout re-present does nothing (np_core.h ClassifyKeepAlive)
+  kReader = 1u << 12,     // the save manager's one-shot file thread runs to its end before the game polls it
 };
+// The bit of fix i is 1u << i, with i its index in np_core.h kFixNames (the names DOA4_NP_FIX and the meta use).
 
 bool On(uint32_t fix);
 bool Stopped();                // the session has ended
@@ -44,6 +47,7 @@ enum Counter : int {
   kFbSpinCap,        // a frame's CRI spin steps reached the cap
   kFbCriReady,       // the CRI server thread was not in its loop 2 s after it was created
   kFbAudioStart,     // the first audio callbacks were not done after 250 ms
+  kFbReader,         // the save manager's file thread was not found or had not ended 2 s after it was started
   kPrCriPasses,      // CRI server passes run on the main thread
   kPrSpinSteps,      // of those, spin steps
   kPrLoaderJobs,     // loader jobs run

@@ -141,6 +141,18 @@ bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error,
 // be hashed) agrees with nothing, itself included.
 std::string MetaMismatch(std::string_view recorded, std::string_view current);
 
+// ---- Fix sets (DOA4_NP_FIX; the recording's meta key "fixes") ----
+// The determinism layer's fixes in bit order: fix i is bit 1u << i (np_det_internal.h Fix, pinned there).
+inline constexpr const char* kFixNames[] = {"seed",  "clock",  "sdkclock", "xam",    "audio",     "movie", "loader",
+                                            "cri",   "crijob", "workers",  "notify", "keepalive", "reader"};
+inline constexpr int kFixCount = int(sizeof(kFixNames) / sizeof(kFixNames[0]));
+// "all", empty or null: every bit (~0u); "none": 0; "a,b,c": those fixes; "all-a-b": all but a and b. Names that are
+// not fixes are ignored.
+uint32_t ParseFixSet(const char* text);
+// The names of the fixes in `bits`, comma separated in fix order, or "none": the text the session logs and the
+// recording's meta holds ("fixes=" + this), so a recording made with another set is refused (MetaMismatch).
+std::string FixSetText(uint32_t bits);
+
 // ---- Digest regions ----
 // A guest region hashed every frame, minus masked byte ranges (host-timing
 // words), which are hashed as zero.
@@ -227,5 +239,42 @@ class SeedSeries {
   std::mutex mu_;
   std::unordered_map<uint32_t, uint32_t> seeded_;  // MT address -> seedings so far
 };
+
+// ---- The D3D runtime's keep-alive re-present (the determinism layer's "keepalive" fix) ----
+// The D3D runtime's kick thread (entry 0x8275BD18, created by D3D itself with ExCreateThread) waits for a pending
+// swap with a 30 ms HOST timeout; when the wait times out it re-presents the last frame: sub_8275AD70 from lr
+// 0x8275BD9C, then sub_8275AEE0 (the VdSwap wrapper) from lr 0x8275BDAC. Each call advances the D3D CPU fence
+// counter (device+10396), which the main thread later stamps into static texture headers and into a pointer the
+// game's dynamic-buffer allocator reads, so how many happen in a frame is a function of host speed (Task 11a).
+// In a session those two calls return at once. The main thread's own present calls the same two functions (from
+// sub_82765AE0) and is never touched.
+inline constexpr uint32_t kD3dKickThreadStart = 0x8275BD18;
+enum class KeepAliveFn { kAd70, kAee0 };  // sub_8275AD70, sub_8275AEE0
+// The return address of the kick thread's timeout re-present call to `fn` (the instruction after its bl).
+uint32_t KeepAliveLr(KeepAliveFn fn);
+enum class KeepAliveCall {
+  kPass,        // not the kick thread: run the call
+  kSkip,        // the kick thread's timeout re-present: return at once
+  kUnexpected,  // the kick thread calling `fn` from another site: run the call, log one WARN, count it
+};
+// thread_start = the calling guest thread's entry point (0: not a guest thread), lr = the call's return address.
+KeepAliveCall ClassifyKeepAlive(KeepAliveFn fn, uint32_t thread_start, uint32_t lr);
+
+// ---- The save manager's one-shot file thread (the determinism layer's "reader" fix) ----
+// sub_82731790 (called by the save manager) creates the file thread 0x82731758 suspended, keeps its handle at
+// 0x82E476BC, resumes it and returns 1 (-1: the thread could not be created). The thread does one file operation
+// and exits; the main thread polls the handle with a zero wait every frame, so under load the save manager went on
+// a frame later (Task 11a). In a session the caller waits (up to 2 s) after sub_82731790 until the file thread's
+// host thread has ended.
+inline constexpr uint32_t kReaderThreadHandle = 0x82E476BC;
+inline constexpr int kReaderWaitMs = 2000;
+enum class ReaderWait {
+  kNoThread,  // sub_82731790 did not start a thread: nothing to wait for
+  kEnded,     // the file thread's host thread ended within the wait
+  kFallback,  // the thread was not found or had not ended after kReaderWaitMs: the game runs on (fb_reader)
+};
+// ret = sub_82731790's return value; found = the handle at kReaderThreadHandle names a guest thread with a host
+// thread; ended = that host thread ended within the wait (only read when found).
+ReaderWait ReaderOutcome(int32_t ret, bool found, bool ended);
 
 }  // namespace doa4::np

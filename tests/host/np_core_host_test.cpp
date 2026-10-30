@@ -545,6 +545,114 @@ static void TestMtSeeds() {
   CHECK(all == want);
 }
 
+// Task 11c. The fix set the t11 builds logged and wrote into every recording's meta (np_runs/t11single_rec:
+// np_log "determinism fixes: ..." and rec.d4r's "fixes=" line): the eleven fixes before keepalive and reader.
+static const std::string kT11Fixes = "seed,clock,sdkclock,xam,audio,movie,loader,cri,crijob,workers,notify";
+
+static void TestFixSets() {
+  CHECK(kFixCount == 13);
+  // The default (DOA4_NP_FIX unset, empty or "all") turns the two new fixes on, after the eleven, in fix order.
+  CHECK(FixSetText(ParseFixSet(nullptr)) == kT11Fixes + ",keepalive,reader");
+  CHECK(FixSetText(ParseFixSet("")) == kT11Fixes + ",keepalive,reader");
+  CHECK(FixSetText(ParseFixSet("all")) == kT11Fixes + ",keepalive,reader");
+  // Each name is its own bit, in kFixNames order (np_det_internal.h Fix pins the same bits).
+  CHECK(ParseFixSet("keepalive") == 1u << 11);
+  CHECK(ParseFixSet("reader") == 1u << 12);
+  CHECK(ParseFixSet("notify") == 1u << 10);
+  for (int i = 0; i < kFixCount; ++i) {
+    CHECK(ParseFixSet(kFixNames[i]) == 1u << i);
+    CHECK(FixSetText(ParseFixSet(kFixNames[i])) == kFixNames[i]);
+  }
+  // The text is in fix order, not in the order the list was written.
+  CHECK(FixSetText(ParseFixSet("reader,keepalive")) == "keepalive,reader");
+  // The fixes-off before-half (DOA4_NP_FIX=all-keepalive-reader) is exactly the t11 set: both bits cleared, the
+  // eleven kept (NOT "all", which would leave the two on, and NOT "none").
+  const uint32_t off = ParseFixSet("all-keepalive-reader");
+  CHECK((off & (1u << 11)) == 0);
+  CHECK((off & (1u << 12)) == 0);
+  CHECK(FixSetText(off) == kT11Fixes);
+  // One fix at a time (Task 11a's keepalive-only and reader-only runs).
+  CHECK(FixSetText(ParseFixSet("all-reader")) == kT11Fixes + ",keepalive");
+  CHECK(FixSetText(ParseFixSet("all-keepalive")) == kT11Fixes + ",reader");
+  // Unchanged: "none", and names that are not fixes (whole names only: no prefix match).
+  CHECK(ParseFixSet("none") == 0 && FixSetText(0) == "none");
+  CHECK(ParseFixSet("keep") == 0);
+  CHECK(ParseFixSet("keepalivex") == 0);
+  CHECK(ParseFixSet("readers") == 0);
+}
+
+// The recording's meta round trip with the new fix set (np_session.cpp CurrentMeta writes "fixes=" + the set).
+static void TestMetaFixSet() {
+  auto meta = [](const std::string& fixes) {
+    return "build=ded4ba28058f10b5\ndata=8ce3302b3fcea98d\nfixes=" + fixes +
+           "\nserial=default\nsweep=4\ntweaks=doa4_tag_all_stages=0,doa4_mp_hidden_characters=0\n";
+  };
+  const std::string cur = meta(FixSetText(ParseFixSet(nullptr)));
+  // Written and read back unchanged, and equal to itself.
+  std::string bytes = EncodeRecHeader(1, 0, cur) + EncodeRecFrame(FrameInput{});
+  Recording r;
+  std::string error;
+  CHECK(DecodeRecording(bytes, &r, &error));
+  CHECK(r.meta == cur);
+  CHECK(MetaMismatch(r.meta, cur).empty());
+  // A t11 recording (the eleven fixes) is refused by a session with the default set (Task 11a: t11a_p8limfix2 - an
+  // old record replayed with the fixes on still diverges), with the reason naming both sets.
+  const std::string t11 = meta(kT11Fixes);  // np_runs/t11single_rec/out/rec.d4r's meta, byte for byte
+  CHECK(MetaMismatch(t11, cur) == "fixes " + kT11Fixes + " vs " + kT11Fixes + ",keepalive,reader");
+  // A fixes-off record (all-keepalive-reader) replays only with the same setting: refused by a default session,
+  // accepted by a session with the same setting.
+  const std::string off = meta(FixSetText(ParseFixSet("all-keepalive-reader")));
+  CHECK(!MetaMismatch(off, cur).empty());
+  CHECK(MetaMismatch(off, off).empty());
+  // keepalive-only and reader-only recordings are refused by each other.
+  CHECK(!MetaMismatch(meta(FixSetText(ParseFixSet("all-reader"))), meta(FixSetText(ParseFixSet("all-keepalive")))).empty());
+}
+
+// The kick thread's call sites, from the generated code (generated/default/dead_or_alive_4_recomp.43.cpp,
+// sub_8275BD18: "ctx.lr = 0x8275BD9C; sub_8275AD70" and "ctx.lr = 0x8275BDAC; sub_8275AEE0"); the main thread's
+// present sub_82765AE0 calls the same two from lr 0x82765D54 and 0x82765D70; the main thread's entry point is
+// 0x827929B0 (np_log thread census "[6 start 827929B0 ... main]").
+static void TestKeepAlive() {
+  constexpr uint32_t kick = 0x8275BD18, main_start = 0x827929B0;
+  CHECK(kD3dKickThreadStart == kick);
+  CHECK(KeepAliveLr(KeepAliveFn::kAd70) == 0x8275BD9C);
+  CHECK(KeepAliveLr(KeepAliveFn::kAee0) == 0x8275BDAC);
+  // The kick thread's timeout re-present: skipped.
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAd70, kick, 0x8275BD9C) == KeepAliveCall::kSkip);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAee0, kick, 0x8275BDAC) == KeepAliveCall::kSkip);
+  // The main thread's present: runs, also when its lr is the kick thread's (NOT an lr-only rule), and so does
+  // a plain host thread (start 0).
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAd70, main_start, 0x82765D54) == KeepAliveCall::kPass);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAee0, main_start, 0x82765D70) == KeepAliveCall::kPass);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAd70, main_start, 0x8275BD9C) == KeepAliveCall::kPass);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAee0, 0, 0x8275BDAC) == KeepAliveCall::kPass);
+  // The kick thread from any other site: unexpected (runs, WARN, counted) - the pair swapped (NOT "either lr"),
+  // one instruction off (NOT a range), the main present's site, no lr.
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAd70, kick, 0x8275BDAC) == KeepAliveCall::kUnexpected);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAee0, kick, 0x8275BD9C) == KeepAliveCall::kUnexpected);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAee0, kick, 0x8275BDA8) == KeepAliveCall::kUnexpected);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAee0, kick, 0x82765D70) == KeepAliveCall::kUnexpected);
+  CHECK(ClassifyKeepAlive(KeepAliveFn::kAd70, kick, 0) == KeepAliveCall::kUnexpected);
+}
+
+// sub_82731790 returns 1 (thread started) or -1 (CreateThread failed) - generated/default/dead_or_alive_4_recomp.41.cpp;
+// its handle is stored at r31 + 28 with r31 = 0x82E40000 + 30368 = 0x82E476A0.
+static void TestReaderOutcome() {
+  CHECK(kReaderThreadHandle == 0x82E476A0 + 28);
+  CHECK(kReaderWaitMs == 2000);
+  CHECK(ReaderOutcome(1, true, true) == ReaderWait::kEnded);
+  // Fallbacks (each one fb_reader): not ended within the wait; not found (whatever `ended` says: NOT read when
+  // the thread was not found).
+  CHECK(ReaderOutcome(1, true, false) == ReaderWait::kFallback);
+  CHECK(ReaderOutcome(1, false, true) == ReaderWait::kFallback);
+  CHECK(ReaderOutcome(1, false, false) == ReaderWait::kFallback);
+  // No thread started: nothing to wait for, never a fallback - also when a stale handle would be found (NOT a rule
+  // on `found` alone) and for 0 (NOT "anything but -1").
+  CHECK(ReaderOutcome(-1, false, false) == ReaderWait::kNoThread);
+  CHECK(ReaderOutcome(-1, true, true) == ReaderWait::kNoThread);
+  CHECK(ReaderOutcome(0, true, true) == ReaderWait::kNoThread);
+}
+
 int main() {
   TestPadBytes();
   TestScript();
@@ -560,6 +668,10 @@ int main() {
   TestVirtualClocks();
   TestAudioClocks();
   TestMtSeeds();
+  TestFixSets();
+  TestMetaFixSet();
+  TestKeepAlive();
+  TestReaderOutcome();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }
