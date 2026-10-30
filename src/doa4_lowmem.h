@@ -32,7 +32,10 @@ class Memory;
 namespace doa4 {
 
 // The reserved range: from the end of the runtime's own protected first 64 KB
-// up to 256 MB (the 4 KB-page heap is 0x00000000-0x3FFFFFFF).
+// up to 256 MB (the 4 KB-page heap is 0x00000000-0x3FFFFFFF; general allocations stop at 0x2FFFFFFF, the
+// system heap is above). The game's 4 KB range therefore drops from about 768 MB to 512 MB, the console's
+// whole RAM; an out-of-memory from NtAllocateVirtualMemory would point here first. A stray guest pointer into
+// the reserved range now faults instead of reading pool data.
 inline constexpr uint32_t kLowGuestFloor0 = 0x00010000;
 inline constexpr uint32_t kLowGuestFloor = 0x10000000;
 
