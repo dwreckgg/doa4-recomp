@@ -664,6 +664,32 @@ def test_gate_single_replay_fails(root):
     check("gate FAILED: 1 runs (1 failed), 0 pairs, 0 differ" in out, f"gate, one replay, fails: summary\n{out}")
 
 
+def test_np_run_sdl_pads(root):
+    # Task 11c (coordinator): the runtime opens the host's real game controllers through SDL even in a headless
+    # session (game.log "SDL OnControllerDeviceAdded: Added at index 0"), so rumble could reach the user's pad.
+    # np_run.py gives the game SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000 (an allow-list that matches no
+    # device) unless the caller already set the variable, by --env or in its own environment.
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+    var = "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT"
+
+    def seen(name, *extra, **env):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60", *extra],
+                           capture_output=True, text=True, env=stand_in_env(**env), timeout=120)
+        path = os.path.join(runs, name, "out", "np_log.txt")
+        m = re.search(rf"^stand-in game: {var}=(.*)$", open(path).read(), re.M) if os.path.exists(path) else None
+        return (m.group(1) if m else None), p.returncode
+
+    # precondition: the default case is only a default case if the suite's own environment lacks the variable
+    check(var not in os.environ, f"the suite runs without {var} in its environment (else the default is untested)")
+    got, code = seen("pads_default")
+    check(got == "0x0000/0x0000" and code == 0, f"np_run: the game gets {var}=0x0000/0x0000 by default: {got!r} (exit {code})")
+    got, code = seen("pads_flag", "--env", f"{var}=0x045E/0x02EA")
+    check(got == "0x045E/0x02EA", f"np_run: --env {var}=... is kept: {got!r}")
+    got, code = seen("pads_inherited", **{var: "0x1234/0x5678"})
+    check(got == "0x1234/0x5678", f"np_run: {var} in np_run's own environment is kept: {got!r}")
+
+
 def test_np_run_exit_status(root):
     ud, runs = make_userdata(root), os.path.join(root, "runs")
 

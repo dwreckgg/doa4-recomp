@@ -13,6 +13,8 @@ Options: --exe, --game, --userdata (the pristine source), --runs (where run fold
 --affinity MASK (logical CPU mask, e.g. 0x3: the game is started suspended, limited to those CPUs
 before any of its threads runs, then resumed; only the run's own process; command.txt ends with
 "affinity MASK").
+The game's environment gets SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000 (SDL opens no real controller)
+unless the caller set that variable; command.txt lists it with the DOA4_ variables.
 Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
 A replay the session refuses (another build, fix set, game data or settings than the recording's) or cannot read is
 never a good run: run_result.txt then has "status failed" and "quit refused: ..." / "quit cannot replay ...", or
@@ -42,6 +44,13 @@ REFUSAL_PREFIXES = ("refused: ", "cannot replay ")
 # the session ran on (np_det.cpp: "WARN keep-alive: ..." - the D3D kick thread called a re-present function from a
 # site other than its timeout branch). Such a run is never a good run, however it ended.
 WARN_PREFIX = "WARN "
+
+# The runtime opens the host's game controllers through SDL even in a headless session (game.log "SDL
+# OnControllerDeviceAdded: Added at index 0"). A session's game never reads them (the input hooks serve the script or
+# the recording), but rumble (XamInputSetState) could reach the user's controller, and a run without a session would
+# read it. This allow-list matches no device, so SDL opens none. Set unless the caller already set the variable (by
+# --env or in this script's own environment); a launcher setting, not part of the recording's meta.
+SDL_PADS = ("SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT", "0x0000/0x0000")
 
 
 def judge(mode, code, timed_out, log_lines, out_dir=None):
@@ -168,6 +177,7 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition("=")
         env[k] = v
+    env.setdefault(*SDL_PADS)  # no real controller is opened (see SDL_PADS)
     args = [a.exe, f"--game_data_root={a.game}", f"--user_data_root={ud}",
             f"--log_file={os.path.join(run, 'game.log')}"]
     if a.log_level:
@@ -179,7 +189,7 @@ def main():
     with open(os.path.join(run, "command.txt"), "w") as f:
         f.write(" ".join(args) + "\n")
         for k in sorted(env):
-            if k.startswith("DOA4_"):
+            if k.startswith("DOA4_") or k == SDL_PADS[0]:
                 f.write(f"{k}={env[k]}\n")
 
     t0 = time.time()

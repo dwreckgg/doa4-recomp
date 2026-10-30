@@ -56,6 +56,7 @@ KEEPALIVE_WARN = ("WARN keep-alive: sub_8275AEE0 called on the D3D kick thread 8
 # The session's last lines (np_det.cpp Stop) as a good run of the real game ends: the keep-alive and reader counts.
 SUMMARY = ["keep-alive (on): 22 calls skipped on the D3D kick thread (sub_8275AD70 11, sub_8275AEE0 11), "
            "0 from another site", "reader (on): 3 file threads waited for, 0 fallbacks"]
+SDL_PADS = "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT"
 FALLBACK_FRAME = 4
 PROGRESS_FRAME = 6
 SWEEP_FRAME = 5
@@ -152,7 +153,9 @@ def main():
     write_sweep(os.path.join(out, "sweep.d4s"), rows, listed(name, "FAKE_GAME_SWEEP"))
     write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
                    listed(name, "FAKE_GAME_PROGRESS"), listed(name, "FAKE_GAME_PROGRESS_END"))
-    log = [f"stand-in game: {mode} run {name}, {rows} frames", f"stand-in game: affinity {process_affinity():#x}"]
+    log = [f"stand-in game: {mode} run {name}, {rows} frames", f"stand-in game: affinity {process_affinity():#x}",
+           # the SDL controller allow-list the game's SDL reads at start (np_run.py sets it so no real pad is opened)
+           f"stand-in game: {SDL_PADS}={os.environ.get(SDL_PADS, '(unset)')}"]
     if listed(name, "FAKE_GAME_WARN"):
         log.append(KEEPALIVE_WARN)
     if mode == "record":
