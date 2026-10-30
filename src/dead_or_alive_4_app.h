@@ -210,7 +210,11 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
 
   // Override virtual hooks for customization:
-  // void OnPostInitLogging() override {}
+  void OnPostInitLogging() override {
+    // The dot-product NaN redirect is compile-time, and the build id hashes bytes, not features: this line says
+    // whether this exe has it (netplay phase 1, Task 1; the gate reads it from every run's game.log).
+    REXLOG_INFO("[doa4][LIFE] dot products: canonical NaN {}", doa4::np::DotProductSelfTest());
+  }
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
     doa4_wait_for_previous_instance();  // after "Restart now" in the menu

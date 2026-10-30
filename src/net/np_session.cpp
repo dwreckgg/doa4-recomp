@@ -41,6 +41,7 @@
 #include "np_core.h"
 #include "np_det.h"
 #include "np_det_internal.h"
+#include "np_selftest.h"
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -559,6 +560,13 @@ const FrameInput* StagedInput() { return Active() ? &S().staged : nullptr; }
 uint32_t CurrentFrame() { return S().frame ? S().frame - 1 : 0; }
 
 uint64_t SessionSeed() { return S().seed; }
+
+// This file reaches the SDK's simde_mm_dp_ps redirect the way every generated file does
+// (generated/default/dead_or_alive_4_init.h -> <rex/ppc.h> -> intrinsics.h -> dot_product.h), so the lambda below
+// meets the same macro the recompiled code does.
+std::string DotProductSelfTest() {
+  return selftest::CanonicalNaN([](__m128 a, __m128 b) { return simde_mm_dp_ps(a, b, 0xFF); });
+}
 
 void Start(Host host) {
   State& s = S();

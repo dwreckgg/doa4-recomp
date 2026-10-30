@@ -53,6 +53,10 @@ void Start(Host host);
 // closes the session log. Called first in OnShutdown, while the presenter still exists.
 void Shutdown();
 bool Active();
+// The boot self-test of the dot-product NaN redirect (np_selftest.h): "on" when this build's simde_mm_dp_ps returns
+// the canonical NaN, else "OFF (<lane bit patterns>)". It touches no session state: callable at any time, and the
+// app logs it once at start-up.
+std::string DotProductSelfTest();
 
 // For the other netplay files (np_det.cpp).
 struct FrameInput;

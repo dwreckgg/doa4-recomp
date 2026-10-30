@@ -25,6 +25,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
+
+#include "../../src/net/np_selftest.h"
 
 #if !defined(SIMDE_X86_SSE4_1_NATIVE)
 #error "build with -march=x86-64-v3 -msse4.1 like the game: this test checks simde's native path"
@@ -34,6 +38,7 @@ namespace {
 
 int g_checks = 0;
 int g_failures = 0;
+int g_payload_differs = 0;  // set by TestFixtures: NaN results the hardware gives a non-canonical payload
 
 #define CHECK(cond)                                                     \
   do {                                                                  \
@@ -195,6 +200,7 @@ void TestFixtures() {
       }
     }
   }
+  g_payload_differs = payload_differs;
   CHECK(nan_cases >= 40);
   CHECK(payload_differs > 0);  // else no fixture separates "redirect" from "no redirect" on this CPU
   std::printf("fixtures: %d cases x 2 masks x 2 MXCSR modes; %d NaN results, %d of them with a non-canonical hardware payload\n",
@@ -365,10 +371,118 @@ void TestRandom() {
   }
 }
 
+// ---- the boot self-test (src/net/np_selftest.h; netplay phase 1, Task 1 Step 6b) ---------------------
+// np_session.cpp calls selftest::CanonicalNaN with a lambda around simde_mm_dp_ps(a, b, 0xFF) and the app
+// logs "[doa4][LIFE] dot products: canonical NaN <result>" at start-up. The redirect is compile-time (the
+// build id hashes bytes, not features), so this line is how a build against an SDK without it is seen.
+__m128 Splat(uint32_t bits) { return _mm_castsi128_ps(_mm_set1_epi32(int(bits))); }
+__m128 Lanes(uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3) {
+  return _mm_castsi128_ps(_mm_set_epi32(int(b3), int(b2), int(b1), int(b0)));
+}
+uint32_t LaneBits(__m128 v, int lane) {
+  alignas(16) uint32_t w[4];
+  _mm_store_si128(reinterpret_cast<__m128i*>(w), _mm_castps_si128(v));
+  return w[lane];
+}
+bool HasNaNLane(__m128 a, __m128 b) {
+  for (int i = 0; i < 4; ++i)
+    if (IsNaNBits(LaneBits(a, i)) || IsNaNBits(LaneBits(b, i))) return true;
+  return false;
+}
+
+struct SelfTestCall {
+  uint32_t a[4], b[4];
+};
+// A stand-in for the dot product (a hypothesis about what the redirect or the hardware returns, T3.1): `nan` is
+// what it answers when an input holds a NaN, `fin` what it answers for the finite pair; it records its inputs.
+struct FakeDp {
+  __m128 nan, fin;
+  std::vector<SelfTestCall>* calls;
+  __m128 operator()(__m128 a, __m128 b) const {
+    SelfTestCall c;
+    for (int i = 0; i < 4; ++i) {
+      c.a[i] = LaneBits(a, i);
+      c.b[i] = LaneBits(b, i);
+    }
+    if (calls) calls->push_back(c);
+    return HasNaNLane(a, b) ? nan : fin;
+  }
+};
+
+void TestSelfTest() {
+  namespace st = doa4::np::selftest;
+  const uint32_t kC = kCanonicalNaN, k70 = Bits(70.0f);
+  const __m128 canon = Splat(kC), seventy = Splat(k70);
+
+  // The real redirect, called as np_session.cpp calls it (the generated code's shape, imm8 0xFF).
+  const std::string real = st::CanonicalNaN([](__m128 a, __m128 b) { return simde_mm_dp_ps(a, b, 0xFF); });
+  std::printf("self-test through simde_mm_dp_ps: %s\n", real.c_str());
+  CHECK(real == "on");
+
+  // The raw hardware instruction is the negative control: on a CPU whose DPPS keeps NaN payloads (the fixtures
+  // above found some, g_payload_differs) the self-test must say OFF and show the lanes it saw.
+  const std::string raw = st::CanonicalNaN([](__m128 a, __m128 b) { return _mm_dp_ps(a, b, 0xFF); });
+  std::printf("self-test through the raw _mm_dp_ps: %s\n", raw.c_str());
+  if (g_payload_differs > 0) {
+    CHECK(raw.rfind("OFF (", 0) == 0);  // the self-test's own inputs separate redirect from no redirect here
+    CHECK(raw.size() == 5 + 4 * 8 + 3 + 1);
+  } else {
+    std::printf("INFO: no fixture NaN comes out of this CPU with a non-canonical payload; the raw control is informational\n");
+  }
+
+  // What the self-test feeds the dot product: one call with NaNs of their own payloads in different lanes, one finite pair.
+  {
+    std::vector<SelfTestCall> calls;
+    const std::string s = st::CanonicalNaN(FakeDp{canon, seventy, &calls});
+    CHECK(s == "on");
+    CHECK(calls.size() == 2);
+    int nan_calls = 0, fin_calls = 0;
+    for (const SelfTestCall& c : calls) {
+      bool any_nan = false;
+      for (int i = 0; i < 4; ++i) any_nan = any_nan || IsNaNBits(c.a[i]) || IsNaNBits(c.b[i]);
+      if (any_nan) {
+        ++nan_calls;
+        CHECK(c.a[1] == 0x7FC12345u);  // not the default payloads 0x7FC00000 / 0xFFC00000
+        CHECK(c.b[2] == 0xFFC0BEEFu);
+        CHECK(IsNaNBits(c.a[1]) && IsNaNBits(c.b[2]));
+        int nan_lanes = 0;
+        for (int i = 0; i < 4; ++i) nan_lanes += IsNaNBits(c.a[i]) + IsNaNBits(c.b[i]);
+        CHECK(nan_lanes == 2);  // exactly those two, so the payload that comes back is theirs or the canonical one
+      } else {
+        ++fin_calls;
+        const uint32_t one[4] = {Bits(1.0f), Bits(2.0f), Bits(3.0f), Bits(4.0f)};
+        const uint32_t five[4] = {Bits(5.0f), Bits(6.0f), Bits(7.0f), Bits(8.0f)};
+        for (int i = 0; i < 4; ++i) {
+          CHECK(c.a[i] == one[i]);
+          CHECK(c.b[i] == five[i]);
+        }
+      }
+    }
+    CHECK(nan_calls == 1 && fin_calls == 1);
+  }
+
+  // Verdicts on stand-ins (the exact text, since the gate and the report read it).
+  CHECK(st::CanonicalNaN(FakeDp{canon, seventy, nullptr}) == "on");
+  // 1. the hardware's payload kept (no redirect): every lane shows it
+  CHECK(st::CanonicalNaN(FakeDp{Splat(0x7FC12345u), seventy, nullptr}) == "OFF (7FC12345 7FC12345 7FC12345 7FC12345)");
+  // 2. one NaN lane left alone (only lanes 0-2 canonicalised): it is not "on", and the lane shows
+  CHECK(st::CanonicalNaN(FakeDp{Lanes(kC, kC, kC, 0xFFC0BEEFu), seventy, nullptr}) == "OFF (FFC00000 FFC00000 FFC00000 FFC0BEEF)");
+  CHECK(st::CanonicalNaN(FakeDp{Lanes(0x7FC12345u, kC, kC, kC), seventy, nullptr}) == "OFF (7FC12345 FFC00000 FFC00000 FFC00000)");
+  // 3. another canonical value (0x7FC00000 is a quiet NaN too, but not the pinned one)
+  CHECK(st::CanonicalNaN(FakeDp{Splat(0x7FC00000u), seventy, nullptr}) == "OFF (7FC00000 7FC00000 7FC00000 7FC00000)");
+  // 4. the finite pair answered wrongly (a redirect that disturbs ordinary results): the finite lanes show
+  CHECK(st::CanonicalNaN(FakeDp{canon, Splat(Bits(69.0f)), nullptr}) == "OFF (428A0000 428A0000 428A0000 428A0000)");
+  CHECK(st::CanonicalNaN(FakeDp{canon, canon, nullptr}) == "OFF (FFC00000 FFC00000 FFC00000 FFC00000)");
+  CHECK(st::CanonicalNaN(FakeDp{canon, Lanes(k70, k70, k70, 0u), nullptr}) == "OFF (428C0000 428C0000 428C0000 00000000)");
+  // 5. both wrong: the NaN lanes are the ones shown
+  CHECK(st::CanonicalNaN(FakeDp{Splat(0x7FC12345u), Splat(Bits(69.0f)), nullptr}) == "OFF (7FC12345 7FC12345 7FC12345 7FC12345)");
+}
+
 }  // namespace
 
 int main() {
   TestFixtures();
+  TestSelfTest();
   TestFunctionMixedLanes();
   TestRandom();
   TestFunctionSweep();
