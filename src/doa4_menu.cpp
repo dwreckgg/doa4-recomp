@@ -11,6 +11,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/audio/speaker_mode.h>
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
 #include <rex/input/pad_remap.h>
@@ -33,6 +34,7 @@
 #include "doa4_gamefiles.h"
 #include "doa4_graphics.h"
 #include "doa4_photo_win.h"
+#include "doa4_speakers.h"
 #include "doa4_utf8.h"
 #include "doa4_unlocks.h"
 
@@ -131,6 +133,10 @@ void MenuDialog::OnDraw(ImGuiIO& io) {
     if (ImGui::BeginTabBar("tabs")) {
       if (ImGui::BeginTabItem("Video")) {
         DrawVideoTab();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Audio")) {
+        DrawAudioTab();
         ImGui::EndTabItem();
       }
       if (ImGui::BeginTabItem("Controls")) {
@@ -237,6 +243,50 @@ void MenuDialog::DrawVideoTab() {
   }
   ImGui::TextDisabled("Applies to textures as the game draws them; you may see it after the");
   ImGui::TextDisabled("next screen loads.");
+}
+
+void MenuDialog::DrawAudioTab() {
+  ImGui::SeparatorText("Speakers");
+  if (!host_.saved_speakers) return;
+  std::string& saved = *host_.saved_speakers;
+  const int row = speakers::ChoiceIndex(saved);
+  for (int i = 0; i < int(speakers::kChoices.size()); ++i) {
+    if (i) ImGui::SameLine();
+    if (ImGui::RadioButton(speakers::kChoices[i].label, row == i) && row != i) {
+      // The audio driver reads audio_speakers once, when it opens: save it for
+      // the next start without changing the running value.
+      std::string error = SaveTomlKey(host_.config_path, "audio_speakers",
+                                      TomlString(speakers::kChoices[i].value));
+      if (error.empty()) {
+        saved = speakers::kChoices[i].value;
+        status_.clear();
+      } else {
+        status_ = "Could not save settings: " + error;
+      }
+    }
+  }
+  if (speakers::ChoiceIndex(saved) != speakers::ChoiceIndex(host_.running_speakers)) {
+    ImGui::TextColored(kNoteColor, "Applies after a restart (running on %s).",
+                       speakers::kChoices[speakers::ChoiceIndex(host_.running_speakers)].label);
+    if (ImGui::Button("Restart now")) {
+      Restart();
+    }
+    if (const char* warning = UnsavedUnlocksWarning(*host_.extras)) {
+      ImGui::TextColored(kErrorColor, "%s", warning);
+    }
+  }
+  ImGui::TextDisabled("Automatic follows Windows: 5.1 when the speakers are set to 5.1 or more,");
+  ImGui::TextDisabled("stereo otherwise. 5.1 surround always sends six channels.");
+
+  ImGui::SeparatorText("Output device");
+  const rex::audio::OutputInfo info = rex::audio::GetOutputInfo();
+  ImGui::TextWrapped("%s", speakers::DescribeOutput(info.device_channels, info.stream_channels).c_str());
+  if (info.stream_channels != 0) {
+    ImGui::TextWrapped("The game is sending: %s.", info.stream_channels == 2 ? "stereo" : "5.1");
+  }
+  const std::string hint =
+      speakers::Hint(info.device_channels, info.stream_channels, host_.running_speakers);
+  if (!hint.empty()) ImGui::TextWrapped("%s", hint.c_str());
 }
 
 void MenuDialog::DrawControlsTab() {

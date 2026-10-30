@@ -1,6 +1,6 @@
 // In-game menu, opened and closed with Escape (bind_doa4_menu).
 //
-// Tabs: Video (display mode, render scale), Controls (per-slot controller
+// Tabs: Video (display mode, render scale), Audio (speakers), Controls (per-slot controller
 // remap, keyboard binds), Photo, Extras (unlocks, game tweaks) and Game (where
 // the game files are). Every setting is
 // applied to its cvar and saved to dead_or_alive_4.toml with doa4::SaveTomlKey. The game keeps running while
@@ -44,6 +44,11 @@ struct MenuHost {
   // resolution_scale saved for the next start; owned by the app so it survives
   // the menu being closed and reopened. Changed only after a successful save.
   int* saved_scale = nullptr;
+  // Audio tab: audio_speakers as the game started with (the audio driver reads
+  // it once, when it opens), and as last saved for the next start (owned by the
+  // app like saved_scale; changed only after a successful save).
+  std::string running_speakers = "auto";
+  std::string* saved_speakers = nullptr;
   // The runtime's input system, or null (before the runtime exists).
   std::function<rex::input::InputSystem*()> input;
   // Runs `fn` on the UI thread after the current frame: window changes and
@@ -95,6 +100,7 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   enum class Listen { kNone, kPad, kKey };
 
   void DrawVideoTab();
+  void DrawAudioTab();
   void DrawControlsTab();
   void DrawPadSection();
   void DrawKeyboardSection();
