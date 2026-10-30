@@ -401,6 +401,7 @@ static void TestRoundTrip() {
 
 static void TestTruncation() {
   Group("truncation: every strict prefix of the packed bytes is refused as cut short, and leaves nothing behind");
+  CHECK(!IsEmpty(Dirty()));  // every refusal below starts from a hand-off that is not empty, so "left empty" is a change
   for (const Bytes& packed : {ho::Pack(Full()), Golden()}) {
     CHECK(packed.size() > 80);
     size_t refused = 0;
