@@ -55,6 +55,30 @@ endif()
 
 rexglue_setup_target(dead_or_alive_4)
 
+# Netplay: GekkoNet (BSD-2) for the lockstep input exchange, without its ASIO adapter (the port's transport
+# carries its packets), and miniupnpc (BSD-3) to open the host's port on the router. Both from the DOA2U
+# netplay tree (third_party/README.md).
+enable_language(C)
+file(GLOB DOA4_GEKKO_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/GekkoNet/src/*.cpp)
+add_library(gekkonet STATIC ${DOA4_GEKKO_SOURCES})
+target_include_directories(gekkonet
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/GekkoNet/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/GekkoNet/include/private
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/GekkoNet/thirdparty)
+target_compile_definitions(gekkonet PUBLIC GEKKONET_STATIC GEKKONET_NO_ASIO)
+set_target_properties(gekkonet PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+set(DOA4_UPNP ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnpc)
+add_library(miniupnpc STATIC
+    ${DOA4_UPNP}/src/igd_desc_parse.c ${DOA4_UPNP}/src/miniupnpc.c ${DOA4_UPNP}/src/minixml.c
+    ${DOA4_UPNP}/src/minisoap.c ${DOA4_UPNP}/src/minissdpc.c ${DOA4_UPNP}/src/miniwget.c
+    ${DOA4_UPNP}/src/upnpcommands.c ${DOA4_UPNP}/src/upnpdev.c ${DOA4_UPNP}/src/upnpreplyparse.c
+    ${DOA4_UPNP}/src/upnperrors.c ${DOA4_UPNP}/src/connecthostport.c ${DOA4_UPNP}/src/portlistingparse.c
+    ${DOA4_UPNP}/src/receivedata.c ${DOA4_UPNP}/src/addr_is_reserved.c)
+target_include_directories(miniupnpc PUBLIC ${DOA4_UPNP}/include PRIVATE ${DOA4_UPNP} ${DOA4_UPNP}/src)
+target_compile_definitions(miniupnpc PUBLIC MINIUPNP_STATICLIB PRIVATE _WIN32_WINNT=0x0601 _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(miniupnpc PUBLIC ws2_32 iphlpapi)
+target_link_libraries(dead_or_alive_4 PRIVATE gekkonet miniupnpc ws2_32 iphlpapi winhttp bcrypt)
+
 # Local build fix: the ReXGlue SDK at v0.8.0 does not pass ImGui's headers on to the
 # game target (src/doa4_diag_overlay.cpp includes <imgui.h>); ImGui itself is
 # already compiled into the SDK's UI library.
