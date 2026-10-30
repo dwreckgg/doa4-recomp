@@ -357,7 +357,6 @@ bool DecodeRecording(std::string_view bytes, Recording* out, std::string* error,
   return true;
 }
 
-namespace {
 // The value of the line "<key>=<value>" in `meta`, or "(none)" when there is no such line.
 std::string MetaValue(std::string_view meta, std::string_view key) {
   size_t at = 0;
@@ -372,11 +371,10 @@ std::string MetaValue(std::string_view meta, std::string_view key) {
   }
   return "(none)";
 }
-}  // namespace
 
 std::string MetaMismatch(std::string_view recorded, std::string_view current) {
   std::string out;
-  for (std::string_view key : {"build", "data", "fixes", "serial", "sweep", "tweaks"}) {
+  for (std::string_view key : {"build", "data", "fixes", "serial", "sweep", "tweaks", "guest", "unlock"}) {
     const std::string a = MetaValue(recorded, key), b = MetaValue(current, key);
     // (a value "unreadable" - the build or the game data could not be hashed - agrees with nothing)
     if (a != b || a == "unreadable") out += (out.empty() ? "" : "; ") + std::string(key) + " " + a + " vs " + b;

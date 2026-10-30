@@ -1,0 +1,1489 @@
+// Host test for src/net/np_handoff.cpp (the session hand-off: the host's save copy, seed, delay and guest-visible
+// settings, carried across the restart into a session). Built and run by run_np_handoff_test.bat;
+// "np_handoff_host_test.exe -v" prints each check group before it runs, so a crash (the build uses the standard
+// library's hardening mode, which fast-fails an out-of-range index) names the group it happened in.
+//
+// The joiner writes files named and sized by a REMOTE host, so every path and size rule below is a security
+// boundary and is tested with the hostile input, not only with the honest one.
+//
+// Every expected value is derived independently of the code under test:
+//  - the layout is pinned by a hand-derived byte string (kGolden) and a byte-by-byte encoder of the documented
+//    layout in this file (Raw / Encode), which can also write what Pack refuses (a bad name, a lying length);
+//  - the limits are the brief's numbers (16 files, 262,144 / 300,000 bytes, 120-byte names, 6 components);
+//  - the allowed name characters are a literal string, not a predicate copied from the code;
+//  - the guest-setting names are pinned from the census (np_handoff_census in the Task 4 report: every cvar of the
+//    SDK's kernel, system, window, graphics, audio, input and core sources, decided by reading its uses), and the
+//    last test checks that every name is a cvar the SDK or the port really defines.
+
+#include "../../src/net/np_handoff.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "../../src/doa4_tweaks.h"
+
+namespace ho = doa4::np::handoff;
+namespace rules = doa4::np::rules;
+using Bytes = std::vector<uint8_t>;
+
+static int g_checks = 0;
+static int g_failures = 0;
+static bool g_verbose = false;
+static const char* g_group = "";
+static std::string g_ctx;
+// Variadic: a check may carry commas outside parentheses (a braced initialiser, template arguments).
+#define CHECK(...)                                                                                       \
+  do {                                                                                                   \
+    ++g_checks;                                                                                          \
+    if (!(__VA_ARGS__)) {                                                                                \
+      std::printf("FAIL %s:%d [%s] %s: %s\n", __FILE__, __LINE__, g_group, g_ctx.c_str(), #__VA_ARGS__); \
+      std::fflush(stdout); /* a later check may crash (a hardened out-of-range read) */                  \
+      ++g_failures;                                                                                      \
+    }                                                                                                    \
+  } while (0)
+
+// Names the checks that follow: a FAIL line carries it, so a red check is attributable to a rule.
+static void Group(const char* name) {
+  g_group = name;
+  g_ctx.clear();
+  if (g_verbose) {
+    std::printf("group: %s\n", name);
+    std::fflush(stdout);
+  }
+}
+
+// ---- helpers (independent of the code under test) ----
+
+static std::span<const uint8_t> S(const Bytes& b) { return std::span<const uint8_t>(b.data(), b.size()); }
+static bool Has(const std::string& hay, std::string_view needle) { return hay.find(needle) != std::string::npos; }
+
+static rules::Endpoint Ep(int a, int b, int c, int d, unsigned port) {
+  rules::Endpoint e;
+  e.ip = {uint8_t(a), uint8_t(b), uint8_t(c), uint8_t(d)};
+  e.port = uint16_t(port);
+  return e;
+}
+
+struct Rng {  // xorshift64: a seeded, reproducible stream
+  uint64_t x;
+  explicit Rng(uint64_t seed) : x(seed) {}
+  uint64_t Next() {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    return x;
+  }
+  size_t Below(size_t n) { return size_t(Next() % n); }
+};
+
+// A non-uniform byte pattern: a shifted, swapped or truncated copy differs from the original.
+static Bytes Pattern(size_t n, unsigned seed) {
+  Bytes b(n);
+  for (size_t i = 0; i < n; ++i) b[i] = uint8_t(i * 7 + i / 251 + seed * 13);
+  return b;
+}
+
+// The save prefix and the two real file names of the brief (the profile XUID is a constant of the SDK,
+// sdk src/system/xam/user_profile.cpp:28; 544307D1 is DOA4's title id).
+static const std::string kPre = "B13EBABEBABEBABE/544307D1/";
+static const std::string kUps = kPre + "00000001/ups.dat/ups.dat";
+static const std::string kHdr = kPre + "Headers/00000001/ups.dat.header";
+
+// The encoder of the documented layout: it writes whatever it is given (bad names, lying lengths), byte by byte.
+struct RawFile {
+  std::string name;
+  Bytes data;
+  std::optional<uint16_t> name_len;  // a lie about the name length
+  std::optional<uint32_t> data_len;  // a lie about the data length
+};
+struct Raw {
+  std::string magic = "D4HO";
+  uint16_t version = 1;
+  uint64_t build = 0x1122334455667788ull;
+  std::string release = "netplay-v1.0.3";
+  std::optional<uint16_t> release_len;
+  uint8_t role = 1;
+  uint8_t delay = 3;
+  uint16_t local_port = 7201;
+  std::array<uint8_t, 4> ip = {203, 0, 113, 7};
+  uint16_t peer_port = 7200;
+  uint32_t token = 0xCAFEF00Du;
+  uint64_t seed = 0x0102030405060708ull;
+  std::string guest = "vsync=true\n";
+  std::optional<uint32_t> guest_len;
+  std::optional<uint32_t> count;
+  std::vector<RawFile> files;
+};
+static void PutLe(Bytes* b, uint64_t v, int n) {
+  for (int i = 0; i < n; ++i) b->push_back(uint8_t(v >> (8 * i)));
+}
+static void PutText(Bytes* b, const std::string& s) { b->insert(b->end(), s.begin(), s.end()); }
+static Bytes Encode(const Raw& r) {
+  Bytes b;
+  PutText(&b, r.magic);
+  PutLe(&b, r.version, 2);
+  PutLe(&b, r.build, 8);
+  PutLe(&b, r.release_len ? *r.release_len : r.release.size(), 2);
+  PutText(&b, r.release);
+  PutLe(&b, r.role, 1);
+  PutLe(&b, r.delay, 1);
+  PutLe(&b, r.local_port, 2);
+  b.insert(b.end(), r.ip.begin(), r.ip.end());
+  PutLe(&b, r.peer_port, 2);
+  PutLe(&b, r.token, 4);
+  PutLe(&b, r.seed, 8);
+  PutLe(&b, r.guest_len ? *r.guest_len : r.guest.size(), 4);
+  PutText(&b, r.guest);
+  PutLe(&b, r.count ? *r.count : r.files.size(), 4);
+  for (const RawFile& f : r.files) {
+    PutLe(&b, f.name_len ? *f.name_len : f.name.size(), 2);
+    PutText(&b, f.name);
+    PutLe(&b, f.data_len ? *f.data_len : f.data.size(), 4);
+    b.insert(b.end(), f.data.begin(), f.data.end());
+  }
+  return b;
+}
+static Raw RawOf(std::vector<RawFile> files) {
+  Raw r;
+  r.files = std::move(files);
+  return r;
+}
+
+// The packed size by the documented layout: 46 fixed bytes + release + guest + per file (2 + name + 4 + data).
+static size_t ExpectedSize(const ho::Handoff& h) {
+  size_t n = 46 + h.release.size() + h.guest_settings.size();
+  for (const ho::File& f : h.files) n += 2 + f.name.size() + 4 + f.data.size();
+  return n;
+}
+
+static ho::Handoff Full() {
+  ho::Handoff h;
+  h.build = 0x1122334455667788ull;
+  h.release = "netplay-v1.0.3";
+  h.role = ho::Role::kJoiner;
+  h.delay = 3;
+  h.local_port = 7201;
+  h.peer = Ep(203, 0, 113, 7, 7200);
+  h.session_token = 0xCAFEF00Du;
+  h.seed = 0x0102030405060708ull;
+  h.guest_settings = "user_language=1\nvsync=true\n";
+  h.files.push_back({kUps, Pattern(81920, 1)});
+  h.files.push_back({kHdr, Pattern(328, 2)});
+  return h;
+}
+
+// Every field of two hand-offs, one check each.
+static void CheckSame(const ho::Handoff& a, const ho::Handoff& b) {
+  CHECK(a.build == b.build);
+  CHECK(a.release == b.release);
+  CHECK(a.role == b.role);
+  CHECK(a.delay == b.delay);
+  CHECK(a.local_port == b.local_port);
+  CHECK(a.peer == b.peer);
+  CHECK(a.session_token == b.session_token);
+  CHECK(a.seed == b.seed);
+  CHECK(a.guest_settings == b.guest_settings);
+  CHECK(a.files.size() == b.files.size());
+  for (size_t i = 0; i < a.files.size() && i < b.files.size(); ++i) {
+    CHECK(a.files[i].name == b.files[i].name);
+    CHECK(a.files[i].data == b.files[i].data);
+  }
+}
+
+static bool IsEmpty(const ho::Handoff& h) {
+  return h.build == 0 && h.release.empty() && h.role == ho::Role::kHost && h.delay == 2 && h.local_port == 0 &&
+         h.peer == rules::Endpoint{} && h.session_token == 0 && h.seed == 0 && h.guest_settings.empty() &&
+         h.files.empty();
+}
+
+// A hand-off that is not empty in any field (and small, so a loop can build one per call): Unpack must leave
+// it empty when it refuses.
+static ho::Handoff GoldenHandoff();
+static ho::Handoff Dirty() {
+  ho::Handoff h = GoldenHandoff();
+  h.files.push_back({kPre + "dirty", Pattern(5, 9)});
+  return h;
+}
+
+// Unpacks `b` into a pre-filled hand-off and checks that a refusal leaves nothing behind.
+static std::string UnpackRefusal(const Bytes& b) {
+  ho::Handoff out = Dirty();
+  const std::string why = ho::Unpack(S(b), &out);
+  if (!why.empty()) CHECK(IsEmpty(out));
+  return why;
+}
+
+// =====================================================================================================
+// The layout, round trips, truncation
+// =====================================================================================================
+
+// Hand-derived from the documented layout (np_handoff.h), not by running Pack: "D4HO", u16 version 1, u64 build,
+// text release "v1", u8 role 1, u8 delay 3, u16 local port 7201 (0x1C21), peer 203.0.113.7, u16 peer port 7200
+// (0x1C20), u32 token 0xCAFEF00D, u64 seed, u32 guest length 4 + "a=1\n", u32 file count 1, then the file: u16 name
+// length 27 (26-byte prefix + "x"), the name, u32 data length 3, 09 08 07. 88 bytes.
+static Bytes Golden() {
+  Bytes g = {0x44, 0x34, 0x48, 0x4F,                                                  // "D4HO"
+             0x01, 0x00,                                                              // version 1
+             0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,                          // build
+             0x02, 0x00, 0x76, 0x31,                                                  // "v1"
+             0x01, 0x03,                                                              // role joiner, delay 3
+             0x21, 0x1C,                                                              // local port 7201
+             0xCB, 0x00, 0x71, 0x07,                                                  // peer ip 203.0.113.7
+             0x20, 0x1C,                                                              // peer port 7200
+             0x0D, 0xF0, 0xFE, 0xCA,                                                  // token
+             0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,                          // seed
+             0x04, 0x00, 0x00, 0x00, 0x61, 0x3D, 0x31, 0x0A,                          // guest "a=1\n"
+             0x01, 0x00, 0x00, 0x00,                                                  // one file
+             0x1B, 0x00};                                                             // name length 27
+  const std::string name = kPre + "x";
+  g.insert(g.end(), name.begin(), name.end());
+  const Bytes tail = {0x03, 0x00, 0x00, 0x00, 0x09, 0x08, 0x07};
+  g.insert(g.end(), tail.begin(), tail.end());
+  return g;
+}
+static ho::Handoff GoldenHandoff() {
+  ho::Handoff h;
+  h.build = 0x1122334455667788ull;
+  h.release = "v1";
+  h.role = ho::Role::kJoiner;
+  h.delay = 3;
+  h.local_port = 7201;
+  h.peer = Ep(203, 0, 113, 7, 7200);
+  h.session_token = 0xCAFEF00Du;
+  h.seed = 0x0102030405060708ull;
+  h.guest_settings = "a=1\n";
+  h.files.push_back({kPre + "x", {9, 8, 7}});
+  return h;
+}
+
+static void TestLayout() {
+  Group("layout: Pack writes the documented bytes (little-endian, in the documented order)");
+  const Bytes golden = Golden();
+  CHECK(golden.size() == 88);
+  CHECK(ho::Pack(GoldenHandoff()) == golden);
+  CHECK(Encode([] {
+          Raw r;
+          r.release = "v1";
+          r.guest = "a=1\n";
+          r.files.push_back({kPre + "x", {9, 8, 7}, std::nullopt, std::nullopt});
+          return r;
+        }()) == golden);  // the test's own encoder agrees with the hand-derived bytes
+  CHECK(ho::Pack(GoldenHandoff()).size() == ExpectedSize(GoldenHandoff()));
+  CHECK(std::string(ho::kSavePrefix) == kPre);
+
+  Group("layout: Unpack reads the documented bytes");
+  ho::Handoff out;
+  CHECK(ho::Unpack(S(golden), &out).empty());
+  CheckSame(out, GoldenHandoff());
+
+  Group("layout: the fields each sit where the layout says (one field changed at a time)");
+  {
+    const ho::Handoff base = GoldenHandoff();
+    const Bytes bb = ho::Pack(base);
+    // Byte offsets from the layout: build 6..14, release length 14..16 and text 16..18, role 18, delay 19,
+    // local port 20..22, peer ip 22..26, peer port 26..28, token 28..32, seed 32..40.
+    auto differs_only_at = [&](const ho::Handoff& h, size_t lo, size_t hi) {
+      const Bytes b = ho::Pack(h);
+      CHECK(b.size() == bb.size());
+      if (b.size() != bb.size()) return;
+      size_t first = b.size(), last = 0;
+      for (size_t i = 0; i < b.size(); ++i)
+        if (b[i] != bb[i]) {
+          first = std::min(first, i);
+          last = i + 1;
+        }
+      CHECK(first >= lo && last <= hi && first < last);
+    };
+    ho::Handoff h = base;
+    h.build ^= 0xFF00000000000000ull;
+    differs_only_at(h, 6, 14);
+    h = base;
+    h.role = ho::Role::kHost;
+    differs_only_at(h, 18, 19);
+    h = base;
+    h.delay = 4;
+    differs_only_at(h, 19, 20);
+    h = base;
+    h.local_port = 7202;
+    differs_only_at(h, 20, 22);
+    h = base;
+    h.peer.ip[3] = 8;
+    differs_only_at(h, 22, 26);
+    h = base;
+    h.peer.port = 7201;
+    differs_only_at(h, 26, 28);
+    h = base;
+    h.session_token ^= 0x01000000u;
+    differs_only_at(h, 28, 32);
+    h = base;
+    h.seed ^= 0x0100000000000000ull;
+    differs_only_at(h, 32, 40);
+  }
+}
+
+static void TestRoundTrip() {
+  Group("round trip: the brief's two-file hand-off, field by field");
+  const ho::Handoff h = Full();
+  const Bytes packed = ho::Pack(h);
+  CHECK(!packed.empty());
+  CHECK(packed.size() == ExpectedSize(h));
+  CHECK(h.files[0].data.size() == 81920 && h.files[1].data.size() == 328);
+  ho::Handoff back = Dirty();
+  CHECK(ho::Unpack(S(packed), &back).empty());
+  CheckSame(back, h);
+  CHECK(ho::Pack(back) == packed);  // canonical: packing the unpacked copy gives the same bytes
+  CHECK(ho::Pack(h) == packed);     // deterministic
+
+  Group("round trip: both roles, every delay, no files, a file with no bytes");
+  for (ho::Role role : {ho::Role::kHost, ho::Role::kJoiner}) {
+    for (int d = 1; d <= 8; ++d) {
+      ho::Handoff x = Full();
+      x.files.clear();
+      x.role = role;
+      x.delay = uint8_t(d);
+      ho::Handoff y;
+      const Bytes b = ho::Pack(x);
+      CHECK(!b.empty());
+      CHECK(ho::Unpack(S(b), &y).empty());
+      CheckSame(y, x);
+    }
+  }
+  {
+    ho::Handoff x = Full();
+    x.files = {{kPre + "empty.bin", {}}};
+    x.guest_settings.clear();
+    x.release.clear();
+    ho::Handoff y;
+    const Bytes b = ho::Pack(x);
+    CHECK(!b.empty() && ho::Unpack(S(b), &y).empty());
+    CheckSame(y, x);
+    CHECK(y.files.size() == 1 && y.files[0].data.empty());
+  }
+
+  Group("round trip: extreme values of every numeric field");
+  {
+    ho::Handoff x = Full();
+    x.build = ~0ull;
+    x.seed = ~0ull;
+    x.session_token = 0xFFFFFFFFu;
+    x.local_port = 0xFFFF;
+    x.peer = Ep(255, 255, 255, 255, 65535);
+    ho::Handoff y;
+    const Bytes b = ho::Pack(x);
+    CHECK(!b.empty() && ho::Unpack(S(b), &y).empty());
+    CheckSame(y, x);
+    x.build = 0;
+    x.seed = 0;
+    x.session_token = 1;
+    x.local_port = 0;
+    x.peer = Ep(0, 0, 0, 0, 0);
+    ho::Handoff z;
+    const Bytes b2 = ho::Pack(x);
+    CHECK(!b2.empty() && ho::Unpack(S(b2), &z).empty());
+    CheckSame(z, x);
+  }
+}
+
+static void TestTruncation() {
+  Group("truncation: every strict prefix of the packed bytes is refused as cut short, and leaves nothing behind");
+  for (const Bytes& packed : {ho::Pack(Full()), Golden()}) {
+    CHECK(packed.size() > 80);
+    size_t refused = 0;
+    for (size_t cut = 0; cut < packed.size(); ++cut) {
+      const Bytes prefix(packed.begin(), packed.begin() + long(cut));
+      const std::string why = UnpackRefusal(prefix);
+      if (why == "the hand-off is cut short") ++refused;
+      else {
+        g_ctx = "cut " + std::to_string(cut) + ": " + why;
+        CHECK(false);
+      }
+    }
+    CHECK(refused == packed.size());
+  }
+  g_ctx.clear();
+
+  Group("truncation: the whole bytes are accepted; one trailing byte is refused (the bytes end where the last file does)");
+  {
+    Bytes b = ho::Pack(Full());
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(b), &out).empty());
+    b.push_back(0);
+    CHECK(UnpackRefusal(b) == "extra bytes after the hand-off");
+    b.back() = 0x41;
+    CHECK(UnpackRefusal(b) == "extra bytes after the hand-off");
+    b.insert(b.end(), 1000, 0);
+    CHECK(UnpackRefusal(b) == "extra bytes after the hand-off");
+  }
+  Group("truncation: counts that disagree with the bytes");
+  {
+    Raw r = RawOf({{kUps, Pattern(10, 1), std::nullopt, std::nullopt}, {kHdr, Pattern(10, 2), std::nullopt, std::nullopt}});
+    r.count = 3;  // one file more than there is
+    CHECK(UnpackRefusal(Encode(r)) == "the hand-off is cut short");
+    r.count = 1;  // one file fewer: the second file's bytes are extra
+    CHECK(UnpackRefusal(Encode(r)) == "extra bytes after the hand-off");
+    r.count = 2;
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty() && out.files.size() == 2);
+  }
+  Group("truncation: no destination");
+  {
+    const Bytes b = ho::Pack(Full());
+    CHECK(ho::Unpack(S(b), nullptr) == "no destination");
+  }
+}
+
+// =====================================================================================================
+// Limits, both sides of every one (#0356)
+// =====================================================================================================
+
+static void TestFileCountLimit() {
+  Group("limit: 16 files accepted, a 17th refused (Pack and Unpack)");
+  for (size_t n : {size_t(1), size_t(15), size_t(16)}) {
+    ho::Handoff h = Full();
+    h.files.clear();
+    for (size_t i = 0; i < n; ++i) h.files.push_back({kPre + "f" + std::to_string(i), Pattern(10 + i, unsigned(i))});
+    const Bytes b = ho::Pack(h);
+    ho::Handoff out;
+    g_ctx = std::to_string(n) + " files";
+    CHECK(!b.empty() && ho::Unpack(S(b), &out).empty());
+    CheckSame(out, h);
+  }
+  g_ctx.clear();
+  CHECK(ho::kMaxFiles == 16);
+  {
+    ho::Handoff h = Full();
+    h.files.clear();
+    for (size_t i = 0; i < 17; ++i) h.files.push_back({kPre + "f" + std::to_string(i), Pattern(10, unsigned(i))});
+    CHECK(ho::Pack(h).empty());
+    Raw r;
+    for (size_t i = 0; i < 17; ++i) r.files.push_back({kPre + "f" + std::to_string(i), Pattern(10, unsigned(i)), std::nullopt, std::nullopt});
+    CHECK(UnpackRefusal(Encode(r)) == "too many files");
+    r.files.pop_back();  // the same bytes with 16: the control (the refusal is the count, nothing else)
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty() && out.files.size() == 16);
+    // the count field alone: 17 with no file after it is refused for the count, not as cut short; so is a huge one
+    Raw c;
+    c.count = 17;
+    CHECK(UnpackRefusal(Encode(c)) == "too many files");
+    c.count = 0xFFFFFFFFu;
+    CHECK(UnpackRefusal(Encode(c)) == "too many files");
+    c.count = 0x80000000u;
+    CHECK(UnpackRefusal(Encode(c)) == "too many files");
+    c.count = 16;  // 16 promised, none present
+    CHECK(UnpackRefusal(Encode(c)) == "the hand-off is cut short");
+  }
+}
+
+static void TestFileSizeLimit() {
+  Group("limit: a 262,144-byte file accepted, 262,145 refused (Pack and Unpack)");
+  CHECK(ho::kMaxFileBytes == 262144);
+  {
+    ho::Handoff h = Full();
+    h.files = {{kUps, Pattern(262144, 3)}};
+    const Bytes b = ho::Pack(h);
+    ho::Handoff out;
+    CHECK(!b.empty() && b.size() < ho::kMaxPackedBytes);  // the per-file limit is what the next case hits
+    CHECK(ho::Unpack(S(b), &out).empty());
+    CheckSame(out, h);
+    h.files[0].data.push_back(0);
+    CHECK(h.files[0].data.size() == 262145 && ExpectedSize(h) < ho::kMaxPackedBytes);
+    CHECK(ho::Pack(h).empty());
+    Raw r = RawOf({{kUps, Pattern(262145, 3), std::nullopt, std::nullopt}});
+    CHECK(Encode(r).size() < ho::kMaxPackedBytes);
+    CHECK(UnpackRefusal(Encode(r)) == "a file too large");
+    r.files[0].data.pop_back();
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty() && out.files[0].data.size() == 262144);
+  }
+  Group("limit: a data length field that lies (past the bytes, past the limit, huge) is refused before the bytes are used");
+  {
+    Raw r = RawOf({{kUps, Pattern(10, 1), std::nullopt, std::nullopt}});
+    r.files[0].data_len = 11;  // one more than there is
+    CHECK(UnpackRefusal(Encode(r)) == "the hand-off is cut short");
+    r.files[0].data_len = 9;  // one fewer: the last byte is extra
+    CHECK(UnpackRefusal(Encode(r)) == "extra bytes after the hand-off");
+    r.files[0].data_len = 262145;
+    CHECK(UnpackRefusal(Encode(r)) == "a file too large");
+    r.files[0].data_len = 0xFFFFFFFFu;
+    CHECK(UnpackRefusal(Encode(r)) == "a file too large");
+    r.files[0].data_len = 0x80000000u;
+    CHECK(UnpackRefusal(Encode(r)) == "a file too large");
+    r.files[0].data_len = 262144;  // within the limit but past the bytes
+    CHECK(UnpackRefusal(Encode(r)) == "the hand-off is cut short");
+    r.files[0].data_len = 10;
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty());
+  }
+}
+
+static void TestTotalLimit() {
+  Group("limit: a hand-off of exactly 300,000 bytes accepted, one byte more refused (Pack and Unpack)");
+  CHECK(ho::kMaxPackedBytes == 300000);
+  ho::Handoff h = Full();
+  // the overhead = the packed size of the same hand-off with the second file empty
+  h.files[1].data.clear();
+  const size_t overhead = ho::Pack(h).size();
+  CHECK(overhead == ExpectedSize(h));  // the formula agrees with Pack here, so the padding below is exact
+  const size_t pad = ho::kMaxPackedBytes - overhead;
+  CHECK(pad > 200000 && pad < ho::kMaxFileBytes);  // "about 217 KB, under the per-file limit"
+  h.files[1].data = Pattern(pad, 5);
+  const Bytes at = ho::Pack(h);
+  CHECK(at.size() == 300000);
+  ho::Handoff out = Dirty();
+  CHECK(ho::Unpack(S(at), &out).empty());
+  CheckSame(out, h);
+  h.files[1].data.push_back(0x5A);
+  CHECK(ExpectedSize(h) == 300001 && h.files[1].data.size() < ho::kMaxFileBytes);
+  CHECK(ho::Pack(h).empty());
+  // the same bytes, one more, written by the test's own encoder: refused as too large, not for any per-file rule
+  Raw r = RawOf({{kUps, Pattern(81920, 1), std::nullopt, std::nullopt}, {kHdr, Pattern(pad + 1, 5), std::nullopt, std::nullopt}});
+  r.release = h.release;
+  r.guest = h.guest_settings;
+  const Bytes over = Encode(r);
+  CHECK(over.size() == 300001);
+  CHECK(UnpackRefusal(over) == "the hand-off is too large");
+  r.files[1].data.pop_back();  // the same bytes with one byte less: exactly 300,000
+  const Bytes exact = Encode(r);
+  CHECK(exact.size() == 300000);
+  CHECK(ho::Unpack(S(exact), &out).empty() && out.files[1].data.size() == pad);
+  // far over: the size is refused before anything is read (a hostile host's 5 MB blob)
+  Bytes huge(5u << 20, 0x41);
+  CHECK(UnpackRefusal(huge) == "the hand-off is too large");
+}
+
+static void TestFieldLimits() {
+  Group("limit: release text 200 bytes accepted, 201 refused; guest settings 16,384 bytes accepted, 16,385 refused");
+  CHECK(ho::kMaxReleaseBytes == 200 && ho::kMaxGuestBytes == 16384);
+  {
+    ho::Handoff h = Full();
+    h.release = std::string(200, 'r');
+    ho::Handoff out;
+    const Bytes b = ho::Pack(h);
+    CHECK(!b.empty() && ho::Unpack(S(b), &out).empty() && out.release == h.release);
+    h.release += 'r';
+    CHECK(ho::Pack(h).empty());
+    Raw r;
+    r.release = std::string(201, 'r');
+    CHECK(UnpackRefusal(Encode(r)) == "the release text is too long");
+    r.release = std::string(200, 'r');
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty());
+    r.release = "x";
+    r.release_len = 0xFFFF;  // the length field lies, huge: refused for the limit before it is believed
+    CHECK(UnpackRefusal(Encode(r)) == "the release text is too long");
+    r.release_len = 201;  // one past the limit with the bytes to back it (the text is "x" + the next 200 bytes)
+    CHECK(UnpackRefusal(Encode(r)) == "the release text is too long");
+  }
+  {
+    ho::Handoff h = Full();
+    h.guest_settings = std::string(16384, 'g');
+    ho::Handoff out;
+    const Bytes b = ho::Pack(h);
+    CHECK(!b.empty() && ho::Unpack(S(b), &out).empty() && out.guest_settings == h.guest_settings);
+    h.guest_settings += 'g';
+    CHECK(ho::Pack(h).empty());
+    Raw r;
+    r.guest = std::string(16385, 'g');
+    CHECK(UnpackRefusal(Encode(r)) == "the guest settings are too long");
+    r.guest = std::string(16384, 'g');
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty());
+    r.guest = "x";
+    r.guest_len = 0xFFFFFFFFu;
+    CHECK(UnpackRefusal(Encode(r)) == "the guest settings are too long");
+    r.guest_len = 0x80000000u;
+    CHECK(UnpackRefusal(Encode(r)) == "the guest settings are too long");
+    r.guest_len = 2;  // one byte more than the text: it takes a byte of the file count, which is then cut short
+    CHECK(UnpackRefusal(Encode(r)) == "the hand-off is cut short");
+  }
+  Group("limit: input delay 1 and 8 accepted, 0 and 9 refused; token 1 accepted, 0 refused; role 0 and 1 accepted, 2 refused");
+  for (int d : {0, 1, 2, 7, 8, 9, 255}) {
+    ho::Handoff h = Full();
+    h.delay = uint8_t(d);
+    ho::Handoff out;
+    const Bytes b = ho::Pack(h);
+    Raw r;
+    r.delay = uint8_t(d);
+    g_ctx = "delay " + std::to_string(d);
+    if (d >= 1 && d <= 8) {
+      CHECK(!b.empty() && ho::Unpack(S(b), &out).empty() && out.delay == d);
+      CHECK(ho::Unpack(S(Encode(r)), &out).empty());
+    } else {
+      CHECK(b.empty());
+      CHECK(UnpackRefusal(Encode(r)) == "a bad input delay");
+    }
+  }
+  g_ctx.clear();
+  {
+    ho::Handoff h = Full();
+    h.session_token = 1;
+    ho::Handoff out;
+    CHECK(!ho::Pack(h).empty() && ho::Unpack(S(ho::Pack(h)), &out).empty() && out.session_token == 1);
+    h.session_token = 0;
+    CHECK(ho::Pack(h).empty());
+    Raw r;
+    r.token = 0;
+    CHECK(UnpackRefusal(Encode(r)) == "a zero session token");
+    r.token = 1;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty());
+  }
+  {
+    ho::Handoff h = Full();
+    h.role = static_cast<ho::Role>(2);
+    CHECK(ho::Pack(h).empty());
+    h.role = static_cast<ho::Role>(255);
+    CHECK(ho::Pack(h).empty());
+    Raw r;
+    ho::Handoff out;
+    for (int role : {0, 1}) {
+      r.role = uint8_t(role);
+      CHECK(ho::Unpack(S(Encode(r)), &out).empty() && int(out.role) == role);
+    }
+    for (int role : {2, 3, 128, 255}) {
+      r.role = uint8_t(role);
+      CHECK(UnpackRefusal(Encode(r)) == "an unknown role");
+    }
+  }
+}
+
+static void TestHeaderRefusals() {
+  Group("header: magic, version");
+  {
+    Raw r;
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty());  // the control
+    for (const char* magic : {"D4HP", "d4ho", "4DHO", "D4H", "DNH1", "XXXX", "RIFF"}) {
+      Raw m;
+      m.magic = magic;
+      g_ctx = magic;
+      CHECK(UnpackRefusal(Encode(m)) == "not a session hand-off");
+    }
+    g_ctx.clear();
+    for (int pos = 0; pos < 4; ++pos) {
+      Bytes b = Encode(r);
+      b[size_t(pos)] ^= 0xFF;
+      CHECK(UnpackRefusal(b) == "not a session hand-off");
+    }
+    for (unsigned v : {0u, 2u, 3u, 0x0100u, 0xFFFFu}) {
+      Raw m;
+      m.version = uint16_t(v);
+      g_ctx = "version " + std::to_string(v);
+      CHECK(UnpackRefusal(Encode(m)) == "a different hand-off version");
+    }
+    g_ctx.clear();
+  }
+}
+
+// =====================================================================================================
+// Names: the security boundary
+// =====================================================================================================
+
+static void TestNameOk() {
+  Group("NameOk: the names of the real save, a 120-byte name and a 6-component name are accepted");
+  CHECK(ho::NameOk(kUps));
+  CHECK(ho::NameOk(kHdr));
+  CHECK(ho::NameOk(kPre + "00000001/ups.dat/__thumbnail.png"));
+  const std::string n120 = kPre + std::string(120 - kPre.size(), 'a');
+  CHECK(n120.size() == 120 && ho::NameOk(n120));
+  const std::string n121 = kPre + std::string(121 - kPre.size(), 'a');
+  CHECK(n121.size() == 121 && !ho::NameOk(n121));
+  const std::string six = kPre + "a/b/c/d";
+  CHECK(six == "B13EBABEBABEBABE/544307D1/a/b/c/d" && ho::NameOk(six));
+  CHECK(!ho::NameOk(six + "/e"));  // 7 components
+  CHECK(ho::kMaxNameBytes == 120);
+  // the two limits are independent: a 7-component name well under 120 bytes, a 6-component name of 120 bytes
+  CHECK(!ho::NameOk(kPre + "a/b/c/d/e/f/g"));
+  const std::string six120 = kPre + std::string(30, 'a') + "/" + std::string(30, 'b') + "/" + std::string(30, 'c') + "/d";
+  CHECK(six120.size() == 120 && ho::NameOk(six120));
+  CHECK(!ho::NameOk(six120 + "d"));    // 121 bytes, 6 components
+  CHECK(!ho::NameOk(six120 + "/e"));   // 122 bytes, 7 components: both limits broken
+
+  Group("NameOk: the names the brief refuses");
+  CHECK(!ho::NameOk("UserData/x"));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/../x"));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/CON"));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/con.txt"));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/a."));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/a\\b"));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/a b"));
+  CHECK(!ho::NameOk("B13EBABEBABEBABE/544307D1/"));
+  CHECK(!ho::NameOk(""));
+  CHECK(!ho::NameOk("/"));
+
+  Group("NameOk: names that look odd but are fine");
+  for (const char* tail : {".hidden", "a..b", "..a", "-x", "_x", "a.b.c", "x.dat", "CONSOLE.dat", "COM10", "LPT10", "COM0",
+                           "LPT0", "CON1", "NUL1", "AUXX", "PRNT", "COM", "LPT", "CO", "xCON", "COMA", "con_", ".con", "1"}) {
+    g_ctx = tail;
+    CHECK(ho::NameOk(kPre + tail));
+  }
+  g_ctx.clear();
+}
+
+static void TestNameSweeps() {
+  Group("NameOk: every byte value as a name character, at the start, in the middle and at the end of a component");
+  const std::string allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+  CHECK(allowed.size() == 65);
+  int accepted = 0, refused = 0;
+  for (int c = 0; c < 256; ++c) {
+    if (c == '/') continue;  // the separator, tested on its own
+    const char ch = char(c);
+    const bool in_set = allowed.find(ch) != std::string::npos;
+    g_ctx = "byte " + std::to_string(c);
+    CHECK(ho::NameOk(kPre + "a" + ch + "b") == in_set);
+    CHECK(ho::NameOk(kPre + ch + "ab") == in_set);
+    CHECK(ho::NameOk(kPre + "ab" + ch) == (in_set && ch != '.'));  // a trailing dot is refused
+    (in_set ? accepted : refused)++;
+  }
+  g_ctx.clear();
+  CHECK(accepted == 65 && refused == 190);  // 255 byte values besides '/'
+
+  Group("NameOk: the separator");
+  CHECK(ho::NameOk(kPre + "a/b"));
+  CHECK(!ho::NameOk(kPre + "a//b"));
+  CHECK(!ho::NameOk(kPre + "/a"));
+  CHECK(!ho::NameOk(kPre + "a/"));
+  CHECK(!ho::NameOk(kPre + "a/b/"));
+  CHECK(!ho::NameOk(kPre + "//"));
+
+  Group("NameOk: a component that is only dots, in every place");
+  for (const char* d : {".", "..", "...", "...."}) {
+    g_ctx = d;
+    CHECK(!ho::NameOk(kPre + d));
+    CHECK(!ho::NameOk(kPre + d + "/x"));
+    CHECK(!ho::NameOk(kPre + "a/" + d));
+    CHECK(!ho::NameOk(kPre + "a/" + d + "/x"));
+  }
+  g_ctx.clear();
+  CHECK(!ho::NameOk(kPre + "a/../../x"));
+  CHECK(!ho::NameOk(kPre + "a/./b"));
+  CHECK(!ho::NameOk(kPre + "a/b/../c"));
+  CHECK(!ho::NameOk(kPre + "a./b"));  // a trailing dot on a middle component too
+  CHECK(ho::NameOk(kPre + ".a/b"));
+
+  Group("NameOk: the prefix is exact (case, length, separator)");
+  for (const char* bad : {"b13ebabebabebabe/544307D1/x", "B13EBABEBABEBABE/544307d1/x", "B13EBABEBABEBABE/544307D1x/y",
+                          "B13EBABEBABEBABE//544307D1/x", "B13EBABEBABEBABE/544307D1", "XB13EBABEBABEBABE/544307D1/x",
+                          "B13EBABEBABEBABF/544307D1/x", "B13EBABEBABEBABE/544307D2/x", "B13EBABEBABEBAB/544307D1/x",
+                          "B13EBABEBABEBABE544307D1/x", "/B13EBABEBABEBABE/544307D1/x", "./B13EBABEBABEBABE/544307D1/x",
+                          "B13EBABEBABEBABE\\544307D1\\x", "UserData/x", "TitleData/x", "x"}) {
+    g_ctx = bad;
+    CHECK(!ho::NameOk(bad));
+  }
+  g_ctx.clear();
+}
+
+static void TestDeviceNames() {
+  Group("NameOk: Windows device names, any case, with or without an extension, in any component");
+  std::vector<std::string> bases = {"CON", "PRN", "AUX", "NUL"};
+  for (char d = '1'; d <= '9'; ++d) {
+    bases.push_back(std::string("COM") + d);
+    bases.push_back(std::string("LPT") + d);
+  }
+  CHECK(bases.size() == 22);
+  auto lower = [](std::string s) {
+    for (char& c : s) c = char(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    return s;
+  };
+  auto capital = [&](std::string s) { return s.substr(0, 1) + lower(s.substr(1)); };
+  auto alternate = [](std::string s) {
+    for (size_t i = 1; i < s.size(); i += 2) s[i] = char(s[i] >= 'A' && s[i] <= 'Z' ? s[i] + 32 : s[i]);
+    return s;
+  };
+  int refused = 0, control_ok = 0;
+  for (const std::string& base : bases) {
+    for (const std::string& spelled : {base, lower(base), capital(base), alternate(base)}) {
+      for (const char* ext : {"", ".txt", ".a.b", ".x", ".dat"}) {
+        const std::string comp = spelled + ext;
+        g_ctx = comp;
+        CHECK(!ho::NameOk(kPre + comp));                 // the last component
+        CHECK(!ho::NameOk(kPre + comp + "/x"));          // a middle component
+        CHECK(!ho::NameOk(kPre + "a/" + comp));          // below another folder
+        refused += 3;
+        // the control: the same shape one character longer is not a device (CONx, COM1x ... )
+        CHECK(ho::NameOk(kPre + spelled + "x" + ext));
+        ++control_ok;
+      }
+    }
+  }
+  g_ctx.clear();
+  CHECK(refused == 22 * 4 * 5 * 3 && control_ok == 22 * 4 * 5);
+}
+
+struct Hostile {
+  std::string name;
+  const char* why;
+};
+
+static std::vector<Hostile> HostileNames() {
+  std::vector<Hostile> v;
+  auto add = [&](std::string n, const char* why) { v.push_back({std::move(n), why}); };
+  add("", "empty");
+  add(kPre, "the prefix alone");
+  add(kPre + "/", "empty last component");
+  // absolute paths, drive letters, UNC
+  add("/" + kUps, "absolute");
+  add("C:/" + kUps, "drive letter, forward slash");
+  add("C:\\" + kUps, "drive letter, back slash");
+  add("C:" + kUps, "drive-relative");
+  add("//server/share/x", "UNC");
+  add("\\\\?\\C:\\Windows\\x", "extended-length path");
+  add("\\\\.\\COM1", "device path");
+  add("/etc/passwd", "unix absolute");
+  add(kPre + "C:x", "drive letter inside a component");
+  add(kPre + "C:/x", "drive letter as a component");
+  add(kPre + "a/C:/x", "drive letter as a component, deeper");
+  // parent and current directory
+  add(kPre + "../x", "parent");
+  add(kPre + "a/../../x", "parent, climbing out");
+  add(kPre + "a/../b", "parent, staying inside");
+  add(kPre + "..", "parent alone");
+  add(kPre + "a/..", "parent last");
+  add("../" + kUps, "parent before the prefix");
+  add("B13EBABEBABEBABE/../544307D1/x", "parent between the prefix parts");
+  add(kPre + ".", "dot alone");
+  add(kPre + "./x", "dot first");
+  add(kPre + "a/./b", "dot inside");
+  add(kPre + "...", "three dots");
+  add(kPre + "..\\x", "parent with a back slash");
+  add(kPre + "a\\..\\..\\x", "climbing with back slashes");
+  // back slashes
+  add(kPre + "a\\b", "back slash");
+  add("B13EBABEBABEBABE\\544307D1\\x", "back slashes for the prefix");
+  // alternate data streams and other NTFS names
+  add(kPre + "ups.dat:stream", "alternate data stream");
+  add(kPre + "x::$DATA", "default stream name");
+  add(kPre + "x:Zone.Identifier", "Zone.Identifier stream");
+  add(kPre + "x:$I30:$INDEX_ALLOCATION", "index stream");
+  add(kPre + "a/b:c/d", "stream in a middle component");
+  add(kPre + "PROGRA~1", "8.3 short name");
+  add(kPre + "a*b", "wildcard");
+  add(kPre + "a?b", "wildcard");
+  add(kPre + "a<b", "reserved character");
+  add(kPre + "a>b", "reserved character");
+  add(kPre + "a|b", "reserved character");
+  add(kPre + "a\"b", "reserved character");
+  add(kPre + "a%2e%2eb", "percent escape");
+  // device names
+  add(kPre + "CON", "device");
+  add(kPre + "con.txt", "device with an extension");
+  add(kPre + "NUL", "device");
+  add(kPre + "Aux.dat", "device, mixed case");
+  add(kPre + "COM1", "device");
+  add(kPre + "lpt9.x", "device, lower case");
+  add(kPre + "PRN/x", "device as a folder");
+  add(kPre + "a/COM3/x", "device as an inner folder");
+  add(kPre + "NUL.tar.gz", "device with two extensions");
+  add(kPre + "CONIN$", "console input device");
+  add(kPre + "CONOUT$", "console output device");
+  // trailing dots and spaces, leading space
+  add(kPre + "a.", "trailing dot");
+  add(kPre + "a ", "trailing space");
+  add(kPre + "a. ", "dot and space");
+  add(kPre + "a/b./c", "trailing dot on a middle component");
+  add(kPre + "a /b", "trailing space on a middle component");
+  add(kPre + " a", "leading space");
+  // control characters, NUL, high bytes
+  add(kPre + std::string("a\0b", 3), "NUL inside");
+  add(kPre + std::string("\0", 1), "NUL alone");
+  add(kPre + "a\nb", "newline");
+  add(kPre + "a\rb", "carriage return");
+  add(kPre + "a\tb", "tab");
+  add(kPre + "a\x7F", "DEL");
+  add(kPre + "\xC3\xA9", "UTF-8 letter");
+  add(kPre + "a\xEF\xBC\x8E" "b", "full-width dot");
+  add(kPre + "a\xFF", "0xFF");
+  // the prefix
+  add("UserData/x", "another prefix");
+  add("b13ebabebabebabe/544307D1/x", "prefix in another case");
+  add("B13EBABEBABEBABE/544307d1/x", "prefix in another case");
+  add("B13EBABEBABEBABE/544307D1x/y", "prefix not at a separator");
+  add("B13EBABEBABEBABE//544307D1/x", "double separator in the prefix");
+  add("B13EBABEBABEBABE/544307D1", "prefix without its separator");
+  // length and depth
+  add(kPre + std::string(121 - kPre.size(), 'a'), "121 bytes");
+  add(kPre + "a/b/c/d/e", "7 components");
+  add(kPre + std::string(200, 'a'), "200 bytes");
+  add(kPre + std::string(1000, 'a'), "1000 bytes");
+  add(kPre + "a/b/c/d/e/f/g/h/i/j", "10 components");
+  return v;
+}
+
+static void TestHostileNamesInBytes() {
+  Group("hostile names inside the bytes: each is refused by Unpack as a refused name, and Pack will not write it");
+  {  // the control: the same bytes with an honest name are accepted, so every refusal below is the name's
+    Raw r = RawOf({{kUps, Pattern(10, 1), std::nullopt, std::nullopt}});
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty() && out.files.size() == 1 && out.files[0].name == kUps);
+  }
+  const std::vector<Hostile> list = HostileNames();
+  CHECK(list.size() >= 79);  // a floor: the list has 79 names; a loop over an emptied list would pass vacuously
+  for (const Hostile& h : list) {
+    g_ctx = std::string(h.why) + " / " + (h.name.size() > 60 ? h.name.substr(0, 60) + "..." : h.name);
+    CHECK(!ho::NameOk(h.name));
+    ho::Handoff pack = Full();
+    pack.files = {{h.name, Pattern(10, 1)}};
+    CHECK(ho::Pack(pack).empty());
+    Raw r = RawOf({{h.name, Pattern(10, 1), std::nullopt, std::nullopt}});
+    const std::string why = UnpackRefusal(Encode(r));
+    // (an empty or over-long name is refused through the same reason, before its bytes are read)
+    CHECK(why == "a refused file name");
+    // a hostile name second in the list: the honest first file does not shield it
+    Raw r2 = RawOf({{kUps, Pattern(10, 1), std::nullopt, std::nullopt}, {h.name, Pattern(10, 2), std::nullopt, std::nullopt}});
+    CHECK(UnpackRefusal(Encode(r2)) == "a refused file name");
+  }
+  g_ctx.clear();
+
+  Group("hostile names inside the bytes: a name length that lies");
+  {
+    Raw r = RawOf({{kUps, Pattern(10, 1), std::nullopt, std::nullopt}});
+    r.files[0].name_len = uint16_t(kUps.size() + 1);  // one more: the first data-length byte joins the name
+    CHECK(!UnpackRefusal(Encode(r)).empty());
+    r.files[0].name_len = uint16_t(kUps.size() - 1);  // one fewer: the last character joins the data length
+    CHECK(!UnpackRefusal(Encode(r)).empty());
+    r.files[0].name_len = 0xFFFF;
+    CHECK(UnpackRefusal(Encode(r)) == "a refused file name");  // over the name limit: refused before it is read
+    r.files[0].name_len = 0;
+    CHECK(UnpackRefusal(Encode(r)) == "a refused file name");
+    r.files[0].name_len = 121;
+    CHECK(UnpackRefusal(Encode(r)) == "a refused file name");
+    r.files[0].name_len.reset();
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty());
+  }
+
+  Group("hostile names: odd but legal names are accepted through the bytes too (the refusals are not blanket)");
+  for (const char* tail : {".hidden", "a..b", "-x", "CONSOLE.dat", "COM10", "00000001/ups.dat/__thumbnail.png"}) {
+    g_ctx = tail;
+    Raw r = RawOf({{kPre + tail, Pattern(10, 1), std::nullopt, std::nullopt}});
+    ho::Handoff out;
+    CHECK(ho::Unpack(S(Encode(r)), &out).empty() && out.files.size() == 1 && out.files[0].name == kPre + tail);
+  }
+  g_ctx.clear();
+}
+
+static void TestDuplicates() {
+  Group("duplicate names: the same name twice is refused (Pack and Unpack), in any position");
+  {
+    ho::Handoff h = Full();
+    h.files = {{kUps, Pattern(10, 1)}, {kUps, Pattern(10, 2)}};
+    CHECK(ho::Pack(h).empty());
+    Raw r = RawOf({{kUps, Pattern(10, 1), std::nullopt, std::nullopt}, {kUps, Pattern(10, 2), std::nullopt, std::nullopt}});
+    CHECK(UnpackRefusal(Encode(r)) == "a duplicate file name");
+    // the first and the sixteenth of 16
+    Raw r16;
+    ho::Handoff h16 = Full();
+    h16.files.clear();
+    for (int i = 0; i < 16; ++i) {
+      const std::string n = kPre + "f" + std::to_string(i);
+      r16.files.push_back({i == 15 ? kPre + "f0" : n, Pattern(10, unsigned(i)), std::nullopt, std::nullopt});
+      h16.files.push_back({i == 15 ? kPre + "f0" : n, Pattern(10, unsigned(i))});
+    }
+    CHECK(ho::Pack(h16).empty());
+    CHECK(UnpackRefusal(Encode(r16)) == "a duplicate file name");
+    r16.files[15].name = kPre + "f15";
+    h16.files[15].name = kPre + "f15";
+    ho::Handoff out;
+    CHECK(!ho::Pack(h16).empty() && ho::Unpack(S(Encode(r16)), &out).empty());  // the control: all distinct
+  }
+  Group("duplicate names: Windows file names are not case-sensitive, so a name differing only in case is a duplicate");
+  {
+    for (auto pair : {std::pair<std::string, std::string>{kPre + "00000001/UPS.DAT/ups.dat", kPre + "00000001/ups.dat/UPS.DAT"},
+                      {kPre + "A", kPre + "a"},
+                      {kPre + "Z", kPre + "z"},   // the ends of the alphabet: a fold that stops one short
+                      {kPre + "m", kPre + "M"},
+                      {kPre + "x/Y", kPre + "x/y"},
+                      {kPre + "ups.dat", kPre + "UPS.dat"},
+                      {kPre + "a", kPre + "A"}}) {
+      g_ctx = pair.first + " vs " + pair.second;
+      ho::Handoff h = Full();
+      h.files = {{pair.first, Pattern(10, 1)}, {pair.second, Pattern(10, 2)}};
+      CHECK(ho::Pack(h).empty());
+      Raw r = RawOf({{pair.first, Pattern(10, 1), std::nullopt, std::nullopt}, {pair.second, Pattern(10, 2), std::nullopt, std::nullopt}});
+      CHECK(UnpackRefusal(Encode(r)) == "a duplicate file name");
+    }
+    g_ctx.clear();
+    // names one character apart are different files
+    ho::Handoff h = Full();
+    h.files = {{kPre + "a1", Pattern(10, 1)}, {kPre + "a2", Pattern(10, 2)}, {kPre + "a", Pattern(10, 3)}, {kPre + "aa", Pattern(10, 4)}};
+    ho::Handoff out;
+    const Bytes b = ho::Pack(h);
+    CHECK(!b.empty() && ho::Unpack(S(b), &out).empty() && out.files.size() == 4);
+  }
+  Group("duplicate names: a file name that is also a folder of another file is refused");
+  {
+    for (auto pair : {std::pair<std::string, std::string>{kPre + "a", kPre + "a/b"},
+                      {kPre + "a/b", kPre + "a"},
+                      {kPre + "A", kPre + "a/b"},
+                      {kPre + "x/y", kPre + "x/y/z/w"},
+                      {kPre + "00000001/ups.dat", kUps}}) {
+      g_ctx = pair.first + " vs " + pair.second;
+      ho::Handoff h = Full();
+      h.files = {{pair.first, Pattern(10, 1)}, {pair.second, Pattern(10, 2)}};
+      CHECK(ho::Pack(h).empty());
+      Raw r = RawOf({{pair.first, Pattern(10, 1), std::nullopt, std::nullopt}, {pair.second, Pattern(10, 2), std::nullopt, std::nullopt}});
+      CHECK(UnpackRefusal(Encode(r)) == "a file name is also a folder");
+    }
+    g_ctx.clear();
+    // the controls: a shared start that is not a whole component, siblings, a name that extends with a dot
+    for (auto pair : {std::pair<std::string, std::string>{kPre + "ab", kPre + "a/b"},
+                      {kPre + "a/b", kPre + "a/c"},
+                      {kPre + "a", kPre + "a.b"},
+                      {kPre + "a", kPre + "b/a"},
+                      {kPre + "00000001/ups.dat/ups.dat", kPre + "00000001/ups.dat/__thumbnail.png"}}) {
+      g_ctx = pair.first + " vs " + pair.second;
+      ho::Handoff h = Full();
+      h.files = {{pair.first, Pattern(10, 1)}, {pair.second, Pattern(10, 2)}};
+      ho::Handoff out;
+      const Bytes b = ho::Pack(h);
+      CHECK(!b.empty() && ho::Unpack(S(b), &out).empty());
+    }
+    g_ctx.clear();
+  }
+}
+
+// =====================================================================================================
+// Hostile bytes: mutated and random input
+// =====================================================================================================
+
+// Whatever Unpack accepts must satisfy every rule, and packing it again must give the same bytes.
+static void CheckAcceptedInvariants(const Bytes& b, const ho::Handoff& h) {
+  CHECK(h.files.size() <= ho::kMaxFiles);
+  CHECK(h.delay >= 1 && h.delay <= 8);
+  CHECK(h.session_token != 0);
+  CHECK(h.role == ho::Role::kHost || h.role == ho::Role::kJoiner);
+  CHECK(h.release.size() <= 200 && h.guest_settings.size() <= 16384);
+  std::set<std::string> seen;
+  for (const ho::File& f : h.files) {
+    CHECK(ho::NameOk(f.name));
+    CHECK(f.data.size() <= ho::kMaxFileBytes);
+    std::string folded = f.name;
+    for (char& c : folded) c = char(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    CHECK(seen.insert(folded).second);
+  }
+  CHECK(b.size() <= ho::kMaxPackedBytes);
+  CHECK(ho::Pack(h) == b);
+}
+
+static void TestFuzz() {
+  Group("hostile bytes: mutated hand-offs are refused or satisfy every rule and re-pack to the same bytes");
+  ho::Handoff base = GoldenHandoff();
+  base.files.push_back({kHdr, Pattern(100, 4)});
+  base.files.push_back({kPre + "a/b", Pattern(33, 5)});
+  base.guest_settings = "user_language=1\nvsync=true\n";
+  const Bytes packed = ho::Pack(base);
+  CHECK(packed.size() > 200);
+  if (packed.size() <= 200) return;  // nothing to mutate: a Pack that refuses the base is red above, and must not end the run (#0422)
+  Rng rng(0x5EED1234u);
+  size_t accepted = 0, refused = 0;
+  const uint32_t edge[] = {0, 1, 2, 0x7F, 0x80, 0xFF, 0x100, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000u, 0xFFFFFFFFu, 300000, 262145, 120, 121};
+  for (int i = 0; i < 40000; ++i) {
+    Bytes m = packed;
+    switch (rng.Below(5)) {
+      case 0:  // one byte replaced
+        m[rng.Below(m.size())] = uint8_t(rng.Next());
+        break;
+      case 1: {  // two bytes replaced
+        m[rng.Below(m.size())] = uint8_t(rng.Next());
+        m[rng.Below(m.size())] = uint8_t(rng.Next());
+        break;
+      }
+      case 2: {  // an edge value written over 4 bytes (the length fields are the target)
+        const size_t at = rng.Below(m.size() - 3);
+        const uint32_t v = edge[rng.Below(sizeof(edge) / sizeof(edge[0]))];
+        for (int k = 0; k < 4; ++k) m[at + size_t(k)] = uint8_t(v >> (8 * k));
+        break;
+      }
+      case 3:  // cut at a random place
+        m.resize(rng.Below(m.size()));
+        break;
+      default: {  // a random byte string
+        m.resize(rng.Below(400));
+        for (uint8_t& c : m) c = uint8_t(rng.Next());
+        break;
+      }
+    }
+    ho::Handoff out = Dirty();
+    const std::string why = ho::Unpack(S(m), &out);
+    if (why.empty()) {
+      ++accepted;
+      CheckAcceptedInvariants(m, out);
+    } else {
+      ++refused;
+      CHECK(IsEmpty(out));
+    }
+  }
+  // both outcomes happen often, so neither side of the property is vacuous
+  CHECK(accepted > 2000 && refused > 2000);
+  if (g_verbose) std::printf("fuzz: %zu accepted, %zu refused\n", accepted, refused);
+}
+
+// =====================================================================================================
+// Guest-visible settings
+// =====================================================================================================
+
+// The names the census (Task 4 report, Step 1) found can reach the guest, in the order GuestSettingNames() lists
+// them; pinned here from the census output, not derived from the code.
+static const char* const kSdkNames[] = {
+    "user_language", "user_country", "license_mask", "cl", "xex_apply_patches", "kernel_debug_monitor",
+    "kernel_cert_monitor", "kernel_pix", "rexcrt_heap_enable", "rexcrt_heap_size_mb", "protect_zero",
+    "protect_on_release", "scribble_heap", "ignore_thread_priorities", "ignore_thread_affinities",
+    "allow_game_relative_writes", "clock_no_scaling", "clock_source_raw", "video_mode_width", "video_mode_height",
+    "video_mode_refresh_rate", "resolution", "window_width", "window_height", "vsync", "readback_resolve",
+    "readback_resolve_half_pixel_offset", "readback_memexport", "readback_memexport_fast", "d3d12_readback_resolve",
+    "d3d12_readback_memexport", "vulkan_readback_resolve", "vulkan_readback_memexport",
+    "query_occlusion_fake_sample_count", "occlusion_query_enable", "clear_memory_page_state", "audio_maxqframes"};
+static constexpr size_t kSdkCount = sizeof(kSdkNames) / sizeof(kSdkNames[0]);
+
+// The expected names: the census list, then the Extras tweak cvars of the tweaks module.
+static std::vector<std::string> ExpectedNames() {
+  std::vector<std::string> v(kSdkNames, kSdkNames + kSdkCount);
+  for (const doa4::tweaks::Tweak& t : doa4::tweaks::AllTweaks()) v.push_back(t.cvar);
+  return v;
+}
+
+static void TestGuestNames() {
+  Group("guest settings: the names are the census list, then every Extras tweak cvar, in that order");
+  const std::vector<std::string>& names = ho::GuestSettingNames();
+  const std::vector<std::string> want = ExpectedNames();
+  CHECK(kSdkCount == 37);
+  CHECK(doa4::tweaks::AllTweaks().size() >= 2);
+  CHECK(names.size() == want.size());
+  CHECK(names == want);
+  CHECK(&ho::GuestSettingNames() == &names);  // one list, not rebuilt per call
+
+  Group("guest settings: the names are unique, plain identifiers (they sit before '=' in a line), and headless is not among them");
+  std::set<std::string> uniq(names.begin(), names.end());
+  CHECK(uniq.size() == names.size());
+  for (const std::string& n : names) {
+    g_ctx = n;
+    CHECK(!n.empty());
+    CHECK(n.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") == std::string::npos);
+  }
+  g_ctx.clear();
+  CHECK(!uniq.count("headless"));
+  CHECK(uniq.count("vsync") && uniq.count("window_width") && uniq.count("doa4_tag_all_stages") &&
+        uniq.count("doa4_mp_hidden_characters"));
+  for (const doa4::tweaks::Tweak& t : doa4::tweaks::AllTweaks()) CHECK(uniq.count(t.cvar));
+}
+
+// A fake cvar store: values with the shapes real ones have (booleans, numbers, a path-like string, an empty
+// string, a value holding '=', one holding spaces and ';').
+static std::map<std::string, std::string> Store() {
+  static const char* const kValues[] = {"true", "false", "0", "1280", "60.000000", "none", "a=b", "", " spaced value ",
+                                        "x;y;z", "-1", "some"};
+  std::map<std::string, std::string> m;
+  size_t i = 0;
+  for (const std::string& n : ho::GuestSettingNames()) m[n] = kValues[i++ % (sizeof(kValues) / sizeof(kValues[0]))];
+  return m;
+}
+static std::string ExpectedText(const std::map<std::string, std::string>& m) {
+  std::string t;
+  for (const std::string& n : ExpectedNames()) {
+    auto it = m.find(n);
+    t += n + "=" + (it == m.end() ? std::string("<missing>") : it->second) + "\n";
+  }
+  return t;
+}
+
+// The value of `n` in the fake store, or a sentinel (never .at(): a throw in a check ends the run, #0422).
+static std::string Val(const std::map<std::string, std::string>& m, const std::string& n) {
+  auto it = m.find(n);
+  return it == m.end() ? std::string("<missing>") : it->second;
+}
+
+static void TestCapture() {
+  Group("capture: one query per name, in list order; the text is name=value lines in that order");
+  const std::map<std::string, std::string> m = Store();
+  std::vector<std::string> asked;
+  const std::string text = ho::CaptureGuestSettings([&](const std::string& n) {
+    asked.push_back(n);
+    auto it = m.find(n);
+    return it == m.end() ? std::string("<missing>") : it->second;
+  });
+  CHECK(asked == ExpectedNames());
+  CHECK(text == ExpectedText(m));
+  CHECK(!text.empty() && text.back() == '\n');
+  CHECK(std::count(text.begin(), text.end(), '\n') == long(ExpectedNames().size()));
+  CHECK(Has(text, "kernel_cert_monitor=a=b\n"));  // a value holding '=' is kept whole (the fixture gives it to index 6)
+  CHECK(Has(text, "kernel_pix=\n"));              // an empty value stays an empty value (index 7)
+
+  Group("capture: a value no line can hold (a newline or a carriage return) is refused, as empty text");
+  for (const char* bad : {"x\ny", "\n", "x\r", "\r\n", "line1\nline2=3"}) {
+    for (size_t at : {size_t(0), kSdkCount / 2, ExpectedNames().size() - 1}) {
+      g_ctx = std::string("value ") + (bad[0] == '\n' ? "newline-first" : bad) + " at " + std::to_string(at);
+      const std::string t = ho::CaptureGuestSettings([&](const std::string& n) {
+        return n == ExpectedNames()[at] ? std::string(bad) : std::string("1");
+      });
+      CHECK(t.empty());
+    }
+  }
+  g_ctx.clear();
+  {  // the control for the loop above: the same query with plain values captures
+    const std::string t = ho::CaptureGuestSettings([&](const std::string&) { return std::string("1"); });
+    CHECK(!t.empty());
+  }
+}
+
+static void TestApply() {
+  const std::map<std::string, std::string> want = Store();
+  const std::string text = ExpectedText(want);
+  const std::vector<std::string> names = ExpectedNames();
+
+  Group("apply: capture then apply restores every value, one set per name in list order");
+  {
+    std::map<std::string, std::string> cur;
+    for (const std::string& n : names) cur[n] = "OTHER-" + n;  // every value differs from the one to restore
+    std::vector<std::string> order;
+    const std::string why = ho::ApplyGuestSettings(text, [&](const std::string& n, const std::string& v) {
+      order.push_back(n);
+      cur[n] = v;
+      return true;
+    });
+    CHECK(why.empty());
+    CHECK(order == names);
+    CHECK(cur == want);
+    // the same through the real capture of a fake store
+    std::map<std::string, std::string> dest;
+    for (const std::string& n : names) dest[n] = "OTHER-" + n;
+    const std::string cap = ho::CaptureGuestSettings([&](const std::string& n) { return Val(want, n); });
+    CHECK(cap == text);
+    CHECK(ho::ApplyGuestSettings(cap, [&](const std::string& n, const std::string& v) {
+            dest[n] = v;
+            return true;
+          }).empty());
+    CHECK(dest == want);
+  }
+
+  Group("apply: the order of the lines does not matter; the sets still go in list order");
+  {
+    std::vector<std::string> lines;
+    for (size_t i = 0, at = 0; i < text.size();) {
+      at = text.find('\n', i);
+      lines.push_back(text.substr(i, at - i + 1));
+      i = at + 1;
+    }
+    CHECK(lines.size() == names.size());
+    std::string reversed;
+    for (size_t i = lines.size(); i-- > 0;) reversed += lines[i];
+    CHECK(reversed != text);
+    std::vector<std::string> order;
+    CHECK(ho::ApplyGuestSettings(reversed, [&](const std::string& n, const std::string&) {
+            order.push_back(n);
+            return true;
+          }).empty());
+    CHECK(order == names);
+  }
+
+  Group("apply: a value keeps '=', spaces and an empty value exactly");
+  {
+    std::map<std::string, std::string> cur;
+    CHECK(ho::ApplyGuestSettings(text, [&](const std::string& n, const std::string& v) {
+            cur[n] = v;
+            return true;
+          }).empty());
+    size_t equals = 0, empties = 0, spaced = 0;
+    for (const auto& kv : cur) {
+      equals += kv.second == "a=b";
+      empties += kv.second.empty();
+      spaced += kv.second == " spaced value ";
+    }
+    CHECK(equals >= 2 && empties >= 2 && spaced >= 2);  // the fixture holds each shape, more than once
+    CHECK(cur == want);
+  }
+
+  Group("apply: text missing any one listed name is refused, naming it, and nothing is set");
+  for (size_t k = 0; k < names.size(); ++k) {
+    const std::string line = names[k] + "=" + Val(want, names[k]) + "\n";
+    const size_t at = text.find(line);
+    CHECK(at != std::string::npos);
+    std::string cut = text;
+    cut.erase(at, line.size());
+    int sets = 0;
+    g_ctx = "without " + names[k];
+    const std::string why = ho::ApplyGuestSettings(cut, [&](const std::string&, const std::string&) {
+      ++sets;
+      return true;
+    });
+    CHECK(why == "guest setting " + names[k] + ": missing");
+    CHECK(sets == 0);
+  }
+  g_ctx.clear();
+  {
+    int sets = 0;
+    const std::string why = ho::ApplyGuestSettings("", [&](const std::string&, const std::string&) {
+      ++sets;
+      return true;
+    });
+    CHECK(why == "guest setting " + names[0] + ": missing" && sets == 0);
+  }
+
+  Group("apply: an unknown name is refused (also one that is a near miss of a real name), and nothing is set");
+  for (const char* extra : {"bogus_setting=1\n", "vsync2=1\n", "vsyn=1\n", " vsync=1\n", "VSYNC=1\n", "vsync =1\n", "headless=true\n",
+                            "doa4_user_data=x\n", "d3d12_adapter=1\n"}) {
+    int sets = 0;
+    const std::string name = std::string(extra).substr(0, std::string(extra).find('='));
+    g_ctx = extra;
+    const std::string why = ho::ApplyGuestSettings(text + extra, [&](const std::string&, const std::string&) {
+      ++sets;
+      return true;
+    });
+    CHECK(why == "unknown guest setting " + name);
+    CHECK(sets == 0);
+  }
+  g_ctx.clear();
+
+  Group("apply: an unknown name is shown in the reason as printable ASCII, at most 64 characters");
+  {
+    auto none = [](const std::string&, const std::string&) { return true; };
+    CHECK(ho::ApplyGuestSettings(text + "bad\x01name=1\n", none) == "unknown guest setting bad?name");
+    CHECK(ho::ApplyGuestSettings(text + "caf\xC3\xA9=1\n", none) == "unknown guest setting caf??");
+    // the edges of the printable range: space and '~' are shown, 0x1F and DEL are not
+    CHECK(ho::ApplyGuestSettings(text + "a b~c=1\n", none) == "unknown guest setting a b~c");
+    CHECK(ho::ApplyGuestSettings(text + "a\x1F" "b\x7F" "c=1\n", none) == "unknown guest setting a?b?c");
+    CHECK(ho::ApplyGuestSettings(text + std::string(64, 'x') + "=1\n", none) == "unknown guest setting " + std::string(64, 'x'));
+    CHECK(ho::ApplyGuestSettings(text + std::string(65, 'x') + "=1\n", none) ==
+          "unknown guest setting " + std::string(64, 'x') + "...");
+    CHECK(ho::ApplyGuestSettings(text + std::string(5000, 'y') + "=1\n", none) ==
+          "unknown guest setting " + std::string(64, 'y') + "...");
+  }
+
+  Group("apply: a name given twice, a line without '=', an empty name, a blank line, a carriage return, no final newline");
+  {
+    int sets = 0;
+    auto count = [&](const std::string&, const std::string&) {
+      ++sets;
+      return true;
+    };
+    CHECK(ho::ApplyGuestSettings(text + "vsync=false\n", count) == "guest setting vsync given twice" && sets == 0);
+    CHECK(ho::ApplyGuestSettings(text + names[0] + "=" + Val(want, names[0]) + "\n", count) ==
+          "guest setting " + names[0] + " given twice" && sets == 0);
+    CHECK(ho::ApplyGuestSettings(text + "vsync\n", count) == "a malformed guest setting line" && sets == 0);
+    CHECK(ho::ApplyGuestSettings(text + "=x\n", count) == "a malformed guest setting line" && sets == 0);
+    CHECK(ho::ApplyGuestSettings(text + "\n", count) == "a malformed guest setting line" && sets == 0);
+    CHECK(ho::ApplyGuestSettings("\n" + text, count) == "a malformed guest setting line" && sets == 0);
+    std::string cr = text;
+    cr.insert(cr.size() - 1, "\r");
+    CHECK(ho::ApplyGuestSettings(cr, count) == "a carriage return in the guest settings" && sets == 0);
+    std::string nonl = text;
+    nonl.pop_back();
+    CHECK(ho::ApplyGuestSettings(nonl, count) == "the last guest setting line has no newline" && sets == 0);
+    CHECK(ho::ApplyGuestSettings(text, count).empty() && sets == int(names.size()));  // the control: the text itself applies
+  }
+
+  Group("apply: the first value the game refuses is the result; later names are not set, earlier ones were");
+  for (size_t k : {size_t(0), names.size() / 2, names.size() - 1}) {
+    std::vector<std::string> order;
+    g_ctx = "refuse " + names[k];
+    const std::string why = ho::ApplyGuestSettings(text, [&](const std::string& n, const std::string&) {
+      order.push_back(n);
+      return n != names[k];
+    });
+    CHECK(why == "the game refused guest setting " + names[k]);
+    CHECK(order.size() == k + 1 && order.back() == names[k]);
+    CHECK(std::equal(order.begin(), order.end(), names.begin()));
+  }
+  g_ctx.clear();
+  {  // two refusals: the first in list order is the one reported
+    const std::string why = ho::ApplyGuestSettings(text, [&](const std::string& n, const std::string&) {
+      return n != names[3] && n != names[10];
+    });
+    CHECK(why == "the game refused guest setting " + names[3]);
+  }
+}
+
+// =====================================================================================================
+// Every guest-setting name is a cvar the SDK or the port really defines
+// =====================================================================================================
+
+// The names defined by REXCVAR_DEFINE_<TYPE>( name ... in the .cpp/.h files below `root` (the definition may
+// continue on the next line, as audio_maxqframes' does).
+static std::set<std::string> ScanCvars(const std::filesystem::path& root, size_t* files) {
+  std::set<std::string> names;
+  std::error_code ec;
+  *files = 0;
+  for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    const std::string ext = it->path().extension().string();
+    if (ext != ".cpp" && ext != ".h" && ext != ".cc") continue;
+    std::ifstream in(it->path(), std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ++*files;
+    static const std::string kKey = "REXCVAR_DEFINE_";
+    for (size_t at = text.find(kKey); at != std::string::npos; at = text.find(kKey, at + 1)) {
+      size_t p = at + kKey.size();
+      while (p < text.size() && (std::isupper(static_cast<unsigned char>(text[p])) || std::isdigit(static_cast<unsigned char>(text[p])) || text[p] == '_')) ++p;
+      if (p >= text.size() || text[p] != '(') continue;
+      ++p;
+      while (p < text.size() && std::isspace(static_cast<unsigned char>(text[p]))) ++p;
+      size_t q = p;
+      while (q < text.size() && (std::isalnum(static_cast<unsigned char>(text[q])) || text[q] == '_')) ++q;
+      if (q > p) names.insert(text.substr(p, q - p));
+    }
+  }
+  return names;
+}
+
+static void TestSdkNames(const std::string& sdk_src, const std::string& port_src) {
+  Group("sdk names: every guest setting is a cvar the SDK or the port defines (a typo would refuse every session)");
+  CHECK(!sdk_src.empty() && !port_src.empty());  // the runner passes --sdk-src and --port-src; a missing one is a failure, not a skip
+  if (sdk_src.empty() || port_src.empty()) return;
+  size_t sdk_files = 0, port_files = 0;
+  const std::set<std::string> sdk = ScanCvars(sdk_src, &sdk_files);
+  const std::set<std::string> port = ScanCvars(port_src, &port_files);
+  if (g_verbose) std::printf("sdk: %zu files, %zu cvars; port: %zu files, %zu cvars\n", sdk_files, sdk.size(), port_files, port.size());
+  // non-vacuity floors (the SDK defines 194 names in 575 files at e632d09; the port 7) and the scanner's own controls
+  CHECK(sdk_files > 300 && sdk.size() > 150);
+  CHECK(port_files > 20 && port.size() >= 7);
+  CHECK(sdk.count("vsync") && sdk.count("user_language"));
+  CHECK(sdk.count("audio_maxqframes"));  // a definition whose name is on the line after the macro
+  CHECK(sdk.count("headless"));          // defined, deliberately not in the list (the session forces it)
+  CHECK(port.count("doa4_tag_all_stages"));
+  CHECK(!sdk.count("no_such_cvar_xyz") && !port.count("no_such_cvar_xyz"));
+  for (const std::string& n : ho::GuestSettingNames()) {
+    g_ctx = n;
+    CHECK(sdk.count(n) + port.count(n) >= 1);
+  }
+  g_ctx.clear();
+}
+
+int main(int argc, char** argv) {
+  std::string sdk_src, port_src;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "-v") == 0) g_verbose = true;
+    else if (std::strcmp(argv[i], "--sdk-src") == 0 && i + 1 < argc) sdk_src = argv[++i];
+    else if (std::strcmp(argv[i], "--port-src") == 0 && i + 1 < argc) port_src = argv[++i];
+  }
+  TestLayout();
+  TestRoundTrip();
+  TestTruncation();
+  TestFileCountLimit();
+  TestFileSizeLimit();
+  TestTotalLimit();
+  TestFieldLimits();
+  TestHeaderRefusals();
+  TestNameOk();
+  TestNameSweeps();
+  TestDeviceNames();
+  TestHostileNamesInBytes();
+  TestDuplicates();
+  TestFuzz();
+  TestGuestNames();
+  TestCapture();
+  TestApply();
+  TestSdkNames(sdk_src, port_src);
+  std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
+  return g_failures ? 1 : 0;
+}

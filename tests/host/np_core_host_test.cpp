@@ -284,6 +284,55 @@ static void TestMetaMismatch() {
   CHECK(MetaMismatch(meta("aa", "unreadable"), meta("aa", "unreadable")).find("build") == std::string::npos);
 }
 
+// The meta keys Task 4 adds: "guest" (the captured guest-visible settings, newlines written as ';') and "unlock"
+// (1 when the session unlocked everything). Task 12 makes the session write them; until then every meta lacks both
+// on both sides and compares equal.
+static void TestMetaGuestUnlock() {
+  // meta: guest and unlock are compared, each on its own
+  CHECK(MetaMismatch("build=a\nguest=x\nunlock=1\n", "build=a\nguest=y\nunlock=1\n") == "guest x vs y");
+  CHECK(MetaMismatch("build=a\nguest=x\nunlock=0\n", "build=a\nguest=x\nunlock=1\n") == "unlock 0 vs 1");
+  CHECK(MetaMismatch("build=a\nguest=x\nunlock=1\n", "build=a\nguest=x\nunlock=1\n").empty());
+  CHECK(MetaMismatch("build=a\nguest=x\nunlock=0\n", "build=a\nguest=y\nunlock=1\n") == "guest x vs y; unlock 0 vs 1");
+  // a value holds '=' and ';' (the session writes the settings with newlines as ';')
+  CHECK(MetaMismatch("guest=a=1;b=2;\n", "guest=a=1;b=3;\n") == "guest a=1;b=2; vs a=1;b=3;");
+  CHECK(MetaMismatch("guest=\n", "guest=x\n") == "guest  vs x");  // an empty value is a value, not "(none)"
+
+  // meta: a recording without the two keys against a meta with them names both as (none)
+  CHECK(MetaMismatch("build=a\n", "build=a\nguest=x\nunlock=1\n") == "guest (none) vs x; unlock (none) vs 1");
+  CHECK(MetaMismatch("build=a\nguest=x\nunlock=1\n", "build=a\n") == "guest x vs (none); unlock 1 vs (none)");
+  CHECK(MetaMismatch("build=a\nunlock=1\n", "build=a\nguest=x\nunlock=1\n") == "guest (none) vs x");
+  CHECK(MetaMismatch("build=a\nguest=x\n", "build=a\nguest=x\nunlock=1\n") == "unlock (none) vs 1");
+  // a phase-0 recording against a phase-0 meta: both lack both keys and agree
+  CHECK(MetaMismatch("build=a\n", "build=a\n").empty());
+  CHECK(MetaMismatch("", "").empty());
+
+  // meta: the eight keys come in the order build, data, fixes, serial, sweep, tweaks, guest, unlock
+  CHECK(MetaMismatch("unlock=0\nguest=m\ntweaks=k\nsweep=i\nserial=g\nfixes=e\ndata=c\nbuild=a\n",
+                     "unlock=1\nguest=n\ntweaks=l\nsweep=j\nserial=h\nfixes=f\ndata=d\nbuild=b\n") ==
+        "build a vs b; data c vs d; fixes e vs f; serial g vs h; sweep i vs j; tweaks k vs l; guest m vs n; unlock 0 vs 1");
+
+  // meta: guest and unlock are whole key names at the start of a line
+  CHECK(MetaMismatch("guestx=zz\nunlockx=zz\nxguest=zz\nxunlock=zz\n", "").empty());
+  CHECK(MetaMismatch("guestx=zz\n", "guest=zz\n") == "guest (none) vs zz");
+  CHECK(MetaMismatch("unlockx=1\n", "unlock=1\n") == "unlock (none) vs 1");
+  CHECK(MetaMismatch("xguest=zz\nxunlock=1\n", "guest=zz\nunlock=1\n") == "guest (none) vs zz; unlock (none) vs 1");
+
+  // MetaValue: the value of one key, (none) when missing
+  CHECK(MetaValue("build=a\nunlock=1\n", "unlock") == "1");
+  CHECK(MetaValue("build=a\n", "unlock") == "(none)");
+  CHECK(MetaValue("unlockx=1\n", "unlock") == "(none)");  // a key that is a prefix of another key's name
+  CHECK(MetaValue("xunlock=1\n", "unlock") == "(none)");
+  CHECK(MetaValue("build=a\nunlock=1\n", "build") == "a");  // the first line, not the last
+  CHECK(MetaValue("build=a\nunlock=1", "unlock") == "1");   // no final newline
+  CHECK(MetaValue("xunlock=9\nunlock=2\n", "unlock") == "2");
+  CHECK(MetaValue("unlock=1\nunlock=2\n", "unlock") == "1");  // a repeated key: the first line counts
+  CHECK(MetaValue("unlock=\n", "unlock") == "");              // an empty value is a value
+  CHECK(MetaValue("unlock\n", "unlock") == "(none)");         // no '=': not this key's line
+  CHECK(MetaValue("", "unlock") == "(none)");
+  CHECK(MetaValue("guest=a=1;b=2;\n", "guest") == "a=1;b=2;");  // everything after the first '='
+  CHECK(MetaValue("guest=x\nunlock=1\n", "unlock") == "1" && MetaValue("guest=x\nunlock=1\n", "guest") == "x");
+}
+
 static void TestMaskedCopy() {
   uint8_t mem[16];
   for (int i = 0; i < 16; ++i) mem[i] = uint8_t(i + 1);
@@ -773,6 +822,7 @@ int main() {
   TestQueue();
   TestRecording();
   TestMetaMismatch();
+  TestMetaGuestUnlock();
   TestMaskedCopy();
   TestBlockMasks();
   TestBlockRegions();
