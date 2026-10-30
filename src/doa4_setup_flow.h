@@ -2,7 +2,6 @@
 // an extracted folder, check it, pick where to extract, extract with progress
 // and cancel. Every outside effect (file dialogs, the worker thread, the
 // checks, the copy) is injected, so the host test drives it synchronously.
-// See notes/specs/2026-10-28-first-run-setup-design.md.
 //
 // Threading: every Flow method and every `post`ed callback runs on the UI
 // thread; `run_async` work runs on a worker and touches only its arguments,

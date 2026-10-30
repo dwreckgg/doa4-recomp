@@ -8,8 +8,7 @@
 //
 // sub_823078C8 is the game's photo compressor, called only by the snapshot
 // save menu (sub_82535150, its save state) when the player saves the photo to
-// the Album; after it runs, the watcher writes the held full-quality copy. See
-// notes/research/photo_findings.md.
+// the Album; after it runs, the watcher writes the held full-quality copy.
 
 #include <atomic>
 #include <cstdint>

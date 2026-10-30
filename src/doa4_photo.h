@@ -2,7 +2,7 @@
 //
 // Image maths (the game's photo crop, fitting to the monitor, area-average
 // resize), file names, the settings' choice tables, and the edge detector for
-// the game's own snapshot. See notes/specs/2026-10-28-photo-mode-design.md.
+// the game's own snapshot.
 
 #pragma once
 

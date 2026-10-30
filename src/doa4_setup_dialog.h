@@ -1,7 +1,7 @@
 // The first-run setup screen (ImGui, in the game window): shown before the
 // game starts when no game files are configured, and from the Esc menu's Game
 // tab to choose another location. Draws a doa4::setup::Flow; owns its worker
-// thread. See notes/specs/2026-10-28-first-run-setup-design.md.
+// thread.
 //
 // Test switch DOA4_SETUP_TEST (no file dialogs are opened):
 //   folder=<path>               choose that extracted folder

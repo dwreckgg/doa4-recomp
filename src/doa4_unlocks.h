@@ -2,8 +2,7 @@
 //
 // Everything lives in the current profile, a struct in guest DATA that the game
 // saves as ups.dat. The menu writes single bytes into it and the game's own
-// autosave persists them. No game code is called. Layout and rules:
-// notes/research/unlock_findings.md and notes/specs/2026-10-28-extras-tab-design.md.
+// autosave persists them. No game code is called.
 
 #pragma once
 

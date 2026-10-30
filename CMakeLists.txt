@@ -24,6 +24,8 @@ set(DEADORALIVE4_SOURCES
     src/doa4_extras.cpp
     src/doa4_cvars.cpp
     src/doa4_graphics.cpp
+    src/doa4_lowmem.cpp
+    src/doa4_speakers.cpp
     src/doa4_photo.cpp
     src/doa4_photo_win.cpp
     src/doa4_photo_service.cpp

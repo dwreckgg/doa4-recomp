@@ -6,7 +6,7 @@
 // sector 32 holds "MICROSOFT*XBOX*MEDIA" and the root directory's sector and
 // size. A directory table is a binary tree of entries: left and right subtree
 // offsets (in 4-byte units), the start sector, the size, attributes (0x10 =
-// folder) and a name. See notes/specs/2026-10-28-first-run-setup-design.md.
+// folder) and a name.
 
 #pragma once
 

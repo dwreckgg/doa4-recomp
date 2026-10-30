@@ -1,6 +1,5 @@
 #Requires -Version 5.1
 # DOA4Setup.psm1 - all of the DOA4 launcher's logic, no UI.
-# Design: notes/specs/2026-10-28-launcher-setup-design.md (the user's notes folder).
 #
 # Every external program (git, winget, vswhere, clang, cmd) is reached through ONE command
 # table (New-DOA4CommandTable) so the tests can replace it with fakes. A table entry is a

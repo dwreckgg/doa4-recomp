@@ -15,9 +15,11 @@ into C++ (`generated/`); the SDK supplies the Xbox 360 runtime (kernel, GPU, aud
 repository contains **no game data**: you build it, then run it against files extracted from your
 own copy of the game.
 
-This port adds, on top of the original recomp: frame pacing fixes, an Esc menu with Video /
-Controls / Photo / Extras / Game tabs, graphics options (anti-aliasing, anisotropic filtering,
-render scale), photos (F12 and full-quality copies of in-game snapshots), unlockables and tweaks,
+This port adds, on top of the original recomp: frame pacing fixes, fixes for the crashes when
+choosing Ryu Hayabusa or Brad Wong and on one of Christie's throws, an Esc menu with Video /
+Audio / Controls / Photo / Extras / Game tabs, graphics options (anti-aliasing, anisotropic
+filtering, render scale), a 5.1 surround sound option, photos (F12 and full-quality copies of
+in-game snapshots), unlockables and tweaks,
 a diagnostics overlay (F6), a first-run setup that finds or extracts the game files, and a
 one-click launcher. It builds against the ReXGlue SDK branch
 [`doa4-recomp` of Dwreckgg/rexglue-sdk](https://github.com/Dwreckgg/rexglue-sdk/tree/doa4-recomp),
@@ -88,7 +90,8 @@ When you are done, `C:\Games\DOA4` contains exactly two things: `setup.bat` and 
 
 ### Playing
 
-- **Esc** opens the menu: video and graphics options, controls, photos, extras and game settings.
+- **Esc** opens the menu: video and graphics options, audio (stereo or 5.1 surround), controls,
+  photos, extras and game settings.
 - **F12** takes a photo. In the launcher, **Open photos** shows them.
 - To get the newest version later, open the launcher and click **Update & rebuild**.
 - **Open saves** and **Open logs** in the launcher open the folders with your saves and the log files.
@@ -156,6 +159,7 @@ The rest of this README is the same process by hand.
 8. [Regenerating the recompiled code](#8-regenerating-the-recompiled-code)
 9. [Host tests](#9-host-tests)
 10. [Troubleshooting](#10-troubleshooting)
+11. [Known bugs](#11-known-bugs)
 
 ## 1. The game version
 
@@ -323,7 +327,11 @@ can lock files the game is writing). The Esc menu's Game tab shows the folder in
 ![The Esc menu's Game tab: the game files folder (with Change... and Open folder) and the saves folder](docs/images/game-tab.png)
 
 - Settings live in `dead_or_alive_4.toml` next to the exe; the **Esc** menu edits them (tabs
-  Video, Controls, Photo, Extras, Game).
+  Video, Audio, Controls, Photo, Extras, Game).
+- The Audio tab picks the speakers: **Automatic** (5.1 when the Windows speaker setup is 5.1 or
+  more, stereo otherwise), **Stereo**, or **5.1 surround** (always six channels). The choice is
+  saved as `audio_speakers` in `dead_or_alive_4.toml` (`auto`, `stereo` or `surround`) and applies
+  after a restart; the tab also shows how many channels the output device reports.
 - **F6** shows a diagnostics overlay.
 
 ### Photos
@@ -378,6 +386,13 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 | The setup screen keeps coming back | The saved location could not be written to `dead_or_alive_4.toml` (the log says why), or the folder has moved. |
 | "This path has characters that this build cannot use" | The game folder's path has characters outside the Windows code page (for example Japanese on an English Windows); the runtime cannot start from it. Use a folder whose path has plain letters and digits. |
 | "This folder holds an unfinished extraction" | An earlier extraction was interrupted (the game was killed or the PC lost power). Delete that folder and extract again. |
+
+## 11. Known bugs
+
+| Bug | Status |
+|---|---|
+| Choosing **Ryu Hayabusa** (or **Brad Wong**, first reported as Zack) as player 1 crashed the game; Ryu also crashed the attract demo (Ryu vs Christie). | Fixed: the runtime put the game's data pool at guest address 0x00010000, so low that the game's "already relocated?" test (a table entry above the buffer address counts as a pointer) skipped Ryu's move-script table; Brad Wong's character-select model read a bad motion record from the same low pool (gone with the fix, not traced to its table). The game now keeps guest 0x00010000-0x0FFFFFFF unused (`src/doa4_lowmem.cpp`; the log says `[doa4][MEM] reserved guest ...`). |
+| A rare crash with `Call to invalid or unregistered function at guest address 0x...` in the log, at one particular move or moment. | A function the recompiler missed. Fixed for the addresses found so far, including the crash on one of Christie's throws (Safari stage). For a new one, add the address to `hints.toml` and regenerate (step 8). |
 
 ## Building from a fresh GitHub clone
 

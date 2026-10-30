@@ -1,6 +1,5 @@
 // The first-run setup's Windows parts: the disc image file dialog and the
-// free space on the drive a folder will be created on. See
-// notes/specs/2026-10-28-first-run-setup-design.md.
+// free space on the drive a folder will be created on.
 
 #pragma once
 

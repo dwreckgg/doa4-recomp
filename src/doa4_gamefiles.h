@@ -1,6 +1,6 @@
 // The game files: which folder the game starts from, checking a disc image or
 // folder against the supported version, and extracting a disc image. No SDK;
-// host-tested. See notes/specs/2026-10-28-first-run-setup-design.md.
+// host-tested.
 
 #pragma once
 
