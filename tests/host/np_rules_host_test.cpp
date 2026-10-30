@@ -23,8 +23,10 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace doa4::np;
@@ -88,57 +90,146 @@ static char FlipCase(char c) {
   return c == '0' ? '1' : '0';  // a digit, '-' or '_': another symbol of the alphabet
 }
 
+// ---- the join-code check symbol: a model written from the scheme in np_rules.cpp. GF(2^6) here is by log/antilog
+// tables (the product multiplies by shift-and-xor) and phi by character class (the product by index arithmetic). ----
+static const char* const kAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+struct GfTables {
+  unsigned exp[126] = {};
+  int lg[64] = {};
+  GfTables() {
+    unsigned v = 1;
+    for (int i = 0; i < 63; ++i) {
+      exp[i] = v;
+      lg[v] = i;
+      v <<= 1;
+      if (v & 64) v ^= 0x43;  // x^6 + x + 1
+    }
+    for (int i = 63; i < 126; ++i) exp[i] = exp[i - 63];
+  }
+  unsigned Mul(unsigned a, unsigned b) const { return (a == 0 || b == 0) ? 0u : exp[lg[a] + lg[b]]; }
+};
+static const GfTables kGf;
+
+static unsigned ModelPhi(char c) {
+  if (c >= 'A' && c <= 'Z') return unsigned(c - 'A');
+  if (c >= 'a' && c <= 'z') return 32u + unsigned(c - 'a');  // the upper-case value ^ 32
+  if (c >= '0' && c <= '9') {
+    const unsigned d = unsigned(c - '0');
+    return d <= 5 ? 26 + d : 52 + d;
+  }
+  return c == '-' ? 62u : 63u;  // '_'
+}
+static const unsigned kModelW7[7] = {1, 2, 4, 8, 16, 32, 63};
+static const unsigned kModelW9[9] = {1, 2, 4, 8, 16, 32, 7, 56, 11};
+static const unsigned* ModelWeights(size_t symbols) { return symbols == 7 ? kModelW7 : kModelW9; }
+
+static unsigned ModelSyndrome(const std::string& code) {  // 0 for a valid code
+  const unsigned* w = ModelWeights(code.size());
+  unsigned s = 0;
+  for (size_t i = 0; i < code.size(); ++i) s ^= kGf.Mul(w[i], ModelPhi(code[i]));
+  return s;
+}
+// Sets code[j] to the one symbol that makes the model's sum 0.
+static std::string ModelSolveAt(std::string code, size_t j) {
+  const unsigned* w = ModelWeights(code.size());
+  unsigned s = 0;
+  for (size_t i = 0; i < code.size(); ++i)
+    if (i != j) s ^= kGf.Mul(w[i], ModelPhi(code[i]));
+  for (const char* p = kAlpha; *p; ++p)
+    if (kGf.Mul(w[j], ModelPhi(*p)) == s) {
+      code[j] = *p;
+      return code;
+    }
+  return std::string();  // cannot happen: w[j] != 0 and phi is a bijection
+}
+// A valid code of `symbols` symbols with `a` at pos and, when has_b, `b` at pos + 1; the other symbols are random,
+// one position outside those is solved for. So every (position, symbol) and every adjacent pair can be built.
+static std::string ModelCodeWith(size_t symbols, size_t pos, char a, bool has_b, char b, Rng& rng) {
+  std::string code(symbols, 'A');
+  for (char& c : code) c = kAlpha[rng.Below(64)];
+  code[pos] = a;
+  const size_t last_fixed = has_b ? pos + 1 : pos;
+  if (has_b) code[pos + 1] = b;
+  size_t free_pos = 0;
+  if (free_pos == pos || free_pos == last_fixed) free_pos = symbols - 1;
+  return ModelSolveAt(code, free_pos);
+}
+static bool Accepts(const std::string& code) {
+  rules::Endpoint e;
+  return rules::ParseJoinCode(code, &e, 7200);
+}
+
 static void TestJoinCodes() {
   static_assert(rules::kPortBase == 7200 && rules::kPorts == 16);  // spec 5: DOA4's range 7200-7215
   rules::Endpoint back;
+  Rng rng(0xC0DE0003ull);
 
-  Group("join code: 6 symbols for a port inside 7200-7215, and the code round-trips");
+  Group("join code: 7 symbols (6 + check) for a port inside 7200-7215, and the code round-trips");
   for (const rules::Endpoint& e : {Ep(203, 0, 113, 7, 7203), Ep(203, 0, 113, 7, 7215), Ep(203, 0, 113, 7, 7200)}) {
     const std::string code = rules::MakeJoinCode(e);
-    CHECK(code.size() == 6);
+    CHECK(code.size() == 7);
+    CHECK(ModelSyndrome(code) == 0);
     back = Ep(9, 9, 9, 9, 999);
     CHECK(rules::ParseJoinCode(code, &back, 7200) && back == e);
   }
 
-  Group("join code: 8 symbols for a port outside the range (either side of it)");
+  Group("join code: 9 symbols (8 + check) for a port outside the range (either side of it)");
   for (const rules::Endpoint& e : {Ep(198, 51, 100, 20, 49152), Ep(198, 51, 100, 20, 7216), Ep(198, 51, 100, 20, 7199),
                                    Ep(198, 51, 100, 20, 1), Ep(198, 51, 100, 20, 65535)}) {
     const std::string code = rules::MakeJoinCode(e);
-    CHECK(code.size() == 8);
+    CHECK(code.size() == 9);
+    CHECK(ModelSyndrome(code) == 0);
     back = Ep(9, 9, 9, 9, 999);
     CHECK(rules::ParseJoinCode(code, &back, 7200) && back == e);
   }
   CHECK(rules::MakeJoinCode(Ep(1, 2, 3, 4, 0)).empty());  // port 0: nothing to encode
 
-  Group("join code: golden vectors from DOA2U's join_code.c (the scramble key and rounds are pinned)");
+  Group("join code: round trip for ALL 16 port indices, on several addresses");
+  for (const rules::Endpoint& base : {Ep(203, 0, 113, 7, 0), Ep(10, 20, 30, 40, 0), Ep(1, 0, 0, 0, 0), Ep(255, 255, 255, 255, 0)}) {
+    std::set<std::string> seen;
+    for (unsigned index = 0; index < 16; ++index) {
+      rules::Endpoint e = base;
+      e.port = uint16_t(7200 + index);
+      const std::string code = rules::MakeJoinCode(e);
+      seen.insert(code);
+      CHECK(code.size() == 7);
+      back = Ep(9, 9, 9, 9, 999);
+      CHECK(rules::ParseJoinCode(code, &back, 7200) && back == e);
+    }
+    CHECK(seen.size() == 16);  // sixteen ports, sixteen different codes
+  }
+
+  Group("join code: golden vectors - payload from DOA2U's join_code.c (the key and rounds), check symbol from the model script");
   {
     struct G { rules::Endpoint ep; const char* code; };
     const G golden[] = {
-        {Ep(203, 0, 113, 7, 7203), "N-iddw"},    {Ep(203, 0, 113, 7, 7215), "Orjdz6"},
-        {Ep(198, 51, 100, 20, 49152), "q-k-QhCu"}, {Ep(198, 51, 100, 20, 7216), "Jnjg3w5a"},
-        {Ep(198, 51, 100, 20, 7199), "M8SdzSwl"},  {Ep(192, 168, 1, 5, 7200), "RRyjQg"},
-        {Ep(255, 255, 255, 255, 65535), "Yj4PF0Po"}, {Ep(1, 0, 0, 0, 7200), "hqnptD"},
-        {Ep(10, 20, 30, 40, 7208), "pt4SMa"},    {Ep(127, 0, 0, 1, 7201), "eGazdO"},
-        {Ep(8, 8, 8, 8, 1), "DZHKPrOW"},         {Ep(192, 168, 1, 5, 7207), "jAwLL2"},
+        {Ep(203, 0, 113, 7, 7203), "N-iddwg"},      {Ep(203, 0, 113, 7, 7215), "Orjdz6c"},
+        {Ep(198, 51, 100, 20, 49152), "q-k-QhCu5"}, {Ep(198, 51, 100, 20, 7216), "Jnjg3w5aA"},
+        {Ep(198, 51, 100, 20, 7199), "M8SdzSwln"},  {Ep(192, 168, 1, 5, 7200), "RRyjQg8"},
+        {Ep(255, 255, 255, 255, 65535), "Yj4PF0PoI"}, {Ep(1, 0, 0, 0, 7200), "hqnptDF"},
+        {Ep(10, 20, 30, 40, 7208), "pt4SMa1"},      {Ep(127, 0, 0, 1, 7201), "eGazdOJ"},
+        {Ep(8, 8, 8, 8, 1), "DZHKPrOWY"},           {Ep(192, 168, 1, 5, 7207), "jAwLL2p"},
     };
     for (const G& g : golden) {
       CHECK(rules::MakeJoinCode(g.ep) == g.code);
       back = Ep(9, 9, 9, 9, 999);
       CHECK(rules::ParseJoinCode(g.code, &back, 7200) && back == g.ep);
     }
-    // JoinCodeTextOf takes the packed value: ip << 4 | port index (6 symbols), ip << 16 | port (8 symbols).
-    CHECK(rules::JoinCodeTextOf(0xCB0071073ull, 6) == "N-iddw");        // 203.0.113.7 = CB007107, index 3
-    CHECK(rules::JoinCodeTextOf(0xC6336414C000ull, 8) == "q-k-QhCu");   // 198.51.100.20 = C6336414, port C000 = 49152
-    CHECK(rules::JoinCodeTextOf(0xCB0071073ull, 6) == rules::MakeJoinCode(Ep(203, 0, 113, 7, 7203)));
+    // JoinCodeTextOf takes the packed value: ip << 4 | port index (7 symbols), ip << 16 | port (9 symbols).
+    CHECK(rules::JoinCodeTextOf(0xCB0071073ull, 7) == "N-iddwg");        // 203.0.113.7 = CB007107, index 3
+    CHECK(rules::JoinCodeTextOf(0xC6336414C000ull, 9) == "q-k-QhCu5");   // 198.51.100.20 = C6336414, port C000 = 49152
+    CHECK(rules::JoinCodeTextOf(0xCB0071073ull, 7) == rules::MakeJoinCode(Ep(203, 0, 113, 7, 7203)));
   }
 
-  Group("join code: JoinCodeTextOf knows only 6 and 8 symbols");
-  for (int n : {-6, 0, 1, 5, 7, 9, 10, 11, 12, 64}) CHECK(rules::JoinCodeTextOf(0x123456789ull, n).empty());
+  Group("join code: JoinCodeTextOf knows only 7 and 9 symbols");
+  for (int n : {-7, 0, 1, 5, 6, 8, 10, 11, 12, 64}) CHECK(rules::JoinCodeTextOf(0x123456789ull, n).empty());
+  CHECK(rules::JoinCodeTextOf(0x123456789ull, 7).size() == 7 && rules::JoinCodeTextOf(0x123456789ull, 9).size() == 9);
 
-  Group("join code: the code does not show the address (not the plain base64 of it)");
+  Group("join code: the code does not show the address (its payload is not the plain base64 of it)");
   // plain base64 (URL-safe alphabet) of the packed values, from the model script
-  CHECK(rules::MakeJoinCode(Ep(203, 0, 113, 7, 7203)) != "ywBxBz");
-  CHECK(rules::MakeJoinCode(Ep(198, 51, 100, 20, 49152)) != "xjNkFMAA");
+  CHECK(rules::MakeJoinCode(Ep(203, 0, 113, 7, 7203)).substr(0, 6) != "ywBxBz");
+  CHECK(rules::MakeJoinCode(Ep(198, 51, 100, 20, 49152)).substr(0, 8) != "xjNkFMAA");
   {  // neighbouring addresses give unrelated codes: most symbols differ, where the plain encoding changed one or two
     unsigned differ = 0, total = 0;
     for (int i = 1; i < 200; ++i) {
@@ -150,28 +241,175 @@ static void TestJoinCodes() {
     CHECK(total == 199 * 6 && differ * 2 > total);
   }
 
-  Group("join code: 5,000 addresses round-trip, in both forms");
+  // the sample of real codes the edit tests below use: 5,000 addresses in both forms
+  std::vector<std::pair<std::string, rules::Endpoint>> sample;
+  Group("join code: 5,000 addresses round-trip, in both forms (every port index among them)");
   for (unsigned i = 0; i < 5000; ++i) {
     const unsigned v = i * 2654435761u;
     const bool in_range = (i & 1) != 0;
-    const unsigned port = in_range ? 7200 + (i % 16) : 1024 + (i * 7919u) % 64000;
+    const unsigned port = in_range ? 7200 + ((i >> 1) % 16) : 1024 + (i * 7919u) % 64000;
     const rules::Endpoint e = Ep(int(v >> 24) | 1, int(v >> 16) & 255, int(v >> 8) & 255, int(v) & 255, port);
     const std::string code = rules::MakeJoinCode(e);
     const bool indexed = port >= 7200 && port <= 7215;
-    CHECK(code.size() == (indexed ? 6u : 8u));
+    CHECK(code.size() == (indexed ? 7u : 9u));
+    CHECK(ModelSyndrome(code) == 0);
     back = Ep(9, 9, 9, 9, 999);
     CHECK(rules::ParseJoinCode(code, &back, 7200) && back == e);
+    sample.emplace_back(code, e);
   }
 
-  Group("join code: case-sensitive - one changed symbol is another address (or none), at every position");
+  Group("join code: the check symbol agrees with the model on random texts, both lengths, valid or not");
+  {
+    unsigned long long both_valid = 0, accepted_but_invalid = 0, valid_but_refused = 0;
+    for (size_t symbols : {size_t(7), size_t(9)}) {
+      for (int i = 0; i < 200000; ++i) {
+        std::string t(symbols, 'A');
+        for (char& c : t) c = kAlpha[rng.Below(64)];
+        const bool model_valid = ModelSyndrome(t) == 0;
+        const bool product_accepts = Accepts(t);
+        accepted_but_invalid += product_accepts && !model_valid;
+        valid_but_refused += model_valid && !product_accepts;  // only a text that decodes to port 0 (once in 65,536)
+        both_valid += model_valid && product_accepts;
+      }
+    }
+    CHECK(accepted_but_invalid == 0);
+    CHECK(valid_but_refused <= 1);
+    CHECK(both_valid > 4000);  // about 1 in 64 of 400,000: the loop saw valid codes too
+  }
+
+  Group("join code: EVERY single-symbol substitution is refused - every position, every symbol, every other symbol");
+  {
+    unsigned long long codes = 0, edits = 0, bad = 0, skipped = 0;
+    for (size_t symbols : {size_t(7), size_t(9)}) {
+      for (size_t pos = 0; pos < symbols; ++pos) {
+        for (const char* pa = kAlpha; *pa; ++pa) {
+          const std::string code = ModelCodeWith(symbols, pos, *pa, false, 'A', rng);
+          // the control: the unedited code is accepted (a random 9-symbol code decodes to port 0 once in 65,536: skipped)
+          if (!Accepts(code)) { ++skipped; continue; }
+          ++codes;
+          for (const char* pb = kAlpha; *pb; ++pb) {
+            if (*pb == *pa) continue;
+            std::string edited = code;
+            edited[pos] = *pb;
+            ++edits;
+            bad += Accepts(edited);
+          }
+        }
+      }
+    }
+    CHECK(codes + skipped == (7 + 9) * 64 && edits == codes * 63);
+    CHECK(skipped <= 3 && bad == 0);
+  }
+
+  Group("join code: EVERY adjacent swap of two different symbols is refused - every pair of positions, every pair of symbols");
+  {
+    unsigned long long codes = 0, swaps = 0, bad = 0, skipped = 0;
+    for (size_t symbols : {size_t(7), size_t(9)}) {
+      for (size_t pos = 0; pos + 1 < symbols; ++pos) {  // pos + 1 == symbols - 1 is the last payload symbol with the check
+        for (const char* pa = kAlpha; *pa; ++pa) {
+          for (const char* pb = kAlpha; *pb; ++pb) {
+            const std::string code = ModelCodeWith(symbols, pos, *pa, true, *pb, rng);
+            if (!Accepts(code)) { ++skipped; continue; }  // (a 9-symbol code that decodes to port 0: once in 65,536)
+            ++codes;
+            std::string swapped = code;
+            std::swap(swapped[pos], swapped[pos + 1]);
+            if (*pa == *pb) {
+              bad += swapped != code || !Accepts(swapped);  // two equal symbols: the swap is the same text
+            } else {
+              ++swaps;
+              bad += Accepts(swapped);
+            }
+          }
+        }
+      }
+    }
+    CHECK(codes + skipped == (6 + 8) * 64 * 64 && swaps <= (6 + 8) * 64 * 63 && swaps > (6 + 8) * 64 * 63 - 64);
+    CHECK(skipped <= 6 && bad == 0);
+  }
+
+  Group("join code: the same on the 5,000 real codes (substitution at every position, adjacent swaps, a wrong check symbol)");
+  {
+    unsigned long long edits = 0, swaps = 0, bad = 0;
+    std::set<std::pair<size_t, char>> covered;  // (position, symbol) pairs the real codes contain
+    for (const auto& [code, e] : sample) {
+      for (size_t pos = 0; pos < code.size(); ++pos) {
+        if (code.size() == 7) covered.emplace(pos, code[pos]);
+        for (const char* pb = kAlpha; *pb; ++pb) {
+          if (*pb == code[pos]) continue;
+          std::string edited = code;
+          edited[pos] = *pb;
+          ++edits;
+          bad += Accepts(edited);
+        }
+      }
+      for (size_t pos = 0; pos + 1 < code.size(); ++pos) {
+        std::string swapped = code;
+        std::swap(swapped[pos], swapped[pos + 1]);
+        if (code[pos] == code[pos + 1]) continue;
+        ++swaps;
+        bad += Accepts(swapped);
+      }
+    }
+    CHECK(edits > 2000000 && swaps > 30000);
+    CHECK(bad == 0);
+    CHECK(covered.size() == 7 * 64);  // the 7-symbol sample holds every symbol at every position
+  }
+
+  Group("join code: lower-casing a code is refused (except the few position sets the check cannot see)");
+  {
+    // Lower-casing adds 32 to phi at each upper-case letter, so it changes the sum by 32 * xor(weights of those
+    // positions): refused unless that xor is 0 - all 7 symbols upper-case (7 symbols), or one of 7 sets of >= 4
+    // positions (9 symbols). The expectation below is computed from the weights, not from the product.
+    unsigned long long with_upper = 0, refused = 0, wrong = 0;
+    auto lower = [](std::string s) {
+      for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c = char(c + 32);
+      return s;
+    };
+    auto expect_refused = [](const std::string& code) {
+      const unsigned* w = ModelWeights(code.size());
+      unsigned x = 0;
+      for (size_t i = 0; i < code.size(); ++i)
+        if (code[i] >= 'A' && code[i] <= 'Z') x ^= w[i];
+      return x != 0;
+    };
+    for (const auto& [code, e] : sample) {
+      const std::string low = lower(code);
+      if (low == code) continue;  // no upper-case letter
+      ++with_upper;
+      const bool accepted = Accepts(low);
+      refused += !accepted;
+      wrong += accepted == expect_refused(code);
+    }
+    CHECK(with_upper > 4000);
+    CHECK(wrong == 0);                       // exactly the predicted codes are accepted, none other
+    CHECK(refused * 100 > with_upper * 98);  // about 99% of the real codes with a capital are refused when lower-cased
+    // the golden codes, each lower-cased: refused (none of them is one of the unseen sets)
+    for (const char* g : {"N-iddwg", "Orjdz6c", "q-k-QhCu5", "Jnjg3w5aA", "M8SdzSwln", "RRyjQg8", "Yj4PF0PoI", "hqnptDF",
+                          "pt4SMa1", "eGazdOJ", "DZHKPrOWY", "jAwLL2p"}) {
+      CHECK(lower(g) != g && !Accepts(lower(g)));
+    }
+    // the limit, pinned: a 7-symbol code made only of capital letters lower-cases to ANOTHER valid code
+    std::string all_upper;
+    for (int tries = 0; tries < 1000 && all_upper.empty(); ++tries) {
+      std::string payload(6, 'A');
+      for (char& c : payload) c = char('A' + rng.Below(26));
+      std::string code = payload + 'A';
+      code = ModelSolveAt(code, 6);
+      if (code[6] >= 'A' && code[6] <= 'Z') all_upper = code;
+    }
+    CHECK(all_upper.size() == 7 && Accepts(all_upper));
+    CHECK(Accepts(lower(all_upper)) && lower(all_upper) != all_upper);
+  }
+
+  Group("join code: case-sensitive - one changed symbol is refused, at every position");
   for (const rules::Endpoint& e : {Ep(203, 0, 113, 7, 7203), Ep(198, 51, 100, 20, 49152)}) {
     const std::string code = rules::MakeJoinCode(e);
     for (size_t k = 0; k < code.size(); ++k) {
       std::string flipped = code;
       flipped[k] = FlipCase(flipped[k]);
       CHECK(flipped != code);
-      rules::Endpoint got = Ep(9, 9, 9, 9, 999);
-      CHECK(!rules::ParseJoinCode(flipped, &got, 7200) || !(got == e));
+      CHECK(!Accepts(flipped));
     }
   }
 
@@ -186,12 +424,12 @@ static void TestJoinCodes() {
     for (char c : code) { everywhere += c; everywhere += (c == code[0]) ? " \t" : "\r\n"; }
     back = Ep(9, 9, 9, 9, 999);
     CHECK(rules::ParseJoinCode(everywhere, &back, 7200) && back == e);
-    const rules::Endpoint e8 = Ep(198, 51, 100, 20, 49152);
-    const std::string code8 = rules::MakeJoinCode(e8);
+    const rules::Endpoint e9 = Ep(198, 51, 100, 20, 49152);
+    const std::string code9 = rules::MakeJoinCode(e9);
     back = Ep(9, 9, 9, 9, 999);
-    CHECK(rules::ParseJoinCode(" " + code8.substr(0, 4) + "\t" + code8.substr(4) + "\n", &back, 7200) && back == e8);
-    // blanks do not count toward the length: 8 symbols with blanks is still 8, 9 symbols with blanks is 9
-    CHECK(!rules::ParseJoinCode(" " + code8 + " A ", &back, 7200));
+    CHECK(rules::ParseJoinCode(" " + code9.substr(0, 4) + "\t" + code9.substr(4) + "\n", &back, 7200) && back == e9);
+    // blanks do not count toward the length: 9 symbols with blanks is still 9, 10 symbols with blanks is 10
+    CHECK(!rules::ParseJoinCode(" " + code9 + " A ", &back, 7200));
   }
 
   Group("join code: dotted addresses with the default port, with a port, with blanks");
@@ -211,30 +449,32 @@ static void TestJoinCodes() {
   CHECK(rules::ParseJoinCode("192.168.100.100:7200", &back, 7200) && back == Ep(192, 168, 100, 100, 7200));
 
   Group("join code: the same non-zero rule for the code forms (address 0.0.0.1 is valid, 0.0.0.0 is not)");
-  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x1ull << 4, 6), &back, 7200) && back == Ep(0, 0, 0, 1, 7200));
-  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x100ull << 4 | 15, 6), &back, 7200) && back == Ep(0, 0, 1, 0, 7215));
-  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x1000000ull << 4 | 5, 6), &back, 7200) && back == Ep(1, 0, 0, 0, 7205));
-  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x10000ull << 4 | 2, 6), &back, 7200) && back == Ep(0, 1, 0, 0, 7202));
-  // an 8-symbol code carries the full port even inside the range (MakeJoinCode never writes one)
-  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0xC6336414ull << 16 | 7203, 8), &back, 7200) &&
+  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x1ull << 4, 7), &back, 7200) && back == Ep(0, 0, 0, 1, 7200));
+  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x100ull << 4 | 15, 7), &back, 7200) && back == Ep(0, 0, 1, 0, 7215));
+  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x1000000ull << 4 | 5, 7), &back, 7200) && back == Ep(1, 0, 0, 0, 7205));
+  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x10000ull << 4 | 2, 7), &back, 7200) && back == Ep(0, 1, 0, 0, 7202));
+  // a 9-symbol code carries the full port even inside the range (MakeJoinCode never writes one)
+  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0xC6336414ull << 16 | 7203, 9), &back, 7200) &&
         back == Ep(198, 51, 100, 20, 7203));
-  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x1ull << 16 | 1, 8), &back, 7200) && back == Ep(0, 0, 0, 1, 1));
+  CHECK(rules::ParseJoinCode(rules::JoinCodeTextOf(0x1ull << 16 | 1, 9), &back, 7200) && back == Ep(0, 0, 0, 1, 1));
 
-  Group("join code: rejections");
+  Group("join code: rejections, and the entry field's text");
   {
     const rules::Endpoint sentinel = Ep(9, 9, 9, 9, 999);
-    const std::string good6 = rules::MakeJoinCode(Ep(203, 0, 113, 7, 7203));
-    const std::string good8 = rules::MakeJoinCode(Ep(198, 51, 100, 20, 49152));
+    const std::string good7 = rules::MakeJoinCode(Ep(203, 0, 113, 7, 7203));
+    const std::string good9 = rules::MakeJoinCode(Ep(198, 51, 100, 20, 49152));
     const std::string rejects[] = {
-        good6.substr(0, 5),                    // 5 symbols
-        good6 + "A",                           // 7
-        good8 + "A",                           // 9
+        good7.substr(0, 6),                    // the payload alone: the old 6-symbol form
+        good7.substr(0, 5),                    // 5 symbols
+        good7 + "A",                           // 8
+        good9.substr(0, 8),                    // the payload alone: the old 8-symbol form
+        good9 + "A",                           // 10
         std::string(40, 'A'),                  // far too long
-        "ywB!Bz",                              // not in the alphabet
-        "ywB+Bz", "ywB/Bz", "ywB=Bz",          // standard base64 symbols are not in the URL-safe alphabet
-        std::string("ywB") + char(0xE9) + "Bz",  // a high byte (a signed-char table index would be negative)
-        std::string("ywB") + char(0xFF) + "Bz",
-        std::string("ywB") + '\0' + "Bz",      // an embedded NUL is not a symbol
+        "ywB!BzA",                             // not in the alphabet
+        "ywB+BzA", "ywB/BzA", "ywB=BzA",       // standard base64 symbols are not in the URL-safe alphabet
+        std::string("ywB") + char(0xE9) + "BzA",  // a high byte (a signed-char table index would be negative)
+        std::string("ywB") + char(0xFF) + "BzA",
+        std::string("ywB") + '\0' + "BzA",     // an embedded NUL is not a symbol
         "",                                    // nothing
         "  \r\n",                              // blanks only
         "192.168.1.5:0",                       // port 0
@@ -256,21 +496,31 @@ static void TestJoinCodes() {
         "1.2.3.4.5",                           // five
         "1..3.4", ".1.2.3", "1.2.3.",          // empty octets
         "-1.2.3.4",
-        rules::JoinCodeTextOf(0, 6),                         // a code of 0.0.0.0
-        rules::JoinCodeTextOf(0x5ull, 6),                    // 0.0.0.0, port index 5
-        rules::JoinCodeTextOf(0x01020304ull << 16, 8),       // a code of port 0
-        rules::JoinCodeTextOf(0, 8),                         // 0.0.0.0 and port 0
-        rules::JoinCodeTextOf(0x1ull << 16, 8),              // 0.0.0.1, port 0
+        rules::JoinCodeTextOf(0, 7),                         // a code (valid check) of 0.0.0.0
+        rules::JoinCodeTextOf(0x5ull, 7),                    // 0.0.0.0, port index 5
+        rules::JoinCodeTextOf(0x01020304ull << 16, 9),       // a code of port 0
+        rules::JoinCodeTextOf(0, 9),                         // 0.0.0.0 and port 0
+        rules::JoinCodeTextOf(0x1ull << 16, 9),              // 0.0.0.1, port 0
     };
     for (const std::string& r : rejects) {
       rules::Endpoint got = sentinel;
       CHECK(!rules::ParseJoinCode(r, &got, 7200));
       CHECK(got == sentinel);  // a refused text leaves the caller's endpoint as it was
     }
+    // a VALID code with the high bit set on one symbol: a lookup that masks each byte to 7 bits would take it for the
+    // original code (the check symbol no longer catches that, so it needs its own check)
+    for (const std::string& code : {good7, good9}) {
+      for (size_t k = 0; k < code.size(); ++k) {
+        std::string t = code;
+        t[k] = char(uint8_t(t[k]) | 0x80);
+        CHECK(!Accepts(t));
+      }
+    }
     CHECK(!rules::ParseJoinCode("192.168.1.5", &back, 0));  // no default port: nothing to connect to
     CHECK(!rules::ParseJoinCode("1.2.3.4", nullptr, 7200));
     CHECK(!rules::ParseJoinCode(std::string_view(), &back, 7200));
-    CHECK(rules::ParseJoinCode(good6, nullptr, 7200) == false);
+    CHECK(rules::ParseJoinCode(good7, nullptr, 7200) == false);
+    CHECK(std::string(rules::kBadCodeText) == "That code doesn't look right - check it (capital letters matter)");
   }
 
   Group("join code: EndpointText");
@@ -488,6 +738,25 @@ static void TestStun() {
     Bytes v6 = {0, 2, 0xE9, 0x30};
     v6.insert(v6.end(), 16, 0x11);
     StunRefused(StunMsg(0x0101, kTid, {{0x0020, v6}}), kTid, __LINE__);
+    // a mapped address nobody can use: port 0 or 0.0.0.0, in either attribute kind (fix round 1)
+    for (const rules::Endpoint& z : {Ep(203, 0, 113, 7, 0), Ep(0, 0, 0, 0, 51234), Ep(0, 0, 0, 0, 0)}) {
+      StunRefused(StunMsg(0x0101, kTid, {{0x0020, XorMapped(z)}}), kTid, __LINE__);
+      StunRefused(StunMsg(0x0101, kTid, {{0x0001, Mapped(z)}}), kTid, __LINE__);
+    }
+    // the XOR attribute is the one used: a zero XOR answer is refused even beside a usable MAPPED one
+    StunRefused(StunMsg(0x0101, kTid, {{0x0020, XorMapped(Ep(0, 0, 0, 0, 0))}, {0x0001, Mapped(e)}}), kTid, __LINE__);
+    // the nearest usable answers are accepted (controls: every octet alone non-zero, the smallest port)
+    for (const rules::Endpoint& u : {Ep(203, 0, 113, 7, 1), Ep(0, 0, 0, 1, 51234), Ep(0, 0, 1, 0, 51234),
+                                     Ep(0, 1, 0, 0, 51234), Ep(1, 0, 0, 0, 51234)}) {
+      rules::Endpoint got;
+      CHECK(rules::StunMapped(S(StunMsg(0x0101, kTid, {{0x0020, XorMapped(u)}})), kTid, &got) && got == u);
+      got = Ep(9, 9, 9, 9, 999);
+      CHECK(rules::StunMapped(S(StunMsg(0x0101, kTid, {{0x0001, Mapped(u)}})), kTid, &got) && got == u);
+    }
+    {  // a zero MAPPED-ADDRESS beside a usable XOR one does not matter: the XOR one wins
+      rules::Endpoint got;
+      CHECK(rules::StunMapped(S(StunMsg(0x0101, kTid, {{0x0001, Mapped(Ep(0, 0, 0, 0, 0))}, {0x0020, XorMapped(e)}})), kTid, &got) && got == e);
+    }
     {  // two stray bytes after the last attribute, counted in the message length: not a whole attribute header
       Bytes c = good;
       c.insert(c.end(), {0x00, 0x00});
@@ -534,7 +803,9 @@ static void TestNat() {
   CHECK(std::string(rules::NatNote(rules::Nat::kSymmetric)) ==
         "Your network changes ports per destination (symmetric NAT): players outside it may not reach you");
   {
-    const std::string base = "A direct connection is not possible between your networks; relay arrives with lobbies.";
+    // the brief's sentence, then the ask to check the code (fix round 1), then the symmetric-NAT note when it applies
+    const std::string base = "A direct connection is not possible between your networks; relay arrives with lobbies."
+                             " Also check the code you entered (capital letters matter).";
     CHECK(rules::ConnectTimeoutText(rules::Nat::kCone) == base);
     CHECK(rules::ConnectTimeoutText(rules::Nat::kSymmetric) == base + " (Your network changes ports per destination.)");
     CHECK(rules::ConnectTimeoutText(rules::Nat::kNoAnswer) == base);   // the suffix is for a symmetric NAT only
@@ -556,7 +827,7 @@ static void TestDelayPacer() {
   CHECK(rules::DelayFromRtt(101) == 5);  // 502,696
   CHECK(rules::DelayFromRtt(200) == 7);  // 799,399
   CHECK(rules::DelayFromRtt(201) == 8);  // 802,396
-  CHECK(rules::DelayFromRtt(266) == 8);  // formula 9 (997,201), clamped; retail's 10 starts at 267 (1,000,198)
+  CHECK(rules::DelayFromRtt(266) == 8);  // retail: >= 266 ms -> 10 (doa4_own_online.md:81); the formula gives 9 here, 10 from 267; clamped
   CHECK(rules::DelayFromRtt(-1) == 8);   // no measurement: retail's "no QoS -> 10", clamped (F20c; Start needs 4 samples)
 
   Group("DelayFromRtt: every step edge of the formula, both sides (from the model script)");
@@ -1055,10 +1326,11 @@ static void TestJudge() {
                                     rules::Judge(Id(0, "netplay-v1.0.5", kFiles), Id(0, "netplay-v1.0.5", kFiles), false),
                                     rules::Judge(Id(0, "dev", kFiles), host, false),
                                     rules::Judge(host, Id(0, "dev", kFiles), false)}) {
-      CHECK(v.refusal == R::kBuild && Has(v.text, "build could not be identified"));
+      CHECK(v.refusal == R::kBuild &&
+            Has(v.text, "One game could not read its own build - reinstall it from the newest release"));  // names a remedy
     }
     // a refusal for a differing build is not worded as an unreadable one
-    CHECK(!Has(rules::Judge(host, Id(host.build + 1, "netplay-v1.0.6", kFiles), false).text, "could not be identified"));
+    CHECK(!Has(rules::Judge(host, Id(host.build + 1, "netplay-v1.0.6", kFiles), false).text, "could not read its own build"));
     CHECK(rules::Judge(Id(1, "dev", kFiles), Id(1, "dev", kFiles), false).refusal == R::kNone);  // build 1 is a build
     CHECK(rules::Judge(Id(~0ull, "dev", kFiles), Id(~0ull, "dev", kFiles), false).refusal == R::kNone);
   }
@@ -1070,6 +1342,26 @@ static void TestJudge() {
     CHECK(v.refusal == R::kFiles && Has(v.text, "stg.afs") && !Has(v.text, "snd.afs"));
     CHECK(rules::Judge(a, host, false).refusal == R::kFiles);
     CHECK(rules::Judge(host, a, false).refusal == R::kFiles);
+  }
+
+  Group("Judge: a files text with no group at all (the files could not be read) agrees with nothing, itself included");
+  {
+    const char* empties[] = {"", "\n", "\n\n"};
+    for (const char* empty : empties) {
+      const rules::Verdict h = rules::Judge(Id(host.build, "netplay-v1.0.5", empty), host, false);
+      CHECK(h.refusal == R::kFiles && Has(h.text, "The game files could not be read on the host") && !Has(h.text, "joiner"));
+      const rules::Verdict j = rules::Judge(host, Id(host.build, "netplay-v1.0.5", empty), false);
+      CHECK(j.refusal == R::kFiles && Has(j.text, "The game files could not be read on the joiner") && !Has(j.text, "the host"));
+      const rules::Verdict b = rules::Judge(Id(host.build, "netplay-v1.0.5", empty), Id(host.build, "netplay-v1.0.5", empty), false);
+      CHECK(b.refusal == R::kFiles && Has(b.text, "The game files could not be read on either side"));
+      // the earlier rules still come first: busy, an unreadable build, a differing build
+      CHECK(rules::Judge(Id(host.build, "netplay-v1.0.5", empty), host, true).refusal == R::kBusy);
+      CHECK(rules::Judge(Id(0, "netplay-v1.0.5", empty), host, false).refusal == R::kBuild);
+      CHECK(rules::Judge(Id(host.build, "netplay-v1.0.5", empty), Id(host.build + 1, "netplay-v1.0.6", kFiles), false).refusal == R::kBuild);
+    }
+    // a line that is not blank is a group, even a bare "a=": that text is not unreadable
+    CHECK(rules::Judge(Id(host.build, "netplay-v1.0.5", "a=\n"), Id(host.build, "netplay-v1.0.5", "a=\n"), false).refusal == R::kNone);
+    CHECK(rules::Judge(host, host, false).refusal == R::kNone);  // the control: a readable pair agrees
   }
 
   Group("Judge: the verdict values are the wire's refusal codes");

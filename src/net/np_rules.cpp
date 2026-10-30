@@ -53,6 +53,87 @@ int SymbolIndex(char c) {
 
 bool AllZero(const std::array<uint8_t, 4>& ip) { return (ip[0] | ip[1] | ip[2] | ip[3]) == 0; }
 
+// ---- the check symbol (fix round 1, R23) ----
+// A code is the payload (6 or 8 symbols, as above) plus ONE check symbol, so 7 or 9 symbols. With x_0..x_n the symbols
+// (x_n the check) and phi a bijection on the symbol values, a code is valid iff, in GF(2^6) (x^6 + x + 1, addition is
+// XOR), the sum over i of w_i * phi(x_i) is 0. The weights are nonzero and each differs from the next one. Then:
+//  - a substitution at position i changes the sum by w_i * (phi(a) ^ phi(b)), which is not 0 (a field has no zero
+//    divisors, phi is injective, w_i != 0): EVERY single-symbol substitution is detected, in the payload or the check;
+//  - an adjacent swap of a and b at i, i+1 changes it by (w_i ^ w_(i+1)) * (phi(a) ^ phi(b)), not 0 for a != b: EVERY
+//    adjacent transposition is detected, including the last payload symbol with the check symbol.
+// Neither claim depends on the other symbols, so checking every (position, a, b) is checking every code
+// (tests/host does it through the public functions, and a model script did it for the whole table).
+// phi sends the lower-case counterpart of each upper-case letter to phi ^ 32 (phi(upper k) = k, phi(lower k) = 32 + k,
+// digits and - _ fill the rest). Lower-casing a code then adds 32 * (xor of the weights at its upper-case positions)
+// to the sum, so it is refused unless those weights xor to 0 - with weights 1,2,4,8,16,32,63 (7 symbols) only when ALL
+// 7 symbols are upper-case letters, with 1,2,4,8,16,32,7,56,11 (9 symbols) only for 7 position sets of size >= 4. One
+// 6-bit check cannot refuse every multi-symbol change; this one refuses every single-symbol one and nearly every case fold.
+constexpr unsigned kGfPoly = 0x43;
+
+constexpr unsigned GfMul(unsigned a, unsigned b) {
+  unsigned r = 0;
+  for (int i = 0; i < 6; ++i) {
+    if ((b >> i) & 1u) r ^= a;
+    a <<= 1;
+    if (a & 0x40u) a ^= kGfPoly;
+  }
+  return r;
+}
+constexpr unsigned GfInv(unsigned a) {
+  for (unsigned b = 1; b < 64; ++b)
+    if (GfMul(a, b) == 1) return b;
+  return 0;
+}
+
+constexpr unsigned Phi(unsigned i) {  // symbol index -> value in GF(2^6); a bijection
+  if (i < 26) return i;               // A-Z
+  if (i < 52) return i + 6;           // a-z: 32 + k, the upper-case value ^ 32
+  if (i < 58) return i - 26;          // 0-5: 26..31
+  return i;                           // 6-9 - _: 58..63
+}
+constexpr unsigned PhiInv(unsigned v) {
+  if (v < 26) return v;
+  if (v < 32) return v + 26;
+  if (v < 58) return v - 6;
+  return v;
+}
+
+constexpr uint8_t kWeights7[7] = {1, 2, 4, 8, 16, 32, 63};          // 6 payload symbols + check
+constexpr uint8_t kWeights9[9] = {1, 2, 4, 8, 16, 32, 7, 56, 11};   // 8 payload symbols + check
+
+constexpr bool SchemeIsSound() {
+  for (unsigned i = 0; i < 64; ++i) {
+    if (PhiInv(Phi(i)) != i || Phi(i) >= 64) return false;
+    if (i < 26 && Phi(i + 26) != (Phi(i) ^ 32u)) return false;
+  }
+  for (size_t i = 0; i < 7; ++i)
+    if (kWeights7[i] == 0 || (i + 1 < 7 && kWeights7[i] == kWeights7[i + 1])) return false;
+  for (size_t i = 0; i < 9; ++i)
+    if (kWeights9[i] == 0 || (i + 1 < 9 && kWeights9[i] == kWeights9[i + 1])) return false;
+  for (unsigned a = 1; a < 64; ++a)
+    if (GfMul(a, GfInv(a)) != 1) return false;
+  return true;
+}
+static_assert(SchemeIsSound());
+
+const uint8_t* WeightsOf(size_t symbols) { return symbols == 7 ? kWeights7 : kWeights9; }
+
+// The check symbol's index for the payload symbol indices idx[0..payload).
+unsigned CheckIndexOf(const unsigned* idx, size_t payload) {
+  const uint8_t* w = WeightsOf(payload + 1);
+  unsigned sum = 0;
+  for (size_t i = 0; i < payload; ++i) sum ^= GfMul(w[i], Phi(idx[i]));
+  return PhiInv(GfMul(GfInv(w[payload]), sum));
+}
+
+// Whether the symbol indices idx[0..symbols) (check last) are a valid code.
+bool CheckHolds(const unsigned* idx, size_t symbols) {
+  const uint8_t* w = WeightsOf(symbols);
+  unsigned sum = 0;
+  for (size_t i = 0; i < symbols; ++i) sum ^= GfMul(w[i], Phi(idx[i]));
+  return sum == 0;
+}
+
 // Four decimal groups of 1-3 digits (each <= 255) separated by dots, from s[*pos]; *pos moves past the last digit.
 bool ParseIpv4(std::string_view s, size_t* pos, std::array<uint8_t, 4>* ip) {
   size_t i = *pos;
@@ -178,13 +259,17 @@ std::map<std::string, std::string> ParseGroups(std::string_view text) {
 // =====================================================================================================
 
 std::string JoinCodeTextOf(uint64_t packed, int symbols) {
-  if (symbols != 6 && symbols != 8) return {};
-  packed = Scramble(packed, symbols * 6, true);
-  std::string out(size_t(symbols), ' ');
-  for (int i = symbols - 1; i >= 0; --i) {
-    out[size_t(i)] = kAlphabet[size_t(packed & 63)];
+  if (symbols != 7 && symbols != 9) return {};
+  const size_t payload = size_t(symbols) - 1;  // the packed value's symbols; the last one is the check symbol
+  packed = Scramble(packed, int(payload) * 6, true);
+  unsigned idx[8];
+  for (size_t i = payload; i-- > 0;) {
+    idx[i] = unsigned(packed & 63);
     packed >>= 6;
   }
+  std::string out(size_t(symbols), ' ');
+  for (size_t i = 0; i < payload; ++i) out[i] = kAlphabet[idx[i]];
+  out[payload] = kAlphabet[CheckIndexOf(idx, payload)];
   return out;
 }
 
@@ -192,8 +277,8 @@ std::string MakeJoinCode(const Endpoint& ep) {
   if (ep.port == 0) return {};
   uint64_t v = 0;
   for (uint8_t b : ep.ip) v = (v << 8) | b;
-  if (ep.port >= kPortBase && ep.port < kPortBase + kPorts) return JoinCodeTextOf((v << 4) | uint64_t(ep.port - kPortBase), 6);
-  return JoinCodeTextOf((v << 16) | ep.port, 8);
+  if (ep.port >= kPortBase && ep.port < kPortBase + kPorts) return JoinCodeTextOf((v << 4) | uint64_t(ep.port - kPortBase), 7);
+  return JoinCodeTextOf((v << 16) | ep.port, 9);
 }
 
 bool ParseJoinCode(std::string_view text, Endpoint* out, uint16_t default_port) {
@@ -222,23 +307,26 @@ bool ParseJoinCode(std::string_view text, Endpoint* out, uint16_t default_port) 
       return true;
     }
   }
-  char clean[8];
+  char clean[9];
   size_t n = 0;
   for (; i < text.size(); ++i) {
     if (IsBlank(text[i])) continue;
-    if (n >= 8) return false;
+    if (n >= 9) return false;
     clean[n++] = text[i];
   }
-  if (n != 6 && n != 8) return false;
-  uint64_t v = 0;
+  if (n != 7 && n != 9) return false;  // a code is 6 or 8 payload symbols and the check symbol
+  unsigned idx[9];
   for (size_t k = 0; k < n; ++k) {
-    const int idx = SymbolIndex(clean[k]);
-    if (idx < 0) return false;
-    v = (v << 6) | uint64_t(idx);
+    const int at = SymbolIndex(clean[k]);
+    if (at < 0) return false;
+    idx[k] = unsigned(at);
   }
-  v = Scramble(v, int(n) * 6, false);
+  if (!CheckHolds(idx, n)) return false;  // a typo, a swap, a changed letter case
+  uint64_t v = 0;
+  for (size_t k = 0; k + 1 < n; ++k) v = (v << 6) | idx[k];
+  v = Scramble(v, int(n - 1) * 6, false);
   Endpoint ep;
-  if (n == 6) {
+  if (n == 7) {
     ep.port = uint16_t(kPortBase + unsigned(v & 15));
     v >>= 4;
   } else {
@@ -305,9 +393,12 @@ bool StunMapped(std::span<const uint8_t> r, const std::array<uint8_t, 12>& trans
     }
     p = v + ((len + 3) & ~size_t(3));  // values are padded to a multiple of 4
   }
-  if (have_xored) *mapped = xored;
-  else if (have_plain) *mapped = plain;
+  Endpoint chosen;
+  if (have_xored) chosen = xored;
+  else if (have_plain) chosen = plain;
   else return false;
+  if (chosen.port == 0 || AllZero(chosen.ip)) return false;  // no usable address (a NAT or server that answers zeros)
+  *mapped = chosen;
   return true;
 }
 
@@ -332,6 +423,7 @@ const char* NatNote(Nat nat) {
 
 std::string ConnectTimeoutText(Nat nat) {
   std::string text = "A direct connection is not possible between your networks; relay arrives with lobbies.";
+  text += " Also check the code you entered (capital letters matter).";  // a mistyped code can still be someone's code
   if (nat == Nat::kSymmetric) text += " (Your network changes ports per destination.)";
   return text;
 }
@@ -344,6 +436,7 @@ int DelayFromRtt(int rtt_ms) {
   long long frames;
   if (rtt_ms < 0) frames = 10;  // retail: no QoS measurement -> 10
   else if (rtt_ms <= 33) frames = 2;
+  // retail also says >= 266 ms -> 10; that, like the formula's 9 at 266 and 10 from 267, lies above the clamp
   else frames = (static_cast<long long>(rtt_ms) * 2997 + 199999) / 100000;
   return int(std::clamp(frames, 1LL, 8LL));
 }
@@ -501,12 +594,20 @@ Verdict Judge(const Identity& host, const Identity& joiner, bool host_busy) {
   }
   if (host.build == 0 || joiner.build == 0) {
     v.refusal = wire::Refusal::kBuild;
-    v.text = "This game's build could not be identified, so it cannot be matched against the other player's.";
+    v.text = "One game could not read its own build - reinstall it from the newest release.";
     return v;
   }
   if (host.build != joiner.build) {
     v.refusal = wire::Refusal::kBuild;
     v.text = MismatchAdvice(host.release, joiner.release);
+    return v;
+  }
+  // A fingerprint with no group at all means the files could not be read: that side agrees with nothing.
+  const bool host_unread = ParseGroups(host.files).empty(), joiner_unread = ParseGroups(joiner.files).empty();
+  if (host_unread || joiner_unread) {
+    v.refusal = wire::Refusal::kFiles;
+    v.text = std::string("The game files could not be read on ") +
+             (host_unread && joiner_unread ? "either side" : host_unread ? "the host" : "the joiner") + ".";
     return v;
   }
   const std::vector<std::string> groups = DifferingGroups(host.files, joiner.files);
