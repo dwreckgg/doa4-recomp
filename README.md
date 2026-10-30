@@ -104,7 +104,7 @@ When you are done, `C:\Games\DOA4` contains exactly two things: `setup.bat` and 
 | The game says the disc image is the wrong version | You need the USA / Europe Rev 1 disc image. Other regions and versions do not work. |
 | An error about the folder or its name | Move the game folder to a simple place such as `C:\Games\DOA4` (plain letters, numbers and spaces only) and run `setup.bat` from there. |
 | "Not enough space" | Free up space (about 20 GB in total), then click **Install** again. |
-| Anything else | In the launcher, click **Open logs**. Send the newest log file to the person helping you, or attach it to an issue on this page. |
+| Anything else | If **Install** stopped with an error, open the folder `launcher\logs` inside your game folder (for example `C:\Games\DOA4\launcher\logs`) and send the newest file in it. If the game itself has a problem, click **Open logs** in the launcher and send the newest file there. Send it to the person helping you, or attach it to an issue on this page. |
 
 ### Taking part in an online test
 
