@@ -322,6 +322,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     drawer_ = drawer;
     running_scale_ = rex::cvar::Query<int32_t>("resolution_scale");
     saved_scale_ = running_scale_;
+    running_speakers_ = rex::cvar::Query<std::string>("audio_speakers");
+    saved_speakers_ = running_speakers_;
     REXLOG_INFO("[doa4][UI] resolution_scale {} fullscreen {} swap_post_effect {} "
                 "anisotropic_override {}",
                 running_scale_, rex::cvar::Query<bool>("fullscreen"),
@@ -525,6 +527,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.config_path = rex::filesystem::GetExecutableFolder() / (GetName() + ".toml");
     host.running_scale = running_scale_;
     host.saved_scale = &saved_scale_;
+    host.running_speakers = running_speakers_;
+    host.saved_speakers = &saved_speakers_;
     host.input = [this]() -> rex::input::InputSystem* {
       rex::Runtime* rt = runtime();
       return rt ? dynamic_cast<rex::input::InputSystem*>(rt->input_system()) : nullptr;
@@ -590,6 +594,8 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::atomic<bool> menu_open_{false};
   rex::ui::ImGuiDrawer* drawer_ = nullptr;
   int running_scale_ = 1;
+  std::string running_speakers_ = "auto";  // audio_speakers at start (read once by the driver)
+  std::string saved_speakers_ = "auto";     // what the menu last saved for the next start
   int saved_scale_ = 1;  // what the menu last saved for the next start
   // Extras tab (doa4_unlocks.h, doa4_tweaks.h): set up at OnPostLoadXexImage.
   doa4::GuestBytes guest_;
