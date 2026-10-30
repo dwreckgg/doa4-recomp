@@ -8,7 +8,8 @@ TerminateProcess, which never runs the application's shutdown hook).
 
 EXE is a snapshot from tools/np_build.bat (np_bin/<tag>/dead_or_alive_4.exe); NAME is a new folder under
 RUNS. The run copies the pristine save, uses the shared shader cache, and only the process started here is
-ended (never another game process).
+ended (never another game process). The game gets SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000 (SDL
+opens no real controller) unless this script's own environment already sets that variable.
 """
 import os
 import shutil
@@ -20,26 +21,46 @@ RUNS = r"C:/Users/fsop1/doa4/np_runs"
 PRISTINE = r"C:/Users/fsop1/doa4/np_phase0/ud_pristine"
 CACHE = r"C:/Users/fsop1/doa4/np_runs/cache_shared"
 GAME = r"C:\Users\fsop1\doa4\xex\DOA4"
+RUN_SECONDS = 95  # how long the game runs before this script ends it (the tools test shortens it)
 
-if len(sys.argv) != 3:
-    sys.exit(__doc__)
-exe, name = sys.argv[1], sys.argv[2]
-run = os.path.join(RUNS, name)
-os.makedirs(run)  # refuses an existing run folder
-ud = os.path.join(run, "ud")
-shutil.copytree(PRISTINE, ud)
-photos = os.path.join(run, "photos")
-env = {k: v for k, v in os.environ.items() if not k.startswith("DOA4_")}
-env["DOA4_PHOTO_TEST"] = "hotkey"
-args = [exe, f"--game_data_root={GAME}", f"--user_data_root={ud}",
-        f"--cache_path={CACHE}", f"--log_file={os.path.join(run, 'game.log')}",
-        f"--doa4_photo_dir={photos}", "--doa4_photo_format=png_full"]
-p = subprocess.Popen(args, env=env, cwd=os.path.dirname(exe), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-print("pid", p.pid, flush=True)
-time.sleep(95)
-p.terminate()
-p.wait()
-print("photos:", sorted(os.listdir(photos)) if os.path.isdir(photos) else "none")
-log = open(os.path.join(run, "game.log"), encoding="utf-8", errors="replace").read()
-print("[NP] lines:", log.count("[doa4][NP]"), "| movie skipped lines:", log.count("skipped at frame"))
-print("startup and attract play only; shutdown is not exercised (the run ends with TerminateProcess)")
+# The runtime opens the host's game controllers through SDL even without a session, and a game running
+# unattended would read the user's pad (a pad in use in another game took the attract demo into the menus). This
+# allow-list matches no device, so SDL opens none. Same value and rule as np_run.py's SDL_PADS: set unless the
+# caller's own environment already has the variable.
+SDL_PADS = ("SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT", "0x0000/0x0000")
+
+
+def child_env(environ):
+    """The game's environment: the caller's without its DOA4_ variables, the photo test on, no real controller."""
+    env = {k: v for k, v in environ.items() if not k.startswith("DOA4_")}
+    env["DOA4_PHOTO_TEST"] = "hotkey"
+    env.setdefault(*SDL_PADS)
+    return env
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.exit(__doc__)
+    exe, name = argv[1], argv[2]
+    run = os.path.join(RUNS, name)
+    os.makedirs(run)  # refuses an existing run folder
+    ud = os.path.join(run, "ud")
+    shutil.copytree(PRISTINE, ud)
+    photos = os.path.join(run, "photos")
+    env = child_env(os.environ)
+    args = [exe, f"--game_data_root={GAME}", f"--user_data_root={ud}",
+            f"--cache_path={CACHE}", f"--log_file={os.path.join(run, 'game.log')}",
+            f"--doa4_photo_dir={photos}", "--doa4_photo_format=png_full"]
+    p = subprocess.Popen(args, env=env, cwd=os.path.dirname(exe), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("pid", p.pid, flush=True)
+    time.sleep(RUN_SECONDS)
+    p.terminate()
+    p.wait()
+    print("photos:", sorted(os.listdir(photos)) if os.path.isdir(photos) else "none")
+    log = open(os.path.join(run, "game.log"), encoding="utf-8", errors="replace").read()
+    print("[NP] lines:", log.count("[doa4][NP]"), "| movie skipped lines:", log.count("skipped at frame"))
+    print("startup and attract play only; shutdown is not exercised (the run ends with TerminateProcess)")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

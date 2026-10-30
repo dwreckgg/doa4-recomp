@@ -2,7 +2,9 @@
 
   py -3 -I tests/tools/test_np_tools.py
 """
+import contextlib
 import importlib.util
+import io
 import os
 import re
 import shutil
@@ -688,6 +690,59 @@ def test_np_run_sdl_pads(root):
     check(got == "0x045E/0x02EA", f"np_run: --env {var}=... is kept: {got!r}")
     got, code = seen("pads_inherited", **{var: "0x1234/0x5678"})
     check(got == "0x1234/0x5678", f"np_run: {var} in np_run's own environment is kept: {got!r}")
+
+
+def test_np_offline_check_sdl_pads(root):
+    # Task 11b (11c review minor 1): np_offline_check.py starts the game like np_run.py does, with
+    # SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000 (SDL opens no real controller) unless the caller's own
+    # environment already has the variable. Checked on the function that builds the game's environment, and through
+    # main() with a stand-in game that logs the variable it was started with (the wiring).
+    mod = load("np_offline_check")
+    var = "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT"
+    check(var not in os.environ, f"the suite runs without {var} in its environment (else the default is untested)")
+    env = mod.child_env({"PATH": "p", "DOA4_NP": "record", "KEEP_ME": "1"})
+    check(env.get(var) == "0x0000/0x0000", f"child_env: the default is 0x0000/0x0000: {env.get(var)!r}")
+    check(env.get("KEEP_ME") == "1" and env.get("PATH") == "p", "child_env keeps the caller's other variables")
+    check("DOA4_NP" not in env and env.get("DOA4_PHOTO_TEST") == "hotkey", "child_env: DOA4_ variables out, photo test on")
+    env = mod.child_env({var: "0x1234/0x5678"})
+    check(env.get(var) == "0x1234/0x5678", f"child_env: the caller's {var} is kept: {env.get(var)!r}")
+    check(mod.child_env({}).get(var) == "0x0000/0x0000", "child_env: an empty environment gets the default")
+
+    ud = make_userdata(root)
+    runs = os.path.join(root, "runs")
+    os.makedirs(runs)
+    fake_exe = os.path.join(HERE, "fake_offline_game.cmd")
+
+    def started_with(name, **environ):
+        """The variable's value in the log of the stand-in game that main() started, plus the other two lines."""
+        saved = {k: os.environ.get(k) for k in ("FAKE_GAME_PYTHON", var, "DOA4_NP")}
+        old = (mod.RUNS, mod.PRISTINE, mod.CACHE, mod.GAME, mod.RUN_SECONDS)
+        try:
+            os.environ["FAKE_GAME_PYTHON"] = sys.executable
+            for k in (var, "DOA4_NP"):
+                os.environ.pop(k, None)
+            os.environ.update(environ)
+            mod.RUNS, mod.PRISTINE, mod.CACHE, mod.GAME, mod.RUN_SECONDS = runs, ud, os.path.join(root, "cache"), root, 1
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.main(["np_offline_check.py", fake_exe, name])
+        finally:
+            (mod.RUNS, mod.PRISTINE, mod.CACHE, mod.GAME, mod.RUN_SECONDS) = old
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        path = os.path.join(runs, name, "game.log")
+        text = open(path).read() if os.path.exists(path) else ""
+        got = {m.group(1): m.group(2) for m in re.finditer(r"^stand-in offline game: (\w+)=(.*)$", text, re.M)}
+        return got
+
+    got = started_with("offline_default")
+    check(got.get(var) == "0x0000/0x0000", f"np_offline_check: the game gets {var}=0x0000/0x0000 by default: {got!r}")
+    check(got.get("DOA4_PHOTO_TEST") == "hotkey", f"np_offline_check: the photo test is on: {got!r}")
+    got = started_with("offline_caller", **{var: "0x1234/0x5678", "DOA4_NP": "record"})
+    check(got.get(var) == "0x1234/0x5678", f"np_offline_check: the caller's {var} is kept: {got!r}")
+    check(got.get("DOA4_NP") == "(unset)", f"np_offline_check: no DOA4_NP reaches the offline game: {got!r}")
 
 
 def test_np_run_exit_status(root):

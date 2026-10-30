@@ -8,8 +8,18 @@
 // mode plus a combined hash. Two PCs that print the same combined hash computed
 // identical bits; if they differ, the per-class lines say where.
 //
+// The raw DPPS hashes differ between an AMD and an Intel core in the NaN-input
+// class (the two CPUs return different NaN payloads). The SDK therefore makes every
+// dot product return one canonical NaN (0xFFC00000), and this program also hashes
+// the canonicalised results, computed through the SDK's own function (included
+// from <rex/ppc/dot_product.h>, not copied): two PCs must print the same
+// "DPPS canonical hash" even where the raw "DPPS combined hash" differs.
+//
 // Built by run_dpps_test.bat with the game's CPU level (-march=x86-64-v3, so the
-// compiler emits VEX vdpps as the game does). No SDK headers.
+// compiler emits VEX vdpps as the game does). The only SDK header is
+// <rex/ppc/dot_product.h> (and simde's, which it includes).
+
+#include <rex/ppc/dot_product.h>
 
 #include <immintrin.h>
 
@@ -111,7 +121,14 @@ bool SameBits(float x, float y) {
 
 struct Counts {
   uint64_t nans = 0, tree_diff = 0, chain_diff = 0;
+  // The canonicalised run (same pairs): its hash, the lanes that are not a canonical NaN where the
+  // raw lane is a NaN, and the lanes where the game's redirected simde_mm_dp_ps differs from the
+  // SDK function applied to the raw result.
+  uint64_t canon_hash = 0xCBF29CE484222325ull;
+  uint64_t canon_not_canonical = 0, redirect_diff = 0, canon_changed_lanes = 0;
 };
+
+constexpr uint32_t kCanonicalNaN = 0xFFC00000u;
 
 // Kept out of line so the optimiser cannot fold or reorder the DPPS calls
 // across the MXCSR change.
@@ -132,6 +149,21 @@ __declspec(noinline) uint64_t RunClass(int cls, uint32_t mxcsr, Counts* counts) 
       h = Fnv(h, Bits(o1[k]));
       h = Fnv(h, Bits(o2[k]));
       counts->nans += std::isnan(o1[k]) + std::isnan(o2[k]);
+    }
+    // The canonicalised results of the same pairs: the SDK function over the raw results, and the
+    // game's own call shape (simde_mm_dp_ps, redirected by the SDK header) as a cross-check.
+    alignas(16) float c1[4], c2[4], g1[4], g2[4];
+    simde_mm_store_ps(c1, rex::ppc::CanonicalizeDotProductNaN(simde_mm_load_ps(o1)));
+    simde_mm_store_ps(c2, rex::ppc::CanonicalizeDotProductNaN(simde_mm_load_ps(o2)));
+    simde_mm_store_ps(g1, simde_mm_dp_ps(simde_mm_load_ps(a), simde_mm_load_ps(b), 0xEF));
+    simde_mm_store_ps(g2, simde_mm_dp_ps(simde_mm_load_ps(a), simde_mm_load_ps(b), 0xFF));
+    for (int k = 0; k < 4; ++k) {
+      counts->canon_hash = Fnv(counts->canon_hash, Bits(c1[k]));
+      counts->canon_hash = Fnv(counts->canon_hash, Bits(c2[k]));
+      counts->canon_not_canonical += (std::isnan(o1[k]) && Bits(c1[k]) != kCanonicalNaN) +
+                                     (std::isnan(o2[k]) && Bits(c2[k]) != kCanonicalNaN);
+      counts->canon_changed_lanes += (Bits(c1[k]) != Bits(o1[k])) + (Bits(c2[k]) != Bits(o2[k]));
+      counts->redirect_diff += (Bits(g1[k]) != Bits(c1[k])) + (Bits(g2[k]) != Bits(c2[k]));
     }
     counts->tree_diff += !SameBits(o1[0], Model(a, b, false, kTree)) +
                          !SameBits(o2[0], Model(a, b, true, kTree));
@@ -160,8 +192,12 @@ int main() {
     uint32_t mxcsr;
   } kModes[] = {{"default", 0x1F80}, {"ftz_daz", 0x1F80 | 0x8000 | 0x0040}};
   uint64_t all = 0xCBF29CE484222325ull;
+  uint64_t all_canon = 0xCBF29CE484222325ull;
   uint64_t chain_total = 0;
-  for (const auto& m : kModes) {
+  uint64_t not_canonical_total = 0, redirect_diff_total = 0;
+  char canon_lines[2][5][256];
+  for (int mi = 0; mi < 2; ++mi) {
+    const auto& m = kModes[mi];
     for (int cls = 0; cls < 5; ++cls) {
       Counts counts;
       const uint64_t h = RunClass(cls, m.mxcsr, &counts);
@@ -171,11 +207,28 @@ int main() {
                   (unsigned long long)counts.tree_diff, (unsigned long long)counts.chain_diff);
       all = Fnv(Fnv(all, uint32_t(h)), uint32_t(h >> 32));
       chain_total += counts.chain_diff;
+      // The canonical lines are printed after the raw ones, so the raw output is unchanged.
+      std::snprintf(canon_lines[mi][cls], sizeof(canon_lines[mi][cls]),
+                    "canonical %-8s %-8s %016llx  (%llu lanes changed by canonicalising; NaN lanes not "
+                    "canonical after: %llu; game's simde_mm_dp_ps vs SDK function: %llu differ)",
+                    m.name, kClass[cls], (unsigned long long)counts.canon_hash,
+                    (unsigned long long)counts.canon_changed_lanes,
+                    (unsigned long long)counts.canon_not_canonical, (unsigned long long)counts.redirect_diff);
+      all_canon = Fnv(Fnv(all_canon, uint32_t(counts.canon_hash)), uint32_t(counts.canon_hash >> 32));
+      not_canonical_total += counts.canon_not_canonical;
+      redirect_diff_total += counts.redirect_diff;
     }
   }
   // The fixture must be able to tell a different summation order apart.
   std::printf("fixture discriminates summation order: %s\n", chain_total ? "yes" : "NO");
   std::printf("DPPS combined hash: %016llx (2 modes x 5 classes x 200000 vector pairs x 2 masks)\n",
               (unsigned long long)all);
-  return control ? 0 : 1;
+  for (int mi = 0; mi < 2; ++mi)
+    for (int cls = 0; cls < 5; ++cls) std::printf("%s\n", canon_lines[mi][cls]);
+  const bool canon_ok = not_canonical_total == 0 && redirect_diff_total == 0;
+  std::printf("canonical NaN results all 0xFFC00000 and the redirect agrees with the SDK function: %s\n",
+              canon_ok ? "yes" : "NO");
+  std::printf("DPPS canonical hash: %016llx (2 modes x 5 classes x 200000 vector pairs x 2 masks)\n",
+              (unsigned long long)all_canon);
+  return control && canon_ok ? 0 : 1;
 }
