@@ -119,8 +119,9 @@ class ReliableSender {
 // Reassembles one reliable message. One message at a time: chunks of another msg_id (or another count or type
 // under the same msg_id) are ignored while a message is being received or waits to be taken, so a stray or
 // hostile chunk cannot overwrite or resize the buffer. The caller Reset()s an abandoned transfer.
-// A chunk of the message that already completed is ignored, taken or not (no second delivery, no second ack:
-// the sender learns of completion from the application's reply, not from the last ack).
+// A chunk of the message that already completed, taken or not, is acknowledged again with the full bitmap (kAck,
+// never kComplete: the message is delivered once), so one lost final ack cannot leave the sender resending until
+// it times out; a chunk with that msg_id but another count or type is ignored.
 // A chunk is valid when 1 <= count <= kMaxChunks, index < count, 1 <= payload <= kChunkBytes, and every chunk but
 // the last has exactly kChunkBytes. Receiving a chunk twice keeps the first copy and acknowledges again.
 class ReliableReceiver {

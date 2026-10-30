@@ -377,10 +377,18 @@ ReliableReceiver::Result ReliableReceiver::OnChunk(const Chunk& chunk, Ack* ack)
     case State::kReceiving:  // the one message in progress; anything else is a stray
       if (chunk.msg_id != msg_id_ || chunk.count != count_ || chunk.msg_type != msg_type_) return Result::kIgnored;
       break;
-    case State::kComplete:  // waiting to be taken: no second delivery, no second message
-      return Result::kIgnored;
-    case State::kTaken:
-      if (chunk.msg_id == msg_id_) return Result::kIgnored;  // a duplicate of the message already delivered
+    case State::kComplete:  // the message is complete: waiting to be taken ...
+    case State::kTaken:     // ... or already taken
+      if (chunk.msg_id == msg_id_) {
+        // A duplicate of it. It is acknowledged again, so that one lost final ack cannot leave the sender resending
+        // until it times out; the answer is kAck, never kComplete, because kComplete means "deliver" and the message
+        // is delivered once. A chunk of that msg_id with another count or type is a stray, as while receiving.
+        if (chunk.count != count_ || chunk.msg_type != msg_type_) return Result::kIgnored;
+        ack->msg_id = msg_id_;
+        ack->have = have_;
+        return Result::kAck;
+      }
+      if (state_ == State::kComplete) return Result::kIgnored;  // another message waits behind the one not yet taken
       break;
   }
   if (state_ != State::kReceiving) {  // the first chunk of a new message

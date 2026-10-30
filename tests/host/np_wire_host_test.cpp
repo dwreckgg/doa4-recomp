@@ -496,6 +496,8 @@ static void TestMessages() {
     h.files = std::string(1001, 'f');
     CHECK(EncodeHello(h).empty());
     Welcome w = welcome;
+    w.release = std::string(200, 'r');  // Welcome.release: the accept edge, then the reject edge
+    CHECK(!EncodeWelcome(w).empty());
     w.release = std::string(201, 'r');
     CHECK(EncodeWelcome(w).empty());
     w = welcome;
@@ -521,23 +523,42 @@ static void TestMessages() {
 
   Group("msg.decode.limit");
   {
-    // A Welcome body built by hand: u8 refusal | u64 build | text release | text text | u32 token.
-    auto WelcomeBody = [](size_t release_len_field, size_t release_bytes) {
+    // Bodies built by hand with every byte of each text present, so only the limit check can refuse an over-long
+    // text. Every decode site pins the last accepted length beside the first refused one: a limit raised at one
+    // site alone (to 1000, say) must turn that site's check red.
+    auto HelloBody = [](size_t release_len, size_t files_len) {  // u64 build | text release | text files | u8 | u8 | u32
       Bld b;
-      b.U8(0).U64(1).U16(unsigned(release_len_field)).Fill(release_bytes, 'r').U16(0).U32(0);
+      b.U64(1).U16(unsigned(release_len)).Fill(release_len, 'r').U16(unsigned(files_len)).Fill(files_len, 'f').U8(1).U8(2).U32(0);
       return b.b;
     };
-    Welcome w;
-    CHECK(DecodeWelcome(S(WelcomeBody(200, 200)), &w) && w.release.size() == 200);  // the limit itself is accepted
-    CHECK(!DecodeWelcome(S(WelcomeBody(201, 201)), &w));    // over the limit, every byte present: the limit check alone refuses it
-    CHECK(!DecodeWelcome(S(WelcomeBody(0xFFFF, 0xFFFF)), &w));
-    Bld hb;  // a Hello whose files text is 1,001 bytes, all present
-    hb.U64(1).U16(0).U16(1001).Fill(1001, 'f').U8(1).U8(2).U32(0);
+    auto WelcomeBody = [](size_t release_len, size_t text_len) {  // u8 refusal | u64 build | text release | text text | u32
+      Bld b;
+      b.U8(0).U64(1).U16(unsigned(release_len)).Fill(release_len, 'r').U16(unsigned(text_len)).Fill(text_len, 't').U32(0);
+      return b.b;
+    };
+    auto BootBody = [](size_t text_len) {  // u32 token | u8 ok | text
+      Bld b;
+      b.U32(1).U8(1).U16(unsigned(text_len)).Fill(text_len, 't');
+      return b.b;
+    };
     Hello h;
-    CHECK(!DecodeHello(S(hb.b), &h));
-    Bld ok;  // the same with 1,000
-    ok.U64(1).U16(0).U16(1000).Fill(1000, 'f').U8(1).U8(2).U32(0);
-    CHECK(DecodeHello(S(ok.b), &h) && h.files.size() == 1000);
+    Welcome w;
+    BootReply r;
+    CHECK(DecodeHello(S(HelloBody(200, 0)), &h) && h.release.size() == 200);        // Hello.release: 200 accepted ...
+    CHECK(!DecodeHello(S(HelloBody(201, 0)), &h));                                  // ... 201 refused
+    CHECK(!DecodeHello(S(HelloBody(201, 1000)), &h));                               // a good files text does not excuse it
+    CHECK(DecodeHello(S(HelloBody(0, 1000)), &h) && h.files.size() == 1000);        // Hello.files: 1000 accepted ...
+    CHECK(DecodeHello(S(HelloBody(0, 201)), &h) && h.files.size() == 201);          // ... its limit is not kMaxText ...
+    CHECK(!DecodeHello(S(HelloBody(0, 1001)), &h));                                 // ... 1001 refused
+    CHECK(DecodeWelcome(S(WelcomeBody(200, 0)), &w) && w.release.size() == 200);    // Welcome.release: 200 accepted ...
+    CHECK(!DecodeWelcome(S(WelcomeBody(201, 0)), &w));                              // ... 201 refused
+    CHECK(!DecodeWelcome(S(WelcomeBody(0xFFFF, 0)), &w));
+    CHECK(DecodeWelcome(S(WelcomeBody(0, 200)), &w) && w.text.size() == 200);       // Welcome.text: 200 accepted ...
+    CHECK(!DecodeWelcome(S(WelcomeBody(0, 201)), &w));                              // ... 201 refused
+    CHECK(!DecodeWelcome(S(WelcomeBody(0, 1000)), &w));                             // (it is not the files limit)
+    CHECK(DecodeBootReply(S(BootBody(200)), &r) && r.text.size() == 200);           // BootReply.text: 200 accepted ...
+    CHECK(!DecodeBootReply(S(BootBody(201)), &r));                                  // ... 201 refused
+    CHECK(!DecodeBootReply(S(BootBody(1000)), &r));
   }
 
   Group("msg.decode.bounds");
@@ -852,19 +873,21 @@ struct LinkResult {
   Bytes message;
   uint8_t type = 0;
   int sends = 0, send_drops = 0, acks = 0, ack_drops = 0, rounds = 0;
+  int completes = 0;  // how many times the receiver said "complete" (the message is delivered once, at that point)
   bool sender_done = false;
 };
 // The fake channel's contract (T3.1): a UDP-like link that drops by send count (every send_drop_every-th chunk
 // send, every ack_drop_every-th ack) and, when mangle is set, delivers each round's chunks in reverse order and
 // twice. It never corrupts. Every datagram goes through Encode and Decode, so the real header path is in the loop.
-// The loop ends when the receiver has the message, or after 200 rounds.
+// The message is taken at the receiver's first "complete". The loop ends when the receiver has the message AND the
+// sender has seen every ack (a lost final ack is repaired by a re-ack of the duplicate), or after 200 rounds.
 static LinkResult RunLink(const Bytes& data, uint8_t type, int send_drop_every, int ack_drop_every, bool mangle) {
   LinkResult res;
   ReliableSender tx;
   ReliableReceiver rx;
   uint32_t now = 1000;
   if (!tx.Begin(77, type, S(data), now)) return res;
-  for (int round = 0; round < 200 && !res.completed; ++round) {
+  for (int round = 0; round < 200 && !(res.completed && tx.Done()); ++round) {
     ++res.rounds;
     Due due = tx.Due(now, 150);
     if (mangle) {
@@ -891,11 +914,14 @@ static LinkResult RunLink(const Bytes& data, uint8_t type, int send_drop_every, 
         Ack back;
         if (Decode(adg, &ap) == Drop::kNone && DecodeAck(ap.body, &back)) tx.OnAck(back);
       }
-      if (r == ReliableReceiver::Result::kComplete) res.completed = true;
+      if (r == ReliableReceiver::Result::kComplete) {
+        ++res.completes;
+        res.completed = true;
+        res.message = rx.Take(&res.type);
+      }
     }
     now += 150;  // the next round is one retransmit interval later
   }
-  if (res.completed) res.message = rx.Take(&res.type);
   res.sender_done = tx.Done();
   return res;
 }
@@ -908,6 +934,7 @@ static void TestLink() {
   CHECK(r.completed);
   CHECK(r.message == data);
   CHECK(r.type == 9);
+  CHECK(r.completes == 1 && r.sender_done);       // delivered once, and the sender learned of it despite the lost acks
   CHECK(r.send_drops > 20 && r.ack_drops > 20);   // the link really lost chunks and acks (non-vacuity)
   CHECK(r.sends > 71 && r.rounds >= 2);           // and the sender really retransmitted
   std::printf("link.lossy: %d rounds, %d chunk sends (%d lost), %d acks (%d lost)\n", r.rounds, r.sends, r.send_drops, r.acks, r.ack_drops);
@@ -915,18 +942,81 @@ static void TestLink() {
   Group("link.mangled");  // reversed order and every chunk twice, with every fourth send and every third ack lost
   const LinkResult m = RunLink(data, 1, 4, 3, true);
   CHECK(m.completed && m.message == data && m.type == 1);
+  CHECK(m.completes == 1 && m.sender_done);       // every chunk arrives twice and the message is still delivered once
   CHECK(m.send_drops > 20 && m.ack_drops > 10 && m.sends > 71);
 
   Group("link.clean");  // no loss: one round, the sender sees every ack and is done
   const LinkResult c = RunLink(data, 1, 0, 0, false);
   CHECK(c.completed && c.message == data && c.rounds == 1 && c.sends == 71 && c.acks == 71);
-  CHECK(c.sender_done);
+  CHECK(c.sender_done && c.completes == 1);
 
   Group("link.sizes");  // the chunk-count edges end to end: 1, 1200, 1201, 2400, 2401 and the 255-chunk maximum
   for (size_t n : {size_t(1), size_t(1199), size_t(1200), size_t(1201), size_t(2399), size_t(2400), size_t(2401), size_t(306000)}) {
     const Bytes d = Pattern(n, n);
     const LinkResult x = RunLink(d, 1, 5, 2, false);
     CHECK(x.completed && x.message == d);
+    CHECK(x.completes == 1 && x.sender_done);
+  }
+}
+
+// The reliable transfer end to end through the real header path, with the one ack that completes the message lost.
+static ReliableReceiver::Result WireChunk(ReliableReceiver* rx, const Bytes& body, Ack* ack) {
+  const Bytes dg = Encode(Type::kChunk, 0xBEEFu, S(body));
+  Packet p;
+  Chunk c;
+  if (Decode(dg, &p) != Drop::kNone || p.type != Type::kChunk || !DecodeChunk(p.body, &c)) return ReliableReceiver::Result::kIgnored;
+  return rx->OnChunk(c, ack);
+}
+static void WireAck(ReliableSender* tx, const Ack& ack) {
+  const Bytes dg = Encode(Type::kAck, 0xBEEFu, S(EncodeAck(ack)));
+  Packet p;
+  Ack back;
+  if (Decode(dg, &p) == Drop::kNone && p.type == Type::kAck && DecodeAck(p.body, &back)) tx->OnAck(back);
+}
+
+static void TestLostFinalAck() {
+  using R = ReliableReceiver::Result;
+  // 3,000 bytes = chunks of 1,200, 1,200 and 600. The ack of chunk 2 (the one that completes the message) is lost.
+  // One more retransmission round (the sender resends only chunk 2) must make the sender Done, and the receiver
+  // must deliver exactly once, whether the message was taken before the retransmission or after it.
+  for (int take_before = 0; take_before < 2; ++take_before) {
+    Group(take_before ? "link.lost-final-ack.taken-before" : "link.lost-final-ack.taken-after");
+    const Bytes data = Pattern(3000, 77);
+    ReliableSender tx;
+    ReliableReceiver rx;
+    CHECK(tx.Begin(21, 3, S(data), 1000));
+    const Due round1 = tx.Due(1000, 150);
+    CHECK(round1.size() == 3);
+    Ack a0, a1, a2;
+    CHECK(round1.size() == 3 && WireChunk(&rx, round1[0], &a0) == R::kAck);
+    WireAck(&tx, a0);
+    CHECK(round1.size() == 3 && WireChunk(&rx, round1[1], &a1) == R::kAck);
+    WireAck(&tx, a1);
+    CHECK(round1.size() == 3 && WireChunk(&rx, round1[2], &a2) == R::kComplete);
+    CHECK(a2.msg_id == 21 && a2.have == (std::array<uint64_t, 4>{7, 0, 0, 0}));
+    // a2 is lost: the sender has chunks 0 and 1 acknowledged and still waits for chunk 2
+    CHECK(tx.Active() && !tx.Done());
+    uint8_t type = 0xEE;
+    Bytes message;
+    if (take_before) {
+      message = rx.Take(&type);
+      CHECK(message == data && type == 3);
+    }
+    CHECK(tx.Due(1149, 150).empty());
+    const Due round2 = tx.Due(1150, 150);
+    CHECK(IndicesOf(round2) == (std::vector<unsigned>{2}));          // only the unacknowledged chunk
+    Ack a3 = AckOf(99, {});
+    CHECK(round2.size() == 1 && WireChunk(&rx, round2[0], &a3) == R::kAck);   // acknowledged again, not delivered again
+    CHECK(a3.msg_id == 21 && a3.have == (std::array<uint64_t, 4>{7, 0, 0, 0}));
+    WireAck(&tx, a3);
+    CHECK(tx.Done() && !tx.Active());                                // the sender is Done after that one extra round
+    CHECK(tx.Due(1300, 150).empty());
+    if (!take_before) {
+      message = rx.Take(&type);
+      CHECK(message == data && type == 3);
+    }
+    type = 0xEE;
+    CHECK(rx.Take(&type).empty() && type == 0xEE);                    // delivered exactly once
   }
 }
 
@@ -1219,17 +1309,45 @@ static void TestReceiver() {
     CHECK(a.have[0] == 0x17);                                            // 0,1,2,4
     CHECK(rx.OnChunk(PartChunk(p, 3, 4, 3), &a) == R::kComplete);
     CHECK(a.have[0] == 0x1F);
-    CHECK(rx.OnChunk(PartChunk(p, 3, 4, 3), &a) == R::kIgnored);         // a duplicate after completion, before Take
+    const std::array<uint64_t, 4> full = {0x1F, 0, 0, 0};                // all five chunks
+    for (unsigned i = 0; i < 5; ++i) {                                   // a duplicate of any chunk after completion, before Take:
+      Ack s = AckOf(99, {});                                             // acknowledged again with the full bitmap, never "complete"
+      CHECK(rx.OnChunk(PartChunk(p, 3, 4, i), &s) == R::kAck);
+      CHECK(s.msg_id == 3 && s.have == full);
+    }
+    {
+      Chunk wrong_count = PartChunk(p, 3, 4, 0);                         // the same msg_id with another count or type is a stray
+      wrong_count.count = 6;
+      Chunk wrong_type = PartChunk(p, 3, 9, 0);
+      Ack s = AckOf(99, {});
+      CHECK(rx.OnChunk(wrong_count, &s) == R::kIgnored);
+      CHECK(rx.OnChunk(wrong_type, &s) == R::kIgnored);
+      CHECK(Same(s, AckOf(99, {})));                                     // and leaves *ack alone
+      Bytes forged = p.slices[2];                                        // a duplicate with other bytes is acknowledged, not applied
+      forged[0] ^= 0xFF;
+      Chunk other_bytes = PartChunk(p, 3, 4, 2);
+      other_bytes.payload = S(forged);
+      CHECK(rx.OnChunk(other_bytes, &s) == R::kAck);
+    }
     const Bytes msg = rx.Take(&type);
-    CHECK(msg == p.data && type == 4);
+    CHECK(msg == p.data && type == 4);                                   // delivered once, intact, after all of that
     type = 0xEE;
     CHECK(rx.Take(&type).empty() && type == 0xEE);                       // once
-    for (unsigned i = 0; i < 5; ++i) {                                   // duplicates after Take, every index
+    for (unsigned i = 0; i < 5; ++i) {                                   // duplicates after Take, every index: acknowledged again too
       Ack s = AckOf(1, {1});
-      CHECK(rx.OnChunk(PartChunk(p, 3, 4, i), &s) == R::kIgnored);
+      CHECK(rx.OnChunk(PartChunk(p, 3, 4, i), &s) == R::kAck);
+      CHECK(s.msg_id == 3 && s.have == full);
+    }
+    {
+      Chunk wrong_count = PartChunk(p, 3, 4, 0);
+      wrong_count.count = 6;
+      Chunk wrong_type = PartChunk(p, 3, 9, 0);
+      Ack s = AckOf(1, {1});
+      CHECK(rx.OnChunk(wrong_count, &s) == R::kIgnored);
+      CHECK(rx.OnChunk(wrong_type, &s) == R::kIgnored);
       CHECK(Same(s, AckOf(1, {1})));
     }
-    CHECK(rx.Take(nullptr).empty());
+    CHECK(rx.Take(nullptr).empty());                                     // nothing is delivered a second time
   }
   Group("receiver.complete.missing-one");
   {
@@ -1270,6 +1388,24 @@ static void TestReceiver() {
     rx.Reset();                                                           // an abandoned transfer is dropped
     CHECK(rx.Take(&type).empty());
     CHECK(rx.OnChunk(PartChunk(p, 9, 1, 0), &a) == R::kAck && a.msg_id == 9);
+  }
+  Group("receiver.reack.other-id");
+  {
+    ReliableReceiver rx;
+    const Parts p = MakeParts(1300, 18), s = MakeParts(1300, 19);        // two 2-chunk messages of the same type
+    Ack a;
+    CHECK(rx.OnChunk(PartChunk(p, 1, 1, 0), &a) == R::kAck);
+    CHECK(rx.OnChunk(PartChunk(p, 1, 1, 1), &a) == R::kComplete);
+    const Ack before = a;
+    CHECK(rx.OnChunk(PartChunk(s, 5, 1, 0), &a) == R::kIgnored);        // same count and type, another id, p not taken yet: a stray
+    CHECK(Same(a, before));
+    uint8_t type = 0;
+    CHECK(rx.Take(&type) == p.data);
+    CHECK(rx.OnChunk(PartChunk(s, 5, 1, 0), &a) == R::kAck);            // taken: it starts the next message, it is not "a duplicate"
+    CHECK(a.msg_id == 5 && a.have[0] == 1);
+    CHECK(rx.OnChunk(PartChunk(p, 1, 1, 0), &a) == R::kIgnored);        // and p's own chunks are strays now
+    CHECK(rx.OnChunk(PartChunk(s, 5, 1, 1), &a) == R::kComplete);
+    CHECK(rx.Take(&type) == s.data);
   }
   Group("receiver.first-copy-wins");
   {
@@ -1338,6 +1474,7 @@ int main(int argc, char** argv) {
   TestMessages();
   TestFuzz();
   TestLink();
+  TestLostFinalAck();
   TestSender();
   TestReceiver();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
