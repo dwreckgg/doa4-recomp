@@ -1,0 +1,13 @@
+control: 0xFF -> 70, 0xEF -> 65 (ok)
+default  normal   3dc1f1294e19750d  (0 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 40849 differ)
+default  cancel   66f1d355fe021f95  (0 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 24698 differ)
+default  denormal c4cd8e7b63e680a5  (0 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 0 differ)
+default  inf      83c9a11981204cfd  (867632 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 224 differ)
+default  nan      0f998b798c997bf4  (1498800 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 7636 differ)
+ftz_daz  normal   3dc1f1294e19750d  (0 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 40849 differ)
+ftz_daz  cancel   66f1d355fe021f95  (0 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 24698 differ)
+ftz_daz  denormal 5f448f6680db4325  (0 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 0 differ)
+ftz_daz  inf      83c9a11981204cfd  (867632 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 224 differ)
+ftz_daz  nan      0f998b798c997bf4  (1498800 NaN results; lane 0 vs SDM-order model: 0 differ, vs chained-order model: 7636 differ)
+fixture discriminates summation order: yes
+DPPS combined hash: 3b6dca40b68d00a6 (2 modes x 5 classes x 200000 vector pairs x 2 masks)

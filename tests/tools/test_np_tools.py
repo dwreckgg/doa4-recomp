@@ -12,7 +12,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
+import zipfile
 
 sys.dont_write_bytecode = True  # load() must not leave tools/__pycache__ in the tree
 
@@ -949,6 +951,810 @@ def test_gate_final_progress(root):
         f.write(b"not a counters file at all")
     check(final_progress("hc").startswith("none (") and "not a counters file" in final_progress("hc"),
           f"final_progress, a file that is not a counters file: {final_progress('hc')!r}")
+
+
+# ======================================================================================================================
+# Task 12: the cross-PC bundle (tools/np_bundle.py with its templates in tools/np_bundle/) and the cross-check of the
+# friend's results (tools/np_crosscheck.py). Fixture files beside this test, each from a real source:
+#   dpps_canon_sample.txt       the canonical DPPS test's output on this PC (np_phase0/friend_test/dpps_canon_local_2026-10-30.txt)
+#   dpps_friend_old_sample.txt  the OLD DPPS test's output on the friend's PC (np_phase0/friend_test/dpps_friend_2026-10-29.txt)
+#   rec_head_v2.bin             the first 353 bytes of np_runs/t11bsingle_rec/out/rec.d4r: header, meta, two frames
+#   xxh3_vectors.txt            the output of xxh3_vectors.cpp (the xxHash library's own XXH3_64bits_withSeed answers)
+# ======================================================================================================================
+def fixture_text(name):
+    with open(os.path.join(HERE, name), "rb") as f:
+        return f.read().decode("utf-8")
+
+
+def attempt(fn, *args, **kw):
+    """(result, None), or (None, 'Type: message') when fn raises (SystemExit included): a raise is a failed check, not the
+    end of the test (T1.7)."""
+    try:
+        return fn(*args, **kw), None
+    except BaseException as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
+DPPS_LOCAL_CANONICAL = "9358b1f6111e7b0e"  # this PC, np_phase0/friend_test/dpps_canon_local_2026-10-30.txt (task-11b-report.md)
+DPPS_LOCAL_COMBINED = "2d0081405299d44a"  # the raw combined hash on this PC (the old exe printed the same)
+DPPS_FRIEND_OLD_COMBINED = "3b6dca40b68d00a6"  # the friend's i5-12400, old exe, 2026-10-29
+
+
+def test_dpps_hash(root):
+    crosscheck = load("np_crosscheck")
+    sample = fixture_text("dpps_canon_sample.txt")
+    friend_old = fixture_text("dpps_friend_old_sample.txt")
+    # fixture precondition: the per-class lines carry other 16-digit hashes, which a parse that takes "a hash" would return
+    class_hashes = set(re.findall(r"\b[0-9a-f]{16}\b", "\n".join(l for l in sample.splitlines() if " hash: " not in l)))
+    check(len(class_hashes) >= 6 and DPPS_LOCAL_CANONICAL not in class_hashes and DPPS_LOCAL_COMBINED not in class_hashes,
+          f"fixture precondition: the sample's per-class lines hold other hashes: {sorted(class_hashes)}")
+
+    def h(text, *kind):
+        got, err = attempt(crosscheck.dpps_hash, text, *kind)
+        return err if err else got
+
+    check(h(sample, "canonical") == DPPS_LOCAL_CANONICAL, f"dpps_hash canonical: {h(sample, 'canonical')!r}")
+    check(h(sample, "combined") == DPPS_LOCAL_COMBINED, f"dpps_hash combined: {h(sample, 'combined')!r}")
+    check(h(sample) == DPPS_LOCAL_CANONICAL, f"dpps_hash: the default kind is the judged one, canonical: {h(sample)!r}")
+    # NOT the other kind and NOT a class hash (the likeliest wrong parses: any 16-digit hash, the first one, the combined line)
+    check(h(sample, "canonical") not in class_hashes | {DPPS_LOCAL_COMBINED}, "dpps_hash canonical returns neither a class hash nor the combined one")
+    check(h(sample, "combined") not in class_hashes | {DPPS_LOCAL_CANONICAL}, "dpps_hash combined returns neither a class hash nor the canonical one")
+    # the friend's real output of the OLD test: no canonical line (the old exe cannot give the judged value), a combined one
+    check(h(friend_old, "canonical") is None, f"dpps_hash canonical over the old exe's output: {h(friend_old, 'canonical')!r}")
+    check(h(friend_old, "combined") == DPPS_FRIEND_OLD_COMBINED, f"dpps_hash combined over the old exe's output: {h(friend_old, 'combined')!r}")
+    # a text with one kind of line only
+    only_canonical = "\n".join(l for l in sample.splitlines() if not l.startswith("DPPS combined hash"))
+    only_combined = "\n".join(l for l in sample.splitlines() if not l.startswith("DPPS canonical hash"))
+    check(h(only_canonical, "combined") is None and h(only_canonical, "canonical") == DPPS_LOCAL_CANONICAL,
+          f"dpps_hash: canonical line only: {h(only_canonical, 'combined')!r} / {h(only_canonical, 'canonical')!r}")
+    check(h(only_combined, "canonical") is None and h(only_combined, "combined") == DPPS_LOCAL_COMBINED,
+          f"dpps_hash: combined line only: {h(only_combined, 'canonical')!r} / {h(only_combined, 'combined')!r}")
+    # no hash, an empty text, a hash that is not 16 lowercase hex digits
+    for what, text in (("no hash", "no hash here"), ("empty", ""), ("15 digits", "DPPS canonical hash: 9358b1f6111e7b0 (x)"),
+                       ("17 digits", "DPPS canonical hash: 9358b1f6111e7b0e1 (x)"), ("not hex", "DPPS canonical hash: 9358b1f6111e7b0z (x)")):
+        check(h(text, "canonical") is None, f"dpps_hash canonical, {what}: {h(text, 'canonical')!r}")
+    # two canonical lines that disagree are no answer; two that agree are one
+    check(h(sample + "DPPS canonical hash: 0123456789abcdef (x)\n", "canonical") is None, "dpps_hash: two disagreeing canonical lines")
+    check(h(sample + "DPPS canonical hash: " + DPPS_LOCAL_CANONICAL + " (x)\n", "canonical") == DPPS_LOCAL_CANONICAL, "dpps_hash: two equal canonical lines")
+    got, err = attempt(crosscheck.dpps_hash, sample, "nonsense")
+    check(err is not None and err.startswith("ValueError"), f"dpps_hash: an unknown kind raises ValueError: {got!r} {err!r}")
+
+
+FRIEND_LOG = "\n".join([  # lines of a real np_log.txt (np_runs/t11bsingle_rep1/out), the ones the cross-check prints
+    "job workers: one at a time in a fixed order, never beside the main thread",
+    "frame 599: hook avg 32.8 us max 1466.2 us, hash avg 20.4 us max 1465.9 us, det wait avg 641.8 us max 15984.5 us, "
+    "frame period avg 16.678 ms (59.96 fps) max 77.60 ms",
+    "job workers: main thread waited for them avg 994.8 us max 1676.4 us a frame in the update half, join avg 4.7 us max 20.1 us (600 frames)",
+    "quit at frame 9: end of the recording"]) + "\n"
+
+
+def make_results(root, names=("ra", "rb"), dpps=None, listed=True, sysinfo="OS: Windows 11\nCPU: 12th Gen Intel(R) Core(TM) i5-12400, 6 cores, 12 logical\n",
+                 friend=None):
+    """A results folder as run_check.bat leaves it (out/<name>/out/*, dpps.txt, sysinfo.txt, recordings.txt) and the local
+    record run folders it is compared with (root/local/<name>/out/*). friend maps a name to make_run keywords for the
+    FRIEND's run of it. Returns (results, local)."""
+    res, local = os.path.join(root, "res"), os.path.join(root, "local")
+    os.makedirs(os.path.join(res, "out"))
+    for n in names:
+        make_run(local, n)
+        run = make_run(os.path.join(res, "out"), n, **((friend or {}).get(n, {})))
+        with open(os.path.join(run, "out", "np_log.txt"), "w") as f:
+            f.write(FRIEND_LOG)
+    for fname, text in (("dpps.txt", dpps), ("sysinfo.txt", sysinfo), ("recordings.txt", "\r\n".join(names) + "\r\n" if listed else None)):
+        if text is not None:
+            with open(os.path.join(res, fname), "w", newline="") as f:
+                f.write(text)
+    return res, local
+
+
+def crosscheck_run(res, local, *extra):
+    p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_crosscheck.py"), res, "--local", local, *extra],
+                       capture_output=True, text=True, timeout=120)
+    return p.returncode, p.stdout + p.stderr
+
+
+def test_crosscheck(root):
+    good = fixture_text("dpps_canon_sample.txt")
+    friend_old = fixture_text("dpps_friend_old_sample.txt")
+    sub = lambda n: os.path.join(root, n)  # noqa: E731
+    # positive control: two recordings equal, the canonical hash equal -> exit 0; the friend's lines printed
+    res, local = make_results(sub("t1"), dpps=good)
+    code, out = crosscheck_run(res, local)
+    check(code == 0, f"crosscheck, all equal: exit {code}\n{out}")
+    check("== ra: EQUAL" in out and "== rb: EQUAL" in out, f"crosscheck, all equal: per-recording lines\n{out}")
+    check("friend result: status ok; exit 0; timeout 0; quit quit at frame 9: end of the recording" in out, f"crosscheck, all equal: the friend's run_result line\n{out}")
+    check("crosscheck PASSED: 2 of 2 recordings equal, DPPS canonical equal" in out, f"crosscheck, all equal: summary line\n{out}")
+    check(f"DPPS canonical: friend {DPPS_LOCAL_CANONICAL}, this PC {DPPS_LOCAL_CANONICAL}: EQUAL" in out, f"crosscheck, all equal: DPPS line\n{out}")
+    check(f"DPPS combined (raw, not judged): friend {DPPS_LOCAL_COMBINED}, this PC {DPPS_LOCAL_COMBINED}" in out, f"crosscheck, all equal: raw hash printed for information\n{out}")
+    check("friend: job workers: one at a time" in out and "frame period avg 16.678 ms" in out,
+          f"crosscheck: the friend's mode-3 and frame-period lines are printed\n{out}")
+    check("friend's PC: OS: Windows 11 | CPU: 12th Gen Intel(R) Core(TM) i5-12400, 6 cores, 12 logical" in out, f"crosscheck: sysinfo line\n{out}")
+    # one recording differs (its digest): that one DIFFERS, the other stays EQUAL, exit 1
+    res, local = make_results(sub("t2"), dpps=good, friend={"rb": {"digest_change": 5}})
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "== rb: DIFFERS" in out and "== ra: EQUAL" in out, f"crosscheck, a digest differs: exit {code}\n{out}")
+    # equal recordings do not excuse the hash: the friend's canonical hash differs
+    res, local = make_results(sub("t3"), dpps=good.replace("DPPS canonical hash: " + DPPS_LOCAL_CANONICAL, "DPPS canonical hash: 0123456789abcdef"))
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "== ra: EQUAL" in out and "DPPS canonical: friend 0123456789abcdef" in out and ": DIFFERS" in out, f"crosscheck, canonical hash differs: exit {code}\n{out}")
+    # the raw combined hash is information only: it differs, the canonical one is equal -> exit 0 (the wrong code judges it)
+    res, local = make_results(sub("t4"), dpps=good.replace("DPPS combined hash: " + DPPS_LOCAL_COMBINED, "DPPS combined hash: 0123456789abcdef"))
+    code, out = crosscheck_run(res, local)
+    check(code == 0 and "DPPS combined (raw, not judged): friend 0123456789abcdef" in out, f"crosscheck, only the raw hash differs: exit {code}\n{out}")
+    # the OLD test's output (the friend's real one) has no canonical line: missing, exit 1
+    res, local = make_results(sub("t5"), dpps=friend_old)
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "DPPS canonical: friend missing" in out, f"crosscheck, the old exe's output: exit {code}\n{out}")
+    res, local = make_results(sub("t6"), dpps=None)
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "DPPS canonical: friend missing" in out, f"crosscheck, no dpps.txt: exit {code}\n{out}")
+    # a recording that never ran: recordings.txt lists it, out/ does not hold it
+    res, local = make_results(sub("t7"), dpps=good)
+    shutil.rmtree(os.path.join(res, "out", "rb"))
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "rb" in out and "did not run" in out, f"crosscheck, a recording missing from the results: exit {code}\n{out}")
+    # nothing ran at all: an empty out/ is not "every recording equal"
+    res, local = make_results(sub("t8"), dpps=good)
+    for n in ("ra", "rb"):
+        shutil.rmtree(os.path.join(res, "out", n))
+    code, out = crosscheck_run(res, local)
+    check(code == 1, f"crosscheck, empty out/: exit {code}\n{out}")
+    res, local = make_results(sub("t9"), names=(), dpps=good, listed=True)
+    code, out = crosscheck_run(res, local)
+    check(code == 1, f"crosscheck, no recordings at all: exit {code}\n{out}")
+    # no recordings.txt: the list of what should have run is unknown; --expect gives it
+    res, local = make_results(sub("t10"), dpps=good, listed=False)
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "recordings.txt" in out, f"crosscheck, no recordings.txt and no --expect: exit {code}\n{out}")
+    code, out = crosscheck_run(res, local, "--expect", "ra,rb")
+    check(code == 0, f"crosscheck, --expect names the recordings: exit {code}\n{out}")
+    code, out = crosscheck_run(res, local, "--expect", "ra,rb,rc")
+    check(code == 1 and "rc" in out, f"crosscheck, --expect names one that did not run: exit {code}\n{out}")
+    # the friend's run did not end well (timeout): its status fails the pair
+    res, local = make_results(sub("t11"), dpps=good, friend={"ra": {"status": "timeout"}})
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "== ra: DIFFERS" in out and "status timeout" in out, f"crosscheck, the friend's run timed out: exit {code}\n{out}")
+    # no local run folder for a recording
+    res, local = make_results(sub("t12"), dpps=good)
+    shutil.rmtree(os.path.join(local, "rb"))
+    code, out = crosscheck_run(res, local)
+    check(code == 1 and "no local run folder" in out, f"crosscheck, no local run: exit {code}\n{out}")
+    # an extra run in out/ that recordings.txt does not list is reported, not judged
+    res, local = make_results(sub("t13"), names=("ra", "rb", "rx"), dpps=good, friend={"rx": {"digest_change": 3}})
+    with open(os.path.join(res, "recordings.txt"), "w") as f:
+        f.write("ra\nrb\n")
+    code, out = crosscheck_run(res, local)
+    check(code == 0 and "rx" in out and "not in recordings.txt" in out, f"crosscheck, an unlisted extra run: exit {code}\n{out}")
+
+
+def pattern(n, mul, add):
+    """The bytes xxh3_vectors.cpp's Pattern(n, mul, add) makes."""
+    return bytes((i * mul + add) & 0xFF for i in range(n))
+
+
+def xxh3_reference():
+    """(vectors, build) from xxh3_vectors.txt: [(length, seed, hex)] and (exe length, dll length, hex)."""
+    vectors, build = [], None
+    for line in fixture_text("xxh3_vectors.txt").splitlines():
+        w = line.split()
+        if w[:1] == ["vec"]:
+            vectors.append((int(w[1]), int(w[2]), w[3]))
+        elif w[:1] == ["build"]:
+            build = (int(w[1]), int(w[2]), w[3])
+    return vectors, build
+
+
+def test_xxh3(root):
+    bundle = load("np_bundle")
+    vectors, build = xxh3_reference()
+    lengths = sorted({n for n, _, _ in vectors})
+    # fixture precondition: every code path of XXH3_64bits_withSeed (xxhash.h XXH3_64bits_internal) has a length, with both
+    # sides of each of its boundaries, a seed of 0 and several other seeds (the seed changes the secret above 240 bytes),
+    # and inputs of more than one 1024-byte block (the scramble step)
+    needed = {"0": 0, "1-3": 3, "4-8": 5, "9-16": 9, "16/17": 17, "17-32": 32, "33-64": 33, "65-96": 65, "97-128": 97,
+              "128/129": 129, "129-240": 200, "240/241": 241, "one block": 1024, "two blocks": 1025, "many blocks": 4101}
+    for what, n in needed.items():
+        check(n in lengths, f"xxh3 fixture precondition: a vector of {n} bytes ({what})")
+    seeds = {s for _, s, _ in vectors}
+    check(0 in seeds and len(seeds) >= 3 and max(seeds) > 2**63, f"xxh3 fixture precondition: seeds {sorted(seeds)}")
+    check(len(vectors) == len(lengths) * len(seeds) and build is not None, f"xxh3 fixture precondition: {len(vectors)} vectors, build {build}")
+    for n in lengths:
+        data = pattern(n, 131, 7)
+        bad = []
+        for m, seed, want in vectors:
+            if m == n:
+                got, err = attempt(bundle.xxh3_64, data, seed)
+                if err or got != int(want, 16):
+                    bad.append(f"seed {seed}: got {err or format(got, '016x')}, library {want}")
+        check(not bad, f"xxh3_64 over {n} bytes: {'; '.join(bad)}")
+
+
+def write_bin_folder(path, exe=None, dll=None, tracy=b"tracy"):
+    """A build folder as np_build.bat snapshots it (np_bin/<tag>): the three files, small stand-ins of the real ones."""
+    os.makedirs(path)
+    for name, data in (("dead_or_alive_4.exe", exe), ("rexruntime.dll", dll), ("TracyClient.dll", tracy)):
+        if data is not None:
+            with open(os.path.join(path, name), "wb") as f:
+                f.write(data)
+
+
+def test_exe_build_id(root):
+    # src/net/np_session.cpp BuildId() (line 186): h = XXH3_64bits_withSeed(exe, 0), then h = XXH3_64bits_withSeed(rexruntime.dll, h),
+    # 16 lowercase hex digits; TracyClient.dll is not part of it. The expected id is the library's (xxh3_vectors.cpp "build").
+    bundle = load("np_bundle")
+    _, (exe_len, dll_len, want) = xxh3_reference()
+    exe, dll = pattern(exe_len, 17, 1), pattern(dll_len, 29, 5)
+    got, err = attempt(bundle.exe_build_id, (lambda p: (write_bin_folder(p, exe, dll), p)[1])(os.path.join(root, "b1")))
+    check(err is None and got == want, f"exe_build_id of the fixture files: {err or got}, library {want}")
+    # the id depends on the exe, on the dll and on the order (the dll's hash is seeded with the exe's)
+    flipped = lambda d: bytes([d[0] ^ 1]) + d[1:]  # noqa: E731
+    cases = {"b2": (flipped(exe), dll), "b3": (exe, flipped(dll)), "b4": (dll, exe)}  # b4: the files swapped
+    for tag, (e, d) in cases.items():
+        write_bin_folder(os.path.join(root, tag), e, d)
+        got, err = attempt(bundle.exe_build_id, os.path.join(root, tag))
+        check(err is None and got != want, f"exe_build_id changes when the files change ({tag}): {err or got}")
+    write_bin_folder(os.path.join(root, "b5"), exe, dll, tracy=b"another tracy")
+    got, err = attempt(bundle.exe_build_id, os.path.join(root, "b5"))
+    check(err is None and got == want, f"exe_build_id ignores TracyClient.dll: {err or got}")
+    # the exe and the dll must both be readable and non-empty (BuildId() reads "unreadable" otherwise, which agrees with nothing)
+    for tag, (e, d) in {"b6": (exe, None), "b7": (None, dll), "b8": (b"", dll), "b9": (exe, b"")}.items():
+        write_bin_folder(os.path.join(root, tag), e, d)
+        got, err = attempt(bundle.exe_build_id, os.path.join(root, tag))
+        check(err is not None and "BundleError" in err, f"exe_build_id refuses a missing or empty file ({tag}): {err or got}")
+
+
+def rec_bytes(meta, frames=3, version=2, seed=1, flags=0):
+    """A recording as src/net/np_core.cpp EncodeRecHeader/EncodeRecFrame write it (lines 300-318): "D4NPREC1", u32 version, u32 52,
+    u64 seed, u32 flags, u32 meta bytes (0 in version 1), the meta text (version 2), then 52 bytes a frame."""
+    meta = meta.encode() if isinstance(meta, str) else meta
+    head = b"D4NPREC1" + struct.pack("<II", version, 52) + struct.pack("<Q", seed) + struct.pack("<II", flags, len(meta) if version == 2 else 0)
+    return head + (meta if version == 2 else b"") + bytes(52 * frames)
+
+
+def test_recording_meta(root):
+    bundle = load("np_bundle")
+    real = os.path.join(HERE, "rec_head_v2.bin")
+    meta, err = attempt(bundle.recording_meta, real)
+    check(err is None and isinstance(meta, dict), f"recording_meta of a real recording header: {err or meta}")
+    meta = meta or {}
+    check(meta.get("build") == "b3d118544499d1e8" and meta.get("data") == "8ce3302b3fcea98d", f"recording_meta: build and data of the real header: {meta}")
+    check(meta.get("sweep") == "4" and meta.get("serial") == "default" and meta.get("fixes", "").startswith("seed,clock,sdkclock,xam,"),
+          f"recording_meta: the other keys of the real header: {meta}")
+    check(meta.get("tweaks") == "doa4_tag_all_stages=0,doa4_mp_hidden_characters=0", f"recording_meta: tweaks (a value with '=' signs and commas): {meta.get('tweaks')!r}")
+    got, err = attempt(bundle.recording_build_id, real)
+    check(err is None and got == "b3d118544499d1e8", f"recording_build_id of the real header: {err or got}")
+
+    def write(name, data):
+        p = os.path.join(root, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    # synthetic recordings built from the documented layout: the same answer for a build line anywhere in the meta
+    p = write("syn.d4r", rec_bytes("fixes=seed\nbuild=0123456789abcdef\ndata=x\n"))
+    got, err = attempt(bundle.recording_build_id, p)
+    check(err is None and got == "0123456789abcdef", f"recording_build_id: build line not first: {err or got}")
+    # refusals, each with its reason: version 1 (no meta), no build line, build=unreadable, a cut-short header, not a recording, empty
+    # (each with the words of its own reason: a refusal for the wrong reason is a defect the tests must see)
+    bad = {"version 1": (rec_bytes("", version=1), "has no meta"), "no build line": (rec_bytes("data=x\nfixes=seed\n"), "no build id"),
+           "unreadable": (rec_bytes("build=unreadable\ndata=x\n"), "build=unreadable"), "empty build": (rec_bytes("build=\ndata=x\n"), "no build id"),
+           "header cut short": (rec_bytes("build=0123456789abcdef\n")[:40], "cut short"),
+           "not a recording": (b"hello world, this is no recording at all....", "not a recording"), "empty file": (b"", "not a recording"),
+           "version 3": (b"D4NPREC1" + struct.pack("<II", 3, 52) + bytes(24), "unsupported recording version 3"),
+           "frames of 53 bytes": (b"D4NPREC1" + struct.pack("<II", 2, 53) + bytes(24), "unsupported recording version 2 (frames of 53 bytes)")}
+    for what, (data, reason) in bad.items():
+        got, err = attempt(bundle.recording_build_id, write(f"bad_{what.replace(' ', '_')}.d4r", data))
+        check(err is not None and "BundleError" in err and reason in err, f"recording_build_id refuses {what} with {reason!r}: {err or got}")
+    got, err = attempt(bundle.recording_build_id, os.path.join(root, "missing.d4r"))
+    check(err is not None and "BundleError" in err and "cannot be read" in err, f"recording_build_id refuses a missing file: {err or got}")
+
+
+BUNDLE_META = "build={build}\ndata=8ce3302b3fcea98d\nfixes=seed,clock\nserial=default\nsweep=4\ntweaks=a=0,b=0\n"
+
+
+def make_bundle_inputs(root, names=("ra", "rb"), builds=None, frames=12):
+    """Inputs of np_bundle.py: a build folder (np_bin/<tag>: the three files), record run folders runs/<name>/out/{rec.d4r,
+    run_result.txt} whose recordings (the real format) carry the build id of that folder - or builds[name] - , a user data
+    folder (a nested file, an empty folder) and a stand-in for the DPPS exe."""
+    _, (exe_len, dll_len, build) = xxh3_reference()  # the library's id of the fixture files, not the tool's own
+    bin_dir = os.path.join(root, "np_bin", "t12x")
+    write_bin_folder(bin_dir, pattern(exe_len, 17, 1), pattern(dll_len, 29, 5))
+    runs = os.path.join(root, "runs")
+    for n in names:
+        out = os.path.join(runs, n, "out")
+        os.makedirs(out)
+        with open(os.path.join(out, "rec.d4r"), "wb") as f:
+            f.write(rec_bytes(BUNDLE_META.format(build=(builds or {}).get(n, build)), frames=frames))
+        with open(os.path.join(out, "run_result.txt"), "w") as f:
+            f.write(REC_OK)
+    ud = os.path.join(root, "ud_source")
+    os.makedirs(os.path.join(ud, "sub", "deep"))
+    os.makedirs(os.path.join(ud, "empty"))
+    for rel, data in (("save.bin", b"save"), ("sub/deep/x.dat", b"\x00\x01\x02")):
+        with open(os.path.join(ud, *rel.split("/")), "wb") as f:
+            f.write(data)
+    dpps = os.path.join(root, "dpps_host_test_canon.exe")
+    with open(dpps, "wb") as f:
+        f.write(b"MZ stand-in for the DPPS exe")
+    return {"bin": bin_dir, "runs": runs, "recs": [os.path.join(runs, n) for n in names], "ud": ud, "dpps": dpps, "build": build}
+
+
+def run_bundle(inp, out, recs=None, **over):
+    """np_bundle.py as the user runs it. over replaces an option by its name without dashes (userdata=None drops it)."""
+    args = {"bin": inp["bin"], "recs": ",".join(inp["recs"] if recs is None else recs), "userdata": inp["ud"], "dpps": inp["dpps"], "out": out}
+    args.update(over)
+    cmd = [sys.executable, "-I", os.path.join(TOOLS, "np_bundle.py")]
+    for k, v in args.items():
+        if v is not None:
+            cmd += [f"--{k}", v]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    return p.returncode, p.stdout + p.stderr
+
+
+def tree_files(folder):
+    """{relative path with '/': absolute path} of every file under folder."""
+    found = {}
+    for dirpath, _, filenames in os.walk(folder):
+        for f in filenames:
+            p = os.path.join(dirpath, f)
+            found[os.path.relpath(p, folder).replace(os.sep, "/")] = p
+    return found
+
+
+def file_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_bundle_layout(root):
+    inp = make_bundle_inputs(root)
+    out = os.path.join(root, "bundle_x")
+    code, text = run_bundle(inp, out)
+    check(code == 0, f"np_bundle, good inputs: exit {code}\n{text}")
+    files = tree_files(out)
+    expected = sorted(["bin/TracyClient.dll", "bin/dead_or_alive_4.exe", "bin/rexruntime.dll", "dpps_host_test_canon.exe", "README.txt",
+                       "recordings.txt", "run_check.bat", "run_one.ps1", "recs/ra.d4r", "recs/rb.d4r", "ud_pristine/save.bin",
+                       "ud_pristine/sub/deep/x.dat"])
+    check(sorted(files) == expected, f"np_bundle: the folder holds exactly the expected files:\n{sorted(files)}\n{expected}")
+    # byte-for-byte copies of the sources
+    copies = {f"bin/{n}": os.path.join(inp["bin"], n) for n in ("dead_or_alive_4.exe", "rexruntime.dll", "TracyClient.dll")}
+    copies.update({"dpps_host_test_canon.exe": inp["dpps"], "recs/ra.d4r": os.path.join(inp["runs"], "ra", "out", "rec.d4r"),
+                   "recs/rb.d4r": os.path.join(inp["runs"], "rb", "out", "rec.d4r"), "ud_pristine/save.bin": os.path.join(inp["ud"], "save.bin"),
+                   "ud_pristine/sub/deep/x.dat": os.path.join(inp["ud"], "sub", "deep", "x.dat")})
+    for rel, src in copies.items():
+        check(rel in files and file_bytes(files[rel]) == file_bytes(src), f"np_bundle: {rel} is a byte-for-byte copy of its source")
+    check(os.path.isdir(os.path.join(out, "ud_pristine", "empty")), "np_bundle: the user data's empty folder is copied too")
+    # the batch file and the PowerShell helper are written for Windows: ASCII, CRLF throughout, no BOM, no placeholder left
+    for rel in ("run_check.bat", "run_one.ps1", "README.txt", "recordings.txt"):
+        data = file_bytes(files[rel]) if rel in files else b""
+        cr, lf, crlf = data.count(bytes([13])), data.count(bytes([10])), data.count(bytes([13, 10]))
+        check(len(data) > 0 and all(b < 128 for b in data), f"np_bundle: {rel} is non-empty ASCII")
+        check(cr == lf == crlf and lf > 0 and not data.startswith(bytes([0xEF, 0xBB, 0xBF])),
+              f"np_bundle: {rel} has CRLF line ends only and no BOM (CR {cr}, LF {lf}, CRLF {crlf})")
+        check(not any(p in data for p in (b"@RECS@", b"@DPPS@", b"@N@", b"@MINUTES@", b"@BUILD@", b"@DATA@")),
+              f"np_bundle: {rel} holds no template placeholder")
+    bat = file_bytes(files["run_check.bat"]).decode("ascii") if "run_check.bat" in files else ""
+    check(len(re.findall(r'^set "GAME=', bat, re.M)) == 1, "run_check.bat: exactly one GAME line, the line the friend edits")
+    check("for %%R in (ra rb) do" in bat, "run_check.bat: the recordings in the for line, in order")
+    check("dpps_host_test_canon.exe" in bat and "\\" in bat, "run_check.bat: runs the DPPS exe the bundle holds, with backslash paths")
+    check(file_bytes(files["recordings.txt"]).decode("ascii").split() == ["ra", "rb"], "np_bundle: recordings.txt lists the names, one a line")
+    readme = file_bytes(files["README.txt"]).decode("ascii") if "README.txt" in files else ""
+    check(inp["build"] in readme and "8ce3302b3fcea98d" in readme, "README.txt names the build id and the game data id of the recordings")
+    check("about 6 minutes" in readme, "README.txt: the time is 3 minutes a recording (default --minutes-each 3) times the 2 recordings")
+    # no CPU affinity anywhere in what runs on the friend's PC (a mask from this 16-thread PC must never reach a 12-thread CPU)
+    ps1 = file_bytes(files["run_one.ps1"]).decode("ascii") if "run_one.ps1" in files else ""
+    for word in ("affinity", "ProcessorAffinity", "SetProcessAffinityMask"):
+        check(word.lower() not in (bat + ps1).lower(), f"run_check.bat and run_one.ps1 never mention {word}")
+    # the zip beside the folder: the same files at its root (no top folder), '/' separators, same bytes
+    with zipfile.ZipFile(out + ".zip") as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        check(sorted(names) == expected, f"np_bundle: the zip holds the same files:\n{sorted(names)}")
+        # (orig_filename: ZipFile.namelist() turns a '\' of a Windows-written name into '/', which hides the defect)
+        check(all("\\" not in i.orig_filename for i in z.infolist()), "np_bundle: zip entry names use '/' as written in the file")
+        check(all(z.read(n) == file_bytes(files[n]) for n in names if n in files), "np_bundle: the zip's files equal the folder's")
+    check("recordings ra, rb" in text, f"np_bundle prints what it built\n{text}")
+
+
+def test_bundle_refusals(root):
+    # control first: inputs that are fine give a bundle (a refusal below is then about the one thing changed)
+    good = make_bundle_inputs(os.path.join(root, "good"))
+    code, text = run_bundle(good, os.path.join(root, "good", "out_bundle"))
+    check(code == 0, f"np_bundle refusals, control: good inputs exit {code}\n{text}")
+    other = "0123456789abcdef"
+
+    def refused(case, *why, mutate=None, names=("ra", "rb"), recs=None, **over):
+        sub = os.path.join(root, case)
+        inp = make_bundle_inputs(sub, names=names, **({"builds": over.pop("builds")} if "builds" in over else {}))
+        if mutate:
+            mutate(inp)
+        out = os.path.join(sub, "bundle_out")
+        code, text = run_bundle(inp, out, recs=recs(inp) if recs else None, **over)
+        left = [p for p in (out, out + ".zip", out + ".partial") if os.path.exists(p)]
+        check(code != 0, f"np_bundle {case}: must be refused, exit {code}\n{text}")
+        check("Traceback" not in text, f"np_bundle {case}: a refusal is a message, not a crash (a traceback quotes the code and satisfies any token)\n{text}")
+        check(all(w in text for w in why), f"np_bundle {case}: the message names {why}\n{text}")
+        check(not left, f"np_bundle {case}: nothing is left behind: {left}")
+
+    def edit_file(inp, rel, fn):
+        p = os.path.join(inp["bin"], rel) if rel.endswith((".exe", ".dll")) else rel
+        data = fn(file_bytes(p))  # read and transform BEFORE the file is opened for writing (open("wb") empties it)
+        with open(p, "wb") as f:
+            f.write(data)
+
+    def put_rec(name, data):
+        def mutate(inp):
+            with open(os.path.join(inp["runs"], name, "out", "rec.d4r"), "wb") as f:
+                f.write(data)
+        return mutate
+
+    flip = lambda d: bytes([d[0] ^ 1]) + d[1:]  # noqa: E731
+    # A1: every recording's build id must be the id of --bin's exe (the id the tool computes from the exe and the dll)
+    refused("one_other_build", "recording rb was made by build " + other, builds={"rb": other})
+    # (the next one: equal to each other, not to the exe; a check of the recordings against each other only would pass it)
+    refused("all_other_build", "recording ra was made by build " + other, "recording rb was made by build " + other, builds={"ra": other, "rb": other})
+    refused("two_other_builds", "recording ra was made by build " + other, "recording rb was made by build fedcba9876543210",
+            builds={"ra": other, "rb": "fedcba9876543210"})
+    refused("exe_changed", "made by build " + good["build"], mutate=lambda i: edit_file(i, "dead_or_alive_4.exe", flip))
+    refused("dll_changed", "made by build " + good["build"], mutate=lambda i: edit_file(i, "rexruntime.dll", flip))
+    refused("version_1", "recording ra", "has no meta", mutate=put_rec("ra", rec_bytes("", version=1)))
+    refused("no_build_line", "recording ra", "no build id", mutate=put_rec("ra", rec_bytes("data=x\nfixes=seed\n")))
+    refused("unreadable_build", "recording ra", "build=unreadable", builds={"ra": "unreadable"})
+    refused("cut_short", "recording ra", "cut short", mutate=put_rec("ra", rec_bytes(BUNDLE_META.format(build=other))[:40]))
+    refused("not_a_recording", "recording ra", "not a recording", mutate=put_rec("ra", b"hello world, this is no recording at all...."))
+
+    def write_text(inp, name, rel, text):
+        with open(os.path.join(inp["runs"], name, "out", rel), "w") as f:
+            f.write(text)
+
+    # the record run must have ended well, and be a run folder with a recording
+    refused("record_failed", "recording ra", "status failed", mutate=lambda i: write_text(i, "ra", "run_result.txt", "status failed\nexit 3\ntimeout 0\nquit none\n"))
+    refused("no_run_result", "recording ra", "run_result.txt", mutate=lambda i: os.remove(os.path.join(i["runs"], "ra", "out", "run_result.txt")))
+    refused("no_recording", "recording ra", "rec.d4r", mutate=lambda i: os.remove(os.path.join(i["runs"], "ra", "out", "rec.d4r")))
+    refused("no_recs", "--recs", recs=lambda i: [])
+    # names that cannot be put in a batch `for` list and in paths
+    for tag, bad in {"space": "r a", "amp": "r&a", "percent": "r%a", "caret": "r^a", "paren": "r(a)", "semicolon": "r;a", "quote": "r'a"}.items():
+        refused(f"name_{tag}", bad, "name", names=(bad,))
+    refused("duplicate_names", "recording ra", "twice", recs=lambda i: [i["recs"][0], i["recs"][0]])  # (the same folder named twice)
+    # the other inputs
+    for rel in ("dead_or_alive_4.exe", "rexruntime.dll", "TracyClient.dll"):
+        refused(f"no_{rel.split('.')[0]}", rel, mutate=lambda i, rel=rel: os.remove(os.path.join(i["bin"], rel)))
+    refused("empty_exe", "dead_or_alive_4.exe", mutate=lambda i: edit_file(i, "dead_or_alive_4.exe", lambda d: b""))
+    refused("no_userdata", "--userdata", "is not a folder", userdata=os.path.join(root, "nope"))
+    refused("no_dpps", "--dpps", "is not a file", dpps=os.path.join(root, "nope.exe"))
+    # an existing --out (the folder or the zip) is never overwritten or merged into
+    sub = os.path.join(root, "exists")
+    inp = make_bundle_inputs(sub)
+    out = os.path.join(sub, "bundle_out")
+    os.makedirs(out)
+    with open(os.path.join(out, "keep.txt"), "w") as f:
+        f.write("mine")
+    code, text = run_bundle(inp, out)
+    check(code != 0 and "exists" in text and os.listdir(out) == ["keep.txt"], f"np_bundle: an existing --out is refused and untouched: exit {code}\n{text}")
+    shutil.rmtree(out)
+    with open(out + ".zip", "w") as f:
+        f.write("mine")
+    code, text = run_bundle(inp, out)
+    check(code != 0 and "exists" in text and not os.path.exists(out) and file_bytes(out + ".zip") == b"mine",
+          f"np_bundle: an existing --out.zip is refused and untouched: exit {code}\n{text}")
+
+
+def test_bundle_rollback(root):
+    # a failure while the bundle is being put together leaves no folder, no .partial and no zip (an interrupted writer must not
+    # leave a half bundle that looks finished: the folder is built aside and renamed when complete)
+    bundle = load("np_bundle")
+    inp = make_bundle_inputs(root)
+    out = os.path.join(root, "bundle_rb")
+    real_copy, calls = bundle.copy_file, []
+
+    def failing(src, dst):
+        calls.append(dst)
+        if len(calls) == 6:
+            raise OSError("disk full (injected)")
+        return real_copy(src, dst)
+
+    bundle.copy_file = failing
+    try:
+        _, err = attempt(bundle.build_bundle, inp["bin"], inp["recs"], inp["ud"], inp["dpps"], out)
+    finally:
+        bundle.copy_file = real_copy
+    check(err is not None and "disk full" in err, f"bundle rollback: the injected failure comes through: {err}")
+    # (shutil.copytree collects a failed copy and goes on, so the calls after the sixth still happen: at least six were made)
+    check(len(calls) >= 6, f"bundle rollback fixture: the failure came after five copies, not before any: {len(calls)} calls")
+    left = [p for p in (out, out + ".zip", out + ".partial") if os.path.exists(p)]
+    check(not left, f"bundle rollback: nothing is left behind: {left}")
+    # and the tool still builds into the same place afterwards
+    got, err = attempt(bundle.build_bundle, inp["bin"], inp["recs"], inp["ud"], inp["dpps"], out)
+    check(err is None and os.path.isdir(out) and os.path.exists(out + ".zip"), f"bundle rollback: a later build into the same --out works: {err}")
+
+
+def snapshot(folder):
+    """(relative path, size, mtime in ns) of every file and folder under `folder`: what a "was never written" check compares."""
+    rows = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        for n in dirnames + filenames:
+            p = os.path.join(dirpath, n)
+            st = os.stat(p)
+            rows.append((os.path.relpath(p, folder), st.st_size if os.path.isfile(p) else -1, st.st_mtime_ns))
+    return sorted(rows)
+
+
+def patch_bat(bundle_dir, **values):
+    """Sets `set "KEY=value"` lines of the bundle's run_check.bat (the way the friend sets the GAME line); returns the
+    previous values and the problems (a key that is not exactly one line)."""
+    path = os.path.join(bundle_dir, "run_check.bat")
+    text = file_bytes(path).decode("ascii")
+    old, problems = {}, []
+    for key, value in values.items():
+        found = re.findall(rf'^set "{key}=(.*)"\r$', text, re.M)
+        if len(found) != 1:
+            problems.append(f"{key}: {len(found)} lines")
+            continue
+        old[key] = found[0]
+        text = text.replace(f'set "{key}={found[0]}"\r', f'set "{key}={value}"\r')
+    with open(path, "wb") as f:
+        f.write(text.encode("ascii"))
+    return old, problems
+
+
+def runnable_bundle(root, names, timeout=None, game_name="game dir (x86)"):
+    """Record runs made by the stand-in game (np_run.py record) with real-format recordings written over theirs, a bundle
+    built from them by np_bundle.py, and that bundle set up as the friend sets it up (GAME) plus the two lines only a test
+    changes: EXE (the stand-in game in the bundle's bin folder, like the real exe) and TIMEOUT. The DPPS exe is a harmless
+    real one (hostname.exe). Returns a dict: dir, game, local, shipped_game (the GAME line as shipped)."""
+    inp = make_bundle_inputs(root, names=())
+    ud, local = make_userdata(root), os.path.join(root, "local")
+    for n in names:
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", n, "--script", SCRIPT, "--userdata", ud,
+                            "--runs", local, "--exe", FAKE_EXE, "--timeout", "60"], capture_output=True, text=True, env=stand_in_env(), timeout=120)
+        check(p.returncode == 0, f"runnable_bundle: the stand-in's record run {n}: exit {p.returncode}\n{p.stdout}{p.stderr}")
+        with open(os.path.join(local, n, "out", "rec.d4r"), "wb") as f:  # the real format, 12 frames, the bundle's build id
+            f.write(rec_bytes(BUNDLE_META.format(build=inp["build"]), frames=12))
+    out = os.path.join(root, "bundle")
+    code, text = run_bundle(inp, out, recs=[os.path.join(local, n) for n in names])
+    check(code == 0, f"runnable_bundle: np_bundle exit {code}\n{text}")
+    game = os.path.join(root, game_name)
+    os.makedirs(os.path.join(game, "media"))
+    for rel in ("default.xex", os.path.join("media", "a.dat")):
+        with open(os.path.join(game, rel), "wb") as f:
+            f.write(b"stand-in game data")
+    for f in ("fake_game.cmd", "fake_game.py"):
+        shutil.copy(os.path.join(HERE, f), os.path.join(out, "bin", f))
+    shutil.copy(os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "hostname.exe"), os.path.join(out, "dpps_host_test_canon.exe"))
+    values = {"GAME": game, "EXE": "%~dp0bin\\fake_game.cmd"}
+    if timeout:
+        values["TIMEOUT"] = str(timeout)
+    old, problems = patch_bat(out, **values)
+    check(not problems, f"runnable_bundle: run_check.bat lines to set: {problems}")
+    return {"dir": out, "game": game, "local": local, "shipped_game": old.get("GAME"), "shipped_exe": old.get("EXE")}
+
+
+def run_bat(bundle_dir, **env):
+    """run_check.bat as the friend runs it, its `pause` answered; (exit code, its console output)."""
+    p = subprocess.run(["cmd", "/c", os.path.join(bundle_dir, "run_check.bat")], input=b"\r\n", capture_output=True,
+                       env=stand_in_env(**env), timeout=600)
+    return p.returncode, (p.stdout + p.stderr).decode("oem", errors="replace")
+
+
+def stand_in_lines(log_text, key):
+    prefix = f"stand-in game: {key} "
+    return [l[len(prefix):] for l in log_text.splitlines() if l.startswith(prefix)]
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def test_run_check_bat(root):
+    # run_check.bat end to end with the stand-in game: what it does for a replay, as np_run.py does it (the environment, the
+    # command line, the working folder), what it leaves in results.zip, what it never touches, and that its result feeds np_crosscheck
+    names = ("ra_ok", "rb_ok")
+    b = runnable_bundle(root, names)
+    bundle, game = b["dir"], b["game"]
+    check(b["shipped_exe"] == "%~dp0bin\\dead_or_alive_4.exe", f"run_check.bat as shipped: the EXE line: {b['shipped_exe']!r}")
+    game_before, ud_before = snapshot(game), snapshot(os.path.join(bundle, "ud_pristine"))
+    # leftovers of an earlier run in the bundle folder: run_check.bat starts from nothing (a stale out/ run or results.zip would be sent back)
+    os.makedirs(os.path.join(bundle, "out", "stale_run"))
+    with open(os.path.join(bundle, "out", "stale_run", "x.txt"), "w") as f:
+        f.write("stale")
+    with open(os.path.join(bundle, "results.zip"), "w") as f:
+        f.write("stale")
+    # the caller's environment holds DOA4_ variables left over from other runs and a real controller allow-list
+    caller = {"DOA4_NP_SEED": "999", "DOA4_NP_FIX": "none", "DOA4_NP_DUMP": "0,12", "DOA4_NP_QUIT": "5", "DOA4_PHOTO_TEST": "hotkey",
+              "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT": "0x045E/0x028E"}
+    code, text = run_bat(bundle, **caller)
+    check(code == 0 and "DONE" in text, f"run_check.bat, good run: exit {code}\n{text}")
+    check(snapshot(game) == game_before, "run_check.bat never writes the game folder (names, sizes and times equal before and after)")
+    check(snapshot(os.path.join(bundle, "ud_pristine")) == ud_before, "run_check.bat never writes the bundle's pristine save (each run copies it)")
+    check(os.path.isdir(os.path.join(bundle, "cache")), "run_check.bat: the shader cache folder is inside the bundle")
+    zpath = os.path.join(bundle, "results.zip")
+    check(os.path.exists(zpath), "run_check.bat: results.zip is made")
+    unz = os.path.join(root, "unz")
+    members = []
+    if os.path.exists(zpath) and zipfile.is_zipfile(zpath):
+        with zipfile.ZipFile(zpath) as z:
+            members = z.namelist()
+            raw_names = [i.orig_filename for i in z.infolist()]
+            z.extractall(unz)
+    else:
+        raw_names = []
+    check(len(members) > 0 and not any("stale" in m for m in members), f"run_check.bat: results.zip is the new one and holds nothing of the stale run: {members[:3]}")
+    for n in names:
+        for rel in ("out/np_log.txt", "out/run_result.txt", "out/digest.d4d", "out/sweep.d4s", "out/counters.d4k", "command.txt", "pid.txt", "stdout.txt"):
+            check(f"out/{n}/{rel}" in members, f"results.zip holds out/{n}/{rel}")
+        check(not any(m.startswith(f"out/{n}/ud") for m in members), f"results.zip holds no copy of the save (out/{n}/ud)")
+        run = os.path.join(unz, "out", n)
+        log = file_bytes(os.path.join(run, "out", "np_log.txt")).decode("utf-8", "replace") if os.path.exists(os.path.join(run, "out", "np_log.txt")) else ""
+        want_args = [f"--game_data_root={game}", f"--user_data_root={os.path.join(bundle, 'out', n, 'ud')}",
+                     f"--log_file={os.path.join(bundle, 'out', n, 'game.log')}", "--headless=true", f"--cache_path={os.path.join(bundle, 'cache')}"]
+        got_args = (stand_in_lines(log, "args") or [""])[0].split("|")
+        check(len(got_args) == 5 and all(same_path(a, w) for a, w in zip(got_args, want_args)), f"{n}: the game's command line (np_run's order, quoted paths):\n{got_args}\n{want_args}")
+        cwd = (stand_in_lines(log, "cwd") or [""])[0]
+        check(cwd != "" and same_path(cwd, os.path.join(bundle, "bin")), f"{n}: the game starts with the bundle's bin folder as its working folder: {cwd!r}")
+        check(stand_in_lines(log, "ud") == ["yes empty,save.bin,sub"], f"{n}: the game's --user_data_root held a fresh copy of the save when it started: {stand_in_lines(log, 'ud')}")
+        envs = stand_in_lines(log, "env")
+        want_env = ["DOA4_NP=replay", f"DOA4_NP_DIR={os.path.join(bundle, 'out', n, 'out')}", f"DOA4_NP_REC={os.path.join(bundle, 'recs', n + '.d4r')}"]
+        check(len(envs) == 3 and envs[0] == want_env[0] and all(same_path(e.split("=", 1)[1], w.split("=", 1)[1]) and e.split("=", 1)[0] == w.split("=", 1)[0]
+                                                               for e, w in zip(envs[1:], want_env[1:])),
+              f"{n}: exactly DOA4_NP, DOA4_NP_DIR, DOA4_NP_REC in the game's environment (the caller's DOA4_ variables are cleared):\n{envs}")
+        check("stand-in game: SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000\n" in log.replace("\r\n", "\n"),
+              f"{n}: SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT is 0x0000/0x0000 whatever the caller's was (0x045E/0x028E)")
+        rr = file_bytes(os.path.join(run, "out", "run_result.txt")).decode("utf-8") if os.path.exists(os.path.join(run, "out", "run_result.txt")) else ""
+        check(rr.replace("\r\n", "\n") == REP_OK, f"{n}: run_result.txt as np_run.py writes it:\n{rr!r}")
+        cmd = file_bytes(os.path.join(run, "command.txt")).decode("utf-8").splitlines() if os.path.exists(os.path.join(run, "command.txt")) else []
+        check(len(cmd) == 5 and cmd[0].startswith(os.path.join(bundle, "bin", "fake_game.cmd") + " ") and cmd[1].startswith("DOA4_NP=replay")
+              and cmd[4] == "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000", f"{n}: command.txt lists the command line and the DOA4_ and SDL variables, as np_run.py's does:\n{cmd}")
+    for rel in ("dpps.txt", "sysinfo.txt", "recordings.txt"):
+        check(rel in members, f"results.zip holds {rel}")
+    dpps_text = file_bytes(os.path.join(unz, "dpps.txt")).decode("oem", "replace").splitlines() if "dpps.txt" in members else []
+    check(len(dpps_text) >= 2 and dpps_text[-1].strip() == "exit 0", f"dpps.txt: the exe's output and its exit code as the last line: {dpps_text}")
+    sysinfo = file_bytes(os.path.join(unz, "sysinfo.txt")).decode("utf-8", "replace") if "sysinfo.txt" in members else ""
+    check(re.search(r"^OS: .+", sysinfo, re.M) and re.search(r"^CPU: .+logical", sysinfo, re.M), f"sysinfo.txt names the OS and the CPU with its logical count:\n{sysinfo}")
+    check(len(raw_names) > 0 and not any("\\" in m for m in raw_names), "results.zip: entry names use '/' as written in the file (orig_filename, not namelist())")
+    # the whole chain: results -> np_crosscheck. The stand-in DPPS output has no hash: runs EQUAL, the DPPS line DIFFERS, exit 1;
+    # with the real canonical output in dpps.txt (the stand-in for what the friend's exe prints) every line is EQUAL, exit 0
+    if os.path.exists(unz):
+        code, out = crosscheck_run(unz, b["local"])
+        check(code == 1 and "== ra_ok: EQUAL" in out and "== rb_ok: EQUAL" in out and "DPPS canonical: friend missing" in out, f"chain: runs equal, no DPPS hash: exit {code}\n{out}")
+        with open(os.path.join(unz, "dpps.txt"), "w", newline="") as f:
+            f.write(fixture_text("dpps_canon_sample.txt"))
+        code, out = crosscheck_run(unz, b["local"])
+        check(code == 0 and "DPPS canonical: friend 9358b1f6111e7b0e, this PC 9358b1f6111e7b0e: EQUAL" in out, f"chain: everything equal: exit {code}\n{out}")
+
+
+def test_run_check_bat_modes(root):
+    # every way a replay can end, through run_check.bat: its run_result.txt is what np_run.py writes (np_run.judge is the
+    # oracle for status and quit text), a hung replay is ended after TIMEOUT with "status timeout" and the NEXT recording still runs
+    names = ("m_ok", "m_warn", "m_crash", "m_refuse", "m_leaky", "m_cannot", "m_badexit", "m_wrongquit", "m_hang", "m_ok2")
+    b = runnable_bundle(root, names, timeout=3)
+    bundle = b["dir"]
+    modes = {"FAKE_GAME_WARN": "_warn", "FAKE_GAME_FAIL": "_crash", "FAKE_GAME_REFUSE": "_refuse", "FAKE_GAME_REFUSE_LEAKY": "_leaky",
+             "FAKE_GAME_CANNOT": "_cannot", "FAKE_GAME_HANG": "_hang", "FAKE_GAME_BADEXIT": "_badexit", "FAKE_GAME_WRONGQUIT": "_wrongquit"}
+    started = time.time()
+    code, text = run_bat(bundle, **modes)
+    elapsed = time.time() - started
+    check(code == 0 and "DONE" in text, f"run_check.bat, every ending: exit {code}\n{text}")
+    check(elapsed < 150, f"run_check.bat, every ending: finished in {elapsed:.0f} s (the hung run was ended after its 3 s timeout)")
+    check("timeout after 3 s: ending pid" in text and "m_hang: status timeout" in text, f"run_check.bat: the console says the hung run was ended\n{text}")
+    np_run = load("np_run")
+    want = {"m_ok": ("ok", "0", "0"), "m_warn": ("failed", "0", "0"), "m_crash": ("failed", "3", "0"), "m_refuse": ("failed", "0", "0"),
+            "m_leaky": ("failed", "0", "0"), "m_cannot": ("failed", "0", "0"), "m_badexit": ("failed", "5", "0"), "m_wrongquit": ("failed", "0", "0"),
+            "m_hang": ("timeout", None, "1"), "m_ok2": ("ok", "0", "0")}
+    fake = fake_game_module()
+    for n in names:
+        run_out = os.path.join(bundle, "out", n, "out")
+        rr_path, log_path = os.path.join(run_out, "run_result.txt"), os.path.join(run_out, "np_log.txt")
+        rr = file_bytes(rr_path).decode("utf-8") if os.path.exists(rr_path) else ""
+        fields = dict(l.split(" ", 1) for l in rr.replace("\r\n", "\n").splitlines() if " " in l)
+        status, exit_code, timeout = want[n]
+        check(fields.get("status") == status and fields.get("timeout") == timeout and (fields.get("exit") != "0" if exit_code is None else fields.get("exit") == exit_code),
+              f"{n}: run_result.txt status/exit/timeout {status}/{exit_code or 'not 0 (the process was ended)'}/{timeout}:\n{rr!r}")
+        check(rr.count("\n") == 4 and rr.endswith("\n") and "\r" not in rr and not rr.startswith("\ufeff"), f"{n}: run_result.txt is four LF lines, no BOM:\n{rr!r}")
+        lines = file_bytes(log_path).decode("utf-8", "replace").splitlines() if os.path.exists(log_path) else []
+        oracle_status, oracle_quit = np_run.judge("replay", int(fields.get("exit", "-1")), fields.get("timeout") == "1", lines, run_out)
+        check(fields.get("quit") == oracle_quit and (fields.get("status") == oracle_status or fields.get("status") == "timeout"),
+              f"{n}: status and quit text equal np_run.judge's on the same log: {fields} vs {(oracle_status, oracle_quit)}")
+    quit_of = lambda n: dict(l.split(" ", 1) for l in file_bytes(os.path.join(bundle, "out", n, "out", "run_result.txt")).decode().splitlines() if " " in l).get("quit", "")  # noqa: E731
+    check(quit_of("m_warn").startswith(fake.KEEPALIVE_WARN) and quit_of("m_warn").endswith("(quit at frame 12: end of the recording)"), f"m_warn: {quit_of('m_warn')!r}")
+    check(quit_of("m_refuse") == "refused: the recording was made with a different sweep 4 vs 8", f"m_refuse: {quit_of('m_refuse')!r}")
+    check(quit_of("m_leaky").startswith("refusal not honoured (a session started after it; digest.d4d was written): refused: "), f"m_leaky: {quit_of('m_leaky')!r}")
+    check(quit_of("m_cannot").startswith("cannot replay ") and "m_cannot.d4r" in quit_of("m_cannot"), f"m_cannot: {quit_of('m_cannot')!r}")
+    check(quit_of("m_crash") == "none" and quit_of("m_hang") == "none", f"m_crash/m_hang: no quit line: {quit_of('m_crash')!r} {quit_of('m_hang')!r}")
+    # a good quit line does not make a run good: the exit code counts, and so does the reason (only the end of the recording is good)
+    check(quit_of("m_badexit") == "quit at frame 12: end of the recording", f"m_badexit: {quit_of('m_badexit')!r}")
+    check(quit_of("m_wrongquit") == "quit at frame 12: quit frame", f"m_wrongquit: {quit_of('m_wrongquit')!r}")
+    check(os.path.exists(os.path.join(bundle, "results.zip")), "run_check.bat: results.zip is made although runs failed")
+    # the hung run's process (the stand-in's cmd.exe, started by the helper) is gone; the helper ended only that one
+    check(suspended_leftovers(os.path.join(bundle, "out", "m_hang")) == 0, "run_check.bat: the hung run's process was ended")
+    time.sleep(fake.HANG_SECONDS + 2)  # the stand-in's python child outlives its killed cmd.exe: let it end before the folder is removed
+
+
+def test_run_check_bat_preflight(root):
+    b = runnable_bundle(root, ("pa",))
+    bundle, game = b["dir"], b["game"]
+    # as shipped, GAME is not set: nothing is run, nothing is made, the exit code says so
+    patch_bat(bundle, GAME=b["shipped_game"])
+    code, text = run_bat(bundle)
+    check(code == 1 and "GAME" in text, f"run_check.bat, GAME as shipped: exit {code}\n{text}")
+    check(not os.path.exists(os.path.join(bundle, "out")) and not os.path.exists(os.path.join(bundle, "results.zip")), "run_check.bat, GAME as shipped: no run was made")
+    # a folder without default.xex
+    empty = os.path.join(root, "empty_game")
+    os.makedirs(empty)
+    patch_bat(bundle, GAME=empty)
+    code, text = run_bat(bundle)
+    check(code == 1 and "default.xex" in text and not os.path.exists(os.path.join(bundle, "out")), f"run_check.bat, GAME without default.xex: exit {code}\n{text}")
+    # GAME typed with a trailing backslash (a common way to write a folder): the game gets the folder without it
+    patch_bat(bundle, GAME=game + "\\")
+    code, text = run_bat(bundle)
+    log_path = os.path.join(bundle, "out", "pa", "out", "np_log.txt")
+    log = file_bytes(log_path).decode("utf-8", "replace") if os.path.exists(log_path) else ""
+    args = (stand_in_lines(log, "args") or [""])[0].split("|")
+    check(code == 0 and args[0] == f"--game_data_root={game}" and "pa" in os.listdir(os.path.join(bundle, "out")),
+          f"run_check.bat, GAME with a trailing backslash: exit {code}, args {args[:1]}\n{text}")
+    # the helper's check, directly: a path with a letter outside plain ASCII is refused (the game decodes its command line
+    # in the ANSI code page, observation #0296), and so is a bundle folder with one
+    ps1 = os.path.join(bundle, "run_one.ps1")
+    exe = os.path.join(bundle, "bin", "fake_game.cmd")
+
+    def ps_check(script, game_dir, exe_path):
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-Check", "-Game", game_dir,
+                            "-Exe", exe_path], capture_output=True, timeout=120)
+        return p.returncode, (p.stdout + p.stderr).decode("oem", errors="replace")
+
+    code, text = ps_check(ps1, game, exe)
+    check(code == 0, f"run_one.ps1 -Check, good paths: exit {code}\n{text}")
+    accent = os.path.join(root, "caf\u00e9 game")
+    os.makedirs(accent)
+    shutil.copy(os.path.join(game, "default.xex"), os.path.join(accent, "default.xex"))
+    code, text = ps_check(ps1, accent, exe)
+    check(code == 1 and "plain" in text, f"run_one.ps1 -Check, a non-ASCII game folder: exit {code}\n{text}")
+    accent_bundle = os.path.join(root, "caf\u00e9 bundle")
+    os.makedirs(accent_bundle)
+    shutil.copy(ps1, os.path.join(accent_bundle, "run_one.ps1"))
+    code, text = ps_check(os.path.join(accent_bundle, "run_one.ps1"), game, exe)
+    check(code == 1 and "plain" in text, f"run_one.ps1 -Check, a non-ASCII bundle folder: exit {code}\n{text}")
+    code, text = ps_check(ps1, game, os.path.join(bundle, "bin", "nope.exe"))
+    check(code == 1 and "nope.exe" in text, f"run_one.ps1 -Check, no exe: exit {code}\n{text}")
+
+
+def dumpdiff_labels(root, name, a, b, *extra):
+    """The range lines np_dumpdiff.py prints for two dumps (the program itself, run as a user runs it)."""
+    pa, pb = os.path.join(root, name + "_a.bin"), os.path.join(root, name + "_b.bin")
+    for p, data in ((pa, a), (pb, b)):
+        with open(p, "wb") as f:
+            f.write(data)
+    p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_dumpdiff.py"), pa, pb, *extra], capture_output=True, text=True, timeout=60)
+    return p.returncode, [l for l in p.stdout.splitlines() if re.match(r"\s+[0-9A-F]{8} \+", l)]
+
+
+def test_dumpdiff_label(root):
+    # 11c review minor 2: the "SDK handle stash" label of np_dumpdiff.py itself (its only_stash test), through the program on
+    # dumps, not a re-implementation of the filter. Same fixtures as test_stash_words.
+    sig, other, sig1 = b"REX\x00", b"REY\x00", b"REX\x01"
+    stash = "SDK handle stash"
+    code, lines = dumpdiff_labels(root, "s1", stash_memory(sig, 0xF8000054), stash_memory(sig, 0xF800005C))
+    check(code == 0 and len(lines) == 1 and stash in lines[0], f"dumpdiff: a differing stash word (signature in both) is labelled: {lines}")
+    code, lines = dumpdiff_labels(root, "s2", stash_memory(other, 0xF8000054), stash_memory(other, 0xF800005C))
+    check(code == 0 and len(lines) == 1 and stash not in lines[0], f"dumpdiff: the same difference without the signature is not labelled: {lines}")
+    code, lines = dumpdiff_labels(root, "s3", stash_memory(sig, 0xF8000054), stash_memory(sig1, 0xF8000054))
+    check(len(lines) == 1 and stash not in lines[0], f"dumpdiff: a difference in the signature word is not labelled: {lines}")
+    # a stash word and the word after it differ and the two differences are one range (gap 16): not labelled, a non-stash word differs
+    code, lines = dumpdiff_labels(root, "s4", stash_memory(sig, 0xF8000054, 0x11223344), stash_memory(sig, 0xF800005C, 0x11223345))
+    check(len(lines) == 1 and stash not in lines[0], f"dumpdiff: a range with a non-stash word in it is not labelled: {lines}")
+    # the same dumps with --gap 0: two ranges, the stash word's is labelled and the other is not
+    code, lines = dumpdiff_labels(root, "s5", stash_memory(sig, 0xF8000054, 0x11223344), stash_memory(sig, 0xF800005C, 0x11223345), "--gap", "0")
+    check(len(lines) == 2 and stash in lines[0] and stash not in lines[1], f"dumpdiff --gap 0: only the stash word's range is labelled: {lines}")
+    # a word is a stash word for the label only if it is one in BOTH dumps: "signature, signature, handle" in one dump and
+    # "signature, other signature, handle" in the other (the second signature word differs, the handle differs): the handle
+    # word is a stash word in the first dump only, so the range is not labelled (a union of the two sets would label it)
+    chain = lambda second, handle: b"\x77" * 12 + sig + second + struct.pack(">I", handle) + b"\x77" * 12  # noqa: E731
+    code, lines = dumpdiff_labels(root, "s7", chain(sig, 0xF8000054), chain(sig1, 0xF800005C))
+    check(len(lines) == 1 and stash not in lines[0], f"dumpdiff: a stash word in one dump only is not labelled: {lines}")
+    # (control for that fixture: with the signature in both, the same handle difference is labelled)
+    code, lines = dumpdiff_labels(root, "s7c", chain(sig, 0xF8000054), chain(sig, 0xF800005C))
+    check(len(lines) == 1 and stash in lines[0], f"dumpdiff: fixture control, the signature in both dumps: {lines}")
+    # equal dumps: no ranges, nothing labelled
+    code, lines = dumpdiff_labels(root, "s6", stash_memory(sig, 0xF8000054), stash_memory(sig, 0xF8000054))
+    check(code == 0 and lines == [], f"dumpdiff: equal dumps print no range: {lines}")
 
 
 def main():

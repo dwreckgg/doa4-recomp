@@ -31,6 +31,15 @@ Test-only environment (the stand-in's own, not the game's):
   FAKE_GAME_WARN    same form: that run logs the determinism layer's WARN line (np_det.cpp: the keepalive fix
                     met the D3D kick thread calling from an unexpected site, KEEPALIVE_WARN below) halfway, and
                     otherwise ends cleanly - equal hashes, no fallback, the good quit line, exit 0
+  FAKE_GAME_HANG    same form: that run logs "session on" (no quit line, no digest), then sleeps HANG_SECONDS and
+                    exits 0 without writing anything more: a hung game that the caller's timeout has to end
+  FAKE_GAME_BADEXIT same form: that run ends with the good quit line and every file, but exits with code 5
+  FAKE_GAME_WRONGQUIT  same form, replays: that replay ends cleanly (exit 0) with another quit reason than the end of the
+                    recording ("quit at frame N: quit frame", the reason a record run or DOA4_NP_QUIT gives)
+Every run also logs where it was started and with what: "stand-in game: cwd <folder>", "stand-in game: args a|b|c",
+one "stand-in game: env DOA4_X=value" line per DOA4_ variable in its environment and "stand-in game: ud yes a,b" (the
+top-level names in its --user_data_root folder, "no" if there is none): the bundle's run_check.bat test reads them. A replay reads its recording as the real format (np_core.h: "D4NPREC1", version 2, 32-byte header, meta text,
+52-byte frames) or as the text file the stand-in's own record runs write (just the frame count).
 Like the real runtime at startup (rexglue-sdk src/system/runtime.cpp: thread::EnableAffinityConfiguration sets
 the process mask to the SYSTEM mask, result ignored) every run first tries to widen its own CPU mask, then
 logs the mask it ends up with ("stand-in game: affinity 0x.."). That is how the tests see whether
@@ -43,8 +52,10 @@ test_counter_names_match_source); fb_* are 0, pr_* are a function of the frame.
 import os
 import struct
 import sys
+import time
 
-REGIONS = [("game_obj", 0x8320D110, 0x63B0), ("frame_ctr", 0x831013E4, 4)]
+HANG_SECONDS = 8  # FAKE_GAME_HANG: long enough for a test's timeout of a few seconds, short enough that the orphan ends itself
+REGIONS =[("game_obj", 0x8320D110, 0x63B0), ("frame_ctr", 0x831013E4, 4)]
 SWEEP_PER = 2
 COUNTERS = ["fb_worker_token", "fb_main_wait", "fb_unranked", "fb_loader_outside", "fb_loader_idle",
             "fb_audio_late", "fb_spin_cap", "fb_cri_ready", "fb_audio_start", "fb_reader", "pr_cri_passes",
@@ -120,6 +131,18 @@ def listed(name, var):
     return any(s and name.endswith(s) for s in os.environ.get(var, "").split(","))
 
 
+def recording_frames(path):
+    """The frame count of a recording: the real format (np_core.h: "D4NPREC1", u32 version, u32 frame bytes (52), u64
+    seed, u32 flags, u32 meta bytes, the meta text, then 52 bytes a frame) or the text file the stand-in's own record
+    runs write (just the count)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] == b"D4NPREC1":
+        meta = struct.unpack_from("<I", data, 28)[0]
+        return (len(data) - 32 - meta) // 52
+    return int(data.split()[0])
+
+
 def main():
     mode = os.environ["DOA4_NP"]
     out = os.environ["DOA4_NP_DIR"]
@@ -127,8 +150,7 @@ def main():
     if mode == "record":
         frames = int(os.environ.get("FAKE_GAME_FRAMES", "12"))
     else:
-        with open(os.environ["DOA4_NP_REC"]) as f:
-            frames = int(f.read().split()[0])
+        frames = recording_frames(os.environ["DOA4_NP_REC"])
     rows = frames
     if mode == "replay" and listed(name, "FAKE_GAME_SHORT"):
         rows = frames - 1
@@ -149,13 +171,25 @@ def main():
             with open(os.path.join(out, "np_log.txt"), "w") as f:
                 f.write("\n".join(refusal) + "\n")
             sys.exit(0)
+    started = [f"stand-in game: {mode} run {name}, {rows} frames", f"stand-in game: affinity {process_affinity():#x}",
+               # the SDL controller allow-list the game's SDL reads at start (np_run.py sets it so no real pad is opened)
+               f"stand-in game: {SDL_PADS}={os.environ.get(SDL_PADS, '(unset)')}",
+               # where and how the launcher started this process (the bundle's run_check.bat test pins them)
+               f"stand-in game: cwd {os.getcwd()}", "stand-in game: args " + "|".join(sys.argv[1:])]
+    started += [f"stand-in game: env {k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("DOA4_")]
+    ud = next((a[len("--user_data_root="):] for a in sys.argv[1:] if a.startswith("--user_data_root=")), None)
+    started.append("stand-in game: ud " + ("(no --user_data_root)" if ud is None else
+                   "no" if not os.path.isdir(ud) else "yes " + ",".join(sorted(os.listdir(ud)))))
+    if mode == "replay" and listed(name, "FAKE_GAME_HANG"):
+        with open(os.path.join(out, "np_log.txt"), "w") as f:
+            f.write("\n".join(started + [f"session on: replay, sweep {SWEEP_PER} blocks/frame, quit frame none"]) + "\n")
+        time.sleep(HANG_SECONDS)
+        sys.exit(0)
     write_digest(os.path.join(out, "digest.d4d"), rows)
     write_sweep(os.path.join(out, "sweep.d4s"), rows, listed(name, "FAKE_GAME_SWEEP"))
     write_counters(os.path.join(out, "counters.d4k"), rows, listed(name, "FAKE_GAME_FALLBACK"),
                    listed(name, "FAKE_GAME_PROGRESS"), listed(name, "FAKE_GAME_PROGRESS_END"))
-    log = [f"stand-in game: {mode} run {name}, {rows} frames", f"stand-in game: affinity {process_affinity():#x}",
-           # the SDL controller allow-list the game's SDL reads at start (np_run.py sets it so no real pad is opened)
-           f"stand-in game: {SDL_PADS}={os.environ.get(SDL_PADS, '(unset)')}"]
+    log = list(started)
     if listed(name, "FAKE_GAME_WARN"):
         log.append(KEEPALIVE_WARN)
     if mode == "record":
@@ -168,10 +202,11 @@ def main():
         log.append("stand-in game: crashing")
         code = 3
     else:
+        wrong_quit = mode == "replay" and listed(name, "FAKE_GAME_WRONGQUIT")
         log.append(f"quit at frame {rows - 1}: quit frame" if mode == "record"
-                   else f"quit at frame {rows}: end of the recording")
+                   else f"quit at frame {rows}: " + ("quit frame" if wrong_quit else "end of the recording"))
         log += SUMMARY  # after the quit line, as np_det.cpp Stop logs them
-        code = 0
+        code = 5 if listed(name, "FAKE_GAME_BADEXIT") else 0
     with open(os.path.join(out, "np_log.txt"), "w") as f:
         f.write("\n".join(log) + "\n")
     sys.exit(code)
