@@ -2442,9 +2442,14 @@ def test_pair_desync(root):
     code, out, runs = np_pair(root, "dfx", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
                               "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "DOA4_NP_FORCE_DESYNC=6")
     check(code == 1 and "forced at frame 6" in out, f"np_pair, desync at another frame than the forced one: exit {code}\n{out}")
-    # (4) both name a desync but nothing diverged: the post-desync dumps are equal (#0331)
-    code, out, runs = np_pair(root, "dn", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7")
-    check(code == 1 and "post-desync dumps are equal" in out, f"np_pair, desync named but nothing diverged: exit {code}\n{out}")
+    # (4) review I1: each side needs a post-desync dump for a frame >= F; a pre-desync-only dump fails; dumps of different
+    # frames are not compared ("not comparable")
+    code, out, runs = np_pair(root, "dn", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "FAKE_ONLINE_DESYNC_DUMP_FRAME=5")
+    check(code == 1 and "joiner has no post-desync dump at or after frame 7" in out, f"np_pair, desync with a pre-desync-only dump: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "dnc", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8")
+    check(code == 0 and "not comparable (frames 8/10)" in out, f"np_pair, desync dumps of different frames: exit {code}\n{out}")
     code, out, runs = np_pair(root, "dm", "--expect", "desync", "--env-joiner", "FAKE_ONLINE_DIVERGE=7")
     check(code == 1 and "expected a desync" in out, f"np_pair, desync expected, the sides ended with a leave: exit {code}\n{out}")
 
@@ -2690,7 +2695,7 @@ def test_pair_quit(root):
     # Task 15 G2 (gate S6q): --expect quit with --quit-joiner-at-frame: the joiner ends `left`, the host `peer left` within
     # 1.5 s of np_pair's close request, the host relaunches offline (the joiner, ended by np_pair, is not waited for)
     slow = ("--env-host", "FAKE_ONLINE_FRAME_MS=100", "--env-joiner", "FAKE_ONLINE_FRAME_MS=100")
-    q = ("--expect", "quit", "--quit-joiner-at-frame", "8", "--env-joiner", "FAKE_ONLINE_LEFT_AT=8")
+    q = ("--expect", "quit", "--quit-joiner-at-frame", "8", "--env-joiner", "FAKE_ONLINE_LEFT_AT=8", "--env-joiner", "FAKE_ONLINE_LEFT_DELAY_S=0.6")
     code, out, runs = np_pair(root, "pq", *q, "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", *slow, quit_at=200)
     check(code == 0 and "verdict quit" in out, f"np_pair, a graceful quit ends the host at once: exit {code}\n{out}")
     check("host ended 'peer left'" in out, f"np_pair, quit: the host's end is named\n{out}")
@@ -2698,7 +2703,18 @@ def test_pair_quit(root):
     check(code == 1 and "expected 'peer left'" in out, f"np_pair, quit: the host never learns of it: exit {code}\n{out}")
     code, out, runs = np_pair(root, "pql", *q, "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", "--env-host",
                               "FAKE_ONLINE_PEER_LEFT_DELAY_S=2.5", *slow, quit_at=200)
-    check(code == 1 and "after the close request, expected <= 1500" in out, f"np_pair, quit: the host ends too late: exit {code}\n{out}")
+    check(code == 1 and "after the close request, expected 0..1500" in out, f"np_pair, quit: the host ends too late: exit {code}\n{out}")
+    # review M3: the joiner must end `left`; the host may not end before the close request; the joiner may not relaunch
+    code, out, runs = np_pair(root, "pqx", "--expect", "quit", "--quit-joiner-at-frame", "8", "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1",
+                              *slow, quit_at=60)
+    check(code == 1 and "the joiner copy ended None, expected 'left'" in out, f"np_pair, quit: no `left` line on the joiner: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "pqe", *q, "--env-host", "FAKE_ONLINE_END=peer left", "--env-host", "FAKE_ONLINE_QUIT_AT=4", *slow,
+                              quit_at=200)
+    check(code == 1 and "after the close request, expected 0..1500" in out and "host ended -" in out,
+          f"np_pair, quit: the host ended before the close request: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "pqr", *q, "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", "--env-joiner", "FAKE_ONLINE_LEFT_RELAUNCH=1",
+                              *slow, quit_at=200)
+    check(code == 1 and "the joiner relaunched offline" in out, f"np_pair, quit: the joiner relaunched offline: exit {code}\n{out}")
     code, out, runs = np_pair(root, "pqk", "--expect", "quit", "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", *slow)
     check(code == 1 and "needs --quit-joiner-at-frame" in out, f"np_pair, --expect quit without --quit-joiner-at-frame: exit {code}\n{out}")
 
@@ -2980,9 +2996,19 @@ def test_sweep_masks_match_source(root):
     mod = load("np_dumpdiff")
     src = open(os.path.join(HERE, "..", "..", "src", "net", "np_session.cpp"), encoding="utf-8").read()
     table = re.search(r"kSweepMasks\[\]\s*=\s*\{(.*?)\n\};", src, re.S)
-    rows = re.findall(r"\{\s*0x([0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+|\d+),", table.group(1)) if table else []
-    masks = [(int(a, 16), int(n, 0)) for a, n in rows]
-    check(len(masks) >= 6, f"np_session.cpp kSweepMasks: expected at least 6 rows, found {masks}")
+    # review M6: every row of the table (a line that opens a brace) must parse; the counts must be exact
+    body = table.group(1) if table else ""
+    row_lines = [l.strip() for l in body.splitlines() if l.strip().startswith("{")]
+    masks, unparsed = [], []
+    for l in row_lines:
+        m = re.match(r"\{\s*0x([0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+|\d+),", l)
+        if m:
+            masks.append((int(m.group(1), 16), int(m.group(2), 0)))
+        else:
+            unparsed.append(l)
+    check(table is not None and len(row_lines) > 0, "np_session.cpp: the kSweepMasks table was found and has rows")
+    check(unparsed == [], f"np_session.cpp kSweepMasks rows this test cannot parse: {unparsed}")
+    check(len(masks) == len(row_lines) == len(mod.SWEEP_MASKS), f"kSweepMasks rows {len(row_lines)}, parsed {len(masks)}, SWEEP_MASKS {len(mod.SWEEP_MASKS)}")
     check(sorted(mod.SWEEP_MASKS) == sorted(masks), f"np_dumpdiff.SWEEP_MASKS vs np_session.cpp kSweepMasks:\n{mod.SWEEP_MASKS}\n{masks}")
 
 
@@ -3110,7 +3136,13 @@ def test_pair_frame0(root):
             "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7", "--env-host", "FAKE_ONLINE_QUIT_AT=8", "--env-joiner", "FAKE_ONLINE_QUIT_AT=10")
     code, out, runs = np_pair(root, "f0ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DIVERGE=8",
                               "--env-joiner", "FAKE_ONLINE_DUMP0_DIFF=82B8ABCD")
-    check(code == 0 and "frame-0 .data dumps differ at 82B8ABCD" in out, f"np_pair, desync expected, the frame-0 line printed: exit {code}\n{out}")
+    # review M5: a frame-0 difference fails every session expect, not only ok
+    check(code == 1 and "frame-0 .data dumps differ at 82B8ABCD" in out, f"np_pair, desync expected, a frame-0 difference fails it: exit {code}\n{out}")
+    # and a missing frame-0 dump fails a lost run too
+    code, out, runs = np_pair(root, "f0lx", "--expect", "lost", "--kill-joiner-at-frame", "5", "--env-host", "FAKE_ONLINE_END=lost",
+                              "--env-host", "FAKE_ONLINE_FRAME_MS=100", "--env-joiner", "FAKE_ONLINE_FRAME_MS=100",
+                              "--env-joiner", "FAKE_ONLINE_NO_DUMP=1", quit_at=200)
+    check(code == 1 and "joiner wrote no frame-0 dump" in out, f"np_pair, lost run without the joiner's frame-0 dump: exit {code}\n{out}")
 
 
 def generated_sources(gen):

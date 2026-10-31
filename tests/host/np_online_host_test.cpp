@@ -1190,16 +1190,48 @@ static void TestSessionQuit() {
   CHECKF(joiner.StartInSession(js.P(), LoopCfg(), J, [](int32_t, wire::LeaveReason) {}, &e), "joiner StartInSession: %s", e.c_str());
   CHECK(WaitFor([&] { return host.status().state == State::kInSession && joiner.status().state == State::kInSession; }, 7000));
   const int64_t t0 = NowUs();
-  const bool flushed = joiner.QuitSession(4500, 150);
+  const int sent = joiner.QuitSession(4500, 150);
   const int64_t took_ms = (NowUs() - t0) / 1000;
-  std::printf("info: session quit: QuitSession returned %d after %lld ms\n", int(flushed), (long long)took_ms);
-  CHECKF(flushed, "QuitSession reports the Leave sent (%lld ms)", (long long)took_ms);
+  std::printf("info: session quit: QuitSession returned %d after %lld ms\n", sent, (long long)took_ms);
+  CHECKF(sent == 3, "QuitSession: %d of 3 sends handed to the socket (%lld ms)", sent, (long long)took_ms);
   CHECKF(took_ms <= 200, "QuitSession took %lld ms (bound 150 ms + scheduling)", (long long)took_ms);
   CHECK(WaitFor([&] { std::lock_guard<std::mutex> lock(mu); return !left_h.empty(); }, 1000));
   {
     std::lock_guard<std::mutex> lock(mu);
     CHECKF(left_h.size() == 1, "on_peer_left ran %zu times on the host", left_h.size());
     if (!left_h.empty()) CHECK(left_h[0].first == 4500 && left_h[0].second == wire::LeaveReason::kLeft);
+  }
+  host.Stop();
+  joiner.Stop();
+}
+
+// Review M1: a Leave already queued (here a desync's) is not replaced by QuitSession's kLeft: its reason and frame reach
+// the other side, and QuitSession only waits for it to go out.
+static void TestSessionQuitPending() {
+  if (!Group("session quit keeps a pending Leave's reason")) return;
+  handoff::Handoff H, J;
+  CHECK(!g_handoffs.host.empty() && handoff::Unpack(g_handoffs.host, &H).empty() && handoff::Unpack(g_handoffs.joiner, &J).empty());
+  if (g_handoffs.host.empty()) return;
+  Side hs("quitp_host"), js("quitp_join");
+  std::mutex mu;
+  std::vector<std::pair<int32_t, wire::LeaveReason>> left_h;
+  online::Lobby host, joiner;
+  std::string e;
+  CHECKF(host.StartInSession(hs.P(), LoopCfg(), H, [&](int32_t f, wire::LeaveReason r) {
+    std::lock_guard<std::mutex> lock(mu);
+    left_h.emplace_back(f, r);
+  }, &e), "host StartInSession: %s", e.c_str());
+  CHECKF(joiner.StartInSession(js.P(), LoopCfg(), J, [](int32_t, wire::LeaveReason) {}, &e), "joiner StartInSession: %s", e.c_str());
+  CHECK(WaitFor([&] { return host.status().state == State::kInSession && joiner.status().state == State::kInSession; }, 7000));
+  joiner.SendLeave(3000, wire::LeaveReason::kDesync);
+  const int sent = joiner.QuitSession(4500, 150);
+  CHECKF(sent == 3, "QuitSession with a pending Leave: %d of 3 sends", sent);
+  CHECK(WaitFor([&] { std::lock_guard<std::mutex> lock(mu); return !left_h.empty(); }, 1000));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    CHECKF(!left_h.empty() && left_h[0].first == 3000 && left_h[0].second == wire::LeaveReason::kDesync,
+           "the host got Leave(%d, reason %d), want (3000, desync)", left_h.empty() ? -9 : left_h[0].first,
+           left_h.empty() ? -9 : int(left_h[0].second));
   }
   host.Stop();
   joiner.Stop();
@@ -1994,6 +2026,7 @@ int main(int argc, char** argv) {
   TestStartRefusals();
   TestSession();
   TestSessionQuit();
+  TestSessionQuitPending();
   TestSessionSpoof();
   TestRequestFiles();
   TestConnectTimeout();

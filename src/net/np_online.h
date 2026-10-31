@@ -154,9 +154,11 @@ class Lobby {
   bool StartInSession(Providers providers, const net::Config& transport, const handoff::Handoff& h,
                       std::function<void(int32_t frame, wire::LeaveReason reason)> on_peer_left, std::string* error);
   void SendLeave(int32_t frame, wire::LeaveReason reason);  // any thread; sent 3 times on the I/O thread
-  // Task 15 G2 (a session closed by the player): sends Leave(frame, kLeft), waits until it went out (3 sends) or
-  // max_wait_ms passed, then stops the transport. True when every send went out in time. Any thread but the I/O one.
-  bool QuitSession(int32_t frame, uint32_t max_wait_ms);
+  // Task 15 G2 (a session closed by the player): queues Leave(frame, kLeft) unless a Leave is already queued or being
+  // repeated (review M1: that one keeps its reason), waits until the Leave's 3 sends were handed to the socket or
+  // max_wait_ms passed, then stops the transport. Returns how many of the 3 sends were handed to the socket (a sendto at
+  // once, or the network simulator's hold/drop when one is configured). Any thread but the I/O one.
+  int QuitSession(int32_t frame, uint32_t max_wait_ms);
   net::Transport& transport();       // for the game thread's GekkoNet Send/Receive (PushGekko/PopGekko)
 
   struct Impl;

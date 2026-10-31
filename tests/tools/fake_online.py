@@ -50,6 +50,8 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
                     value, the wait before the offline relaunch (default 8.0 s, as the game)
   PEER_LEFT_WATCH=1 the session ends `peer left` as soon as the peer's np_log ends `left` (the quit Leave, Task 15 G2);
                     PEER_LEFT_DELAY_S=<s> notices it that much later
+  DESYNC_DUMP_FRAME=<n>  with END=desync: the post-desync dump is named for frame n (default: the end frame)
+  LEFT_RELAUNCH=1   with LEFT_AT: after `left` the copy relaunches offline (a defect the quit judge must see)
   LOST_ANY=1        with END=lost: a peer whose session process is gone counts as vanished even if it wrote a terminal line
   SKIP_PEER_CHECK=1 the session does not look for a lobby-only peer (plays its frames)   NO_OFFLINE=1  after the lobby-only
                     peer's end, no offline relaunch
@@ -500,12 +502,17 @@ def session(ctl):
         log.write(f"frame {frame}: ok\n")
         if left_at is not None and frame >= left_at:
             # the real game's graceful quit (a close request in a session): `left`, no Leave sent, no offline relaunch;
-            # the process lingers until it is ended
+            # the process lingers until it is ended. LEFT_DELAY_S: the quit comes that long after the frame (np_pair
+            # polls every 0.2 s: its close request then precedes the `left`, as in the game, where it causes it)
+            time.sleep(float(os.environ.get("FAKE_ONLINE_LEFT_DELAY_S", "0")))
             write_digest(os.path.join(sess, "digest.d4d"), frame + 1, diverge)
             event(f"session ended at frame {frame + 1}: left")
             log.write(f"session ended at frame {frame + 1}: left\nchecksums handed to GekkoNet: {max(0, frame + 1 - delay)}\n")
             log.close()
             events.close()
+            if os.environ.get("FAKE_ONLINE_LEFT_RELAUNCH") == "1":  # a game that relaunches after a quit (a defect)
+                spawn_next("offline", {})
+                return 0
             time.sleep(120)
             return 0
         frame += 1
@@ -535,7 +542,8 @@ def session(ctl):
         if diverge is not None:
             dump[100] = 1
         os.makedirs(os.path.join(sess, "dumps"), exist_ok=True)
-        with open(os.path.join(sess, "dumps", f"data_{frame:06d}.bin"), "wb") as f:
+        dump_frame = int(os.environ.get("FAKE_ONLINE_DESYNC_DUMP_FRAME", frame))  # a pre-desync-only dump (review I1)
+        with open(os.path.join(sess, "dumps", f"data_{dump_frame:06d}.bin"), "wb") as f:
             f.write(dump)
     elif end == "lost":
         reason = "left"  # nobody went away: an ordinary end

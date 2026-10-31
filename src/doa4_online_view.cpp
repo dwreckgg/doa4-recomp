@@ -168,11 +168,19 @@ std::string LockedLine(bool in_session) {
          " game_change=" + flag(Control::kGameChange);
 }
 
+Ending PeerLeftEnding(int reason, int32_t frame, bool refused) {
+  if (refused) return Ending::kPeerNotStarted;
+  if (reason == 0 && frame >= 0) return Ending::kPeerQuit;  // wire::LeaveReason::kLeft with a frame: the other player quit
+  return Ending::kPeerLeft;  // a Bye (frame -1), kTimeout, kInternal, anything else
+}
+
 std::string BannerText(bool waiting, Ending ending) {
   switch (ending) {
     case Ending::kDesync: return "The games went out of sync. The session ended; both games restart.";
     case Ending::kLost: return "The other player stopped responding. The session ended; both games restart.";
-    case Ending::kPeerLeft: return "The other player quit the session.";
+    case Ending::kPeerLeft: return "The other player left the session.";
+    case Ending::kPeerQuit: return "The other player quit the session.";
+    case Ending::kPeerNotStarted: return "The other player's game did not start the session.";
     case Ending::kFrame0Timeout: return "The other player's game did not come back.";
     case Ending::kLeft: return "You left the session.";
     case Ending::kInternal: return "The session ended unexpectedly; both games restart.";

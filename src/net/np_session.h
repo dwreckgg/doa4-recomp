@@ -80,7 +80,8 @@ struct Host {
   std::string release;                               // DOA4_RELEASE_TAG (np_log's first line)
   std::function<bool()> session_refused;             // the session lobby's Status::session_refused (carry 2g)
   std::function<void()> stop_transport;              // Shutdown's first step: the session lobby's transport Stop
-  std::function<bool(int32_t frame)> quit_session;   // Task 15 G2: Shutdown of a running session: Leave, flush (<= 150 ms), Stop
+  std::function<int(int32_t frame)> quit_session;    // Task 15 G2: Shutdown of a running session: Leave, flush (<= 150 ms), Stop;
+                                                     // returns the sends handed to the socket (of 3)
 };
 
 // Reads the configuration; called once before any guest code runs.
@@ -117,6 +118,8 @@ bool Online();
 bool BannerWaiting();                 // a hold has lasted >= 1 s and is still on (any thread; the overlay's banner)
 int32_t SessionFrame();               // the last frame hook's frame (-1 before the first)
 live::FrameResult LastResult();
+// Review I2: the other player's game answered as a lobby (the refused-session end); read by the banner.
+bool SessionRefused();
 void RequestLeave();                  // UI: this side leaves at the next frame
 void PeerLeft(int32_t frame, wire::LeaveReason reason);  // the session lobby's on_peer_left (I/O thread)
 // Ends a session that cannot run (before or at its first frame): the terminal lines and the offline relaunch.

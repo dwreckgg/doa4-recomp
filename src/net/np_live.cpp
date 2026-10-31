@@ -110,6 +110,7 @@ FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& loc
       char why[96];
       std::snprintf(why, sizeof why, "the other player left at frame %d (%s)", int(peer),
                     ReasonText(wire::LeaveReason(uint8_t(packed >> 32))));
+      r.peer_reason = int(uint8_t(packed >> 32));  // review I2: the banner text follows the reason
       *out = Finish(r, End::kPeerLeft, peer, why, at);
       return true;
     }

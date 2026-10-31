@@ -133,6 +133,7 @@ struct Actor {
   std::vector<uint32_t> sleeps;
   std::function<void(Actor&, int32_t)> before_frame;  // test hook, inside the fiber, before Frame(f)
   std::function<void(Actor&)> on_end;                 // test hook, inside the fiber, after an end was returned
+  std::function<void(Actor&, live::Event, int32_t)> on_ev;  // test hook, inside Frame (on_event), after the record
   std::function<float()> fa;                          // hooks.frames_ahead (empty: GekkoNet's)
   std::function<float()> ping;                        // hooks.ping_ms (empty: GekkoNet's)
   uint64_t overshoot_us = 0, overshoot_after_us = 0;  // fake timer overshoot (see wait_packet)
@@ -295,6 +296,7 @@ static void Setup(World& w) {
     hooks.on_event = [&w, s](live::Event e, int32_t frame, uint64_t at) {
       Actor& me = w.a[s];
       me.events.push_back({e, frame, at, me.live->remote_slack()});
+      if (me.on_ev) me.on_ev(me, e, frame);
     };
     hooks.frames_ahead = A.fa;
     hooks.ping_ms = A.ping;
@@ -802,6 +804,74 @@ static void TestReportedDesync() {
   CHECKF(CountEv(B, live::Event::kEnd) == 1, "B: %d kEnd events", CountEv(B, live::Event::kEnd));
 }
 
+// Review M4: a reported desync for a frame AHEAD of this side (D > f) ends at once too (no frame gate on the desync
+// branch), and a report that arrives inside a hold ends the hold (the in-hold left() call site).
+static void TestReportedDesyncAhead() {
+  Group("reported desync ahead of this side, and inside a hold");
+  {
+    World w;
+    w.label = "reported desync D > f";
+    w.a[0].frames = w.a[1].frames = 260;
+    w.a[1].before_frame = [](Actor& me, int32_t f) {
+      if (f == 120) me.live->PeerLeft(200, wire::LeaveReason::kDesync);
+    };
+    w.a[0].before_frame = [](Actor& me, int32_t f) {
+      if (f == 122) me.live->Leave(122);
+    };
+    Setup(w);
+    Run(w);
+    const Actor& B = w.a[1];
+    const live::FrameResult* rb = Last(B);
+    CHECKF(rb && rb->end == live::End::kDesync && rb->end_frame == 120 && rb->desync_frame == 200 &&
+               rb->why == "desync at frame 200 (reported by the other player)" && OkCount(B) == 120,
+           "B: end %s at %d, D %d, %d ok, why \"%s\"", rb ? EndName(rb->end) : "-", rb ? rb->end_frame : -1,
+           rb ? rb->desync_frame : -1, OkCount(B), rb ? rb->why.c_str() : "");
+  }
+  {
+    World w;
+    w.label = "reported desync inside a hold";
+    w.a[0].frames = w.a[1].frames = 130;
+    ArmHold(w, 0, 100, 10'500 * kMs);
+    w.a[0].on_ev = [](Actor& me, live::Event e, int32_t f) {
+      if (e == live::Event::kHoldBegin && f == 100) me.live->PeerLeft(98, wire::LeaveReason::kDesync);  // not frame 0's hold
+    };
+    Setup(w);
+    Run(w);
+    const Actor& A = w.a[0];
+    const live::FrameResult* ra = Last(A);
+    CHECKF(ra && ra->end == live::End::kDesync && ra->end_frame == 100 && ra->desync_frame == 98 && OkCount(A) == 100,
+           "A (in hold at 100): end %s at %d, D %d, %d ok", ra ? EndName(ra->end) : "-", ra ? ra->end_frame : -1,
+           ra ? ra->desync_frame : -1, OkCount(A));
+    const EvRec* e = FindEv(A, live::Event::kEnd);
+    const uint64_t begin = w.hold[0].begin;
+    CHECKF(e && begin != kInf && e->at < begin + 1'000'000, "A: the hold ended at once (kEnd at begin + %lld us), not by the 10 s limit",
+           e && begin != kInf ? (long long)(e->at - begin) : -1LL);
+  }
+}
+
+// Review I2: a peer-left end carries the Leave's reason (peer_reason; -1 for every other end).
+static void TestPeerReason() {
+  Group("peer-left reason");
+  for (const wire::LeaveReason why : {wire::LeaveReason::kLeft, wire::LeaveReason::kTimeout, wire::LeaveReason::kInternal}) {
+    World w;
+    w.label = "peer reason";
+    w.a[0].frames = w.a[1].frames = 200;
+    w.a[1].before_frame = [why](Actor& me, int32_t f) {
+      if (f == 150) me.live->PeerLeft(150, why);
+    };
+    w.a[0].before_frame = [](Actor& me, int32_t f) {
+      if (f == 152) me.live->Leave(152);
+    };
+    Setup(w);
+    Run(w);
+    const live::FrameResult* rb = Last(w.a[1]);
+    CHECKF(rb && rb->end == live::End::kPeerLeft && rb->peer_reason == int(why), "B: end %s reason %d (want %d)",
+           rb ? EndName(rb->end) : "-", rb ? rb->peer_reason : -9, int(why));
+    const live::FrameResult* ra = Last(w.a[0]);
+    CHECKF(ra && ra->end == live::End::kLeft && ra->peer_reason == -1, "A: own leave, peer_reason %d", ra ? ra->peer_reason : -9);
+  }
+}
+
 static void TestDesyncFrameOwn() {
   Group("own desync names desync_frame");
   World w;
@@ -1152,6 +1222,8 @@ int main(int argc, char** argv) {
   TestDesync();
   TestLeave();
   TestReportedDesync();
+  TestReportedDesyncAhead();
+  TestPeerReason();
   TestDesyncFrameOwn();
   TestLoad();
   TestPacer();

@@ -180,7 +180,7 @@ struct State {
   std::unique_ptr<exec::Executor> ex;
   std::unique_ptr<live::Session> live;
   std::atomic<live::Session*> live_ptr{nullptr};
-  bool ended = false;
+  std::atomic<bool> ended{false};  // review M1: the game thread (EndOnline) and Shutdown both test-and-set it
   std::atomic<bool> running{false};      // the online session runs (until its end)
   std::atomic<int32_t> session_frame{-1};
   std::atomic<int64_t> last_hook_ms{0};  // steady ms of the last frame hook's start
@@ -801,8 +801,7 @@ void LogNetStats(State& s, const std::string& when) {
 // The end of an online session (game thread, or Abort before the first frame): the terminal lines, the Leave, the
 // det layer off, the overlay, and the offline relaunch after 5 s (8 s for a desync, R16).
 void EndOnline(State& s, const live::FrameResult& r, bool at_hook) {
-  if (s.ended) return;
-  s.ended = true;
+  if (s.ended.exchange(true)) return;
   s.running.store(false);
   const bool refused = s.refused.load();
   const std::string reason = TerminalReason(r, refused);
@@ -1499,6 +1498,8 @@ bool BannerWaiting() { return S().banner_shown.load(); }
 
 int32_t SessionFrame() { return S().session_frame.load(); }
 
+bool SessionRefused() { return S().refused.load(); }
+
 live::FrameResult LastResult() {
   State& s = S();
   std::lock_guard lk(s.result_mu);
@@ -1660,10 +1661,11 @@ void Shutdown() {
     // Task 15 G2: a session still running when the game is closed is a quit: the Leave goes to the other player BEFORE
     // the transport stops (Lobby::QuitSession: 3 sends, at most 150 ms), so the other side ends at once with `peer left`
     // instead of waiting for its 10 s limit. An ended session (or none) only stops the transport.
-    if (!s.ended && s.host.quit_session) {
+    if (!s.ended.load() && s.host.quit_session) {
       const int32_t qf = s.session_frame.load() < 0 ? 0 : s.session_frame.load();
-      const bool sent = s.host.quit_session(qf);
-      Log(std::string("quit: Leave to the other player at frame ") + std::to_string(qf) + (sent ? " sent" : " not confirmed within 150 ms"));
+      const int sent = s.host.quit_session(qf);
+      Log("quit: Leave to the other player at frame " + std::to_string(qf) + ": " + std::to_string(sent) +
+          " of 3 sends handed to the socket within 150 ms");
     } else if (s.host.stop_transport) {
       s.host.stop_transport();
     }
@@ -1674,9 +1676,8 @@ void Shutdown() {
     s.watch_cv.notify_all();
     if (s.watch.joinable()) s.watch.join();
     if (s.restarter.joinable()) s.restarter.join();
-    if (!s.ended) {
+    if (!s.ended.exchange(true)) {  // no offline relaunch: the player closed the game
       const int32_t f = s.session_frame.load() < 0 ? 0 : s.session_frame.load();
-      s.ended = true;  // no offline relaunch: the player closed the game
       s.running.store(false);
       Log("session end: the game was closed");
       Log("session ended at frame " + std::to_string(f) + ": left");

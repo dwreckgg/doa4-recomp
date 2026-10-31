@@ -348,7 +348,17 @@ static void TestBanner() {
   CHECK_EQ(BannerText(false, Ending::kDesync), "The games went out of sync. The session ended; both games restart.");
   CHECK_EQ(BannerText(false, Ending::kLost),
            "The other player stopped responding. The session ended; both games restart.");
-  CHECK_EQ(BannerText(false, Ending::kPeerLeft), "The other player quit the session.");  // Task 15 G2
+  CHECK_EQ(BannerText(false, Ending::kPeerLeft), "The other player left the session.");  // review I2: by reason
+  CHECK_EQ(BannerText(false, Ending::kPeerQuit), "The other player quit the session.");
+  CHECK_EQ(BannerText(false, Ending::kPeerNotStarted), "The other player's game did not start the session.");
+  // the reason -> ending map (wire::LeaveReason numbers: 0 left, 1 desync, 2 timeout, 3 internal; frame -1 = a Bye)
+  CHECK(PeerLeftEnding(0, 4642, false) == Ending::kPeerQuit);       // the quit Leave (Shutdown, menu Leave)
+  CHECK(PeerLeftEnding(0, -1, false) == Ending::kPeerLeft);         // a Bye
+  CHECK(PeerLeftEnding(2, 100, false) == Ending::kPeerLeft);        // kTimeout
+  CHECK(PeerLeftEnding(3, 100, false) == Ending::kPeerLeft);        // kInternal
+  CHECK(PeerLeftEnding(7, 100, false) == Ending::kPeerLeft);        // anything else
+  CHECK(PeerLeftEnding(3, 0, true) == Ending::kPeerNotStarted);     // the refused-session path
+  CHECK(PeerLeftEnding(0, 5, true) == Ending::kPeerNotStarted);
   CHECK_EQ(BannerText(false, Ending::kFrame0Timeout), "The other player's game did not come back.");
   CHECK_EQ(BannerText(false, Ending::kLeft), "You left the session.");
   CHECK_EQ(BannerText(false, Ending::kInternal), "The session ended unexpectedly; both games restart.");

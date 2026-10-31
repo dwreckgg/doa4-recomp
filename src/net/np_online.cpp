@@ -1525,25 +1525,34 @@ void Lobby::SendLeave(int32_t frame, wire::LeaveReason reason) {
   Push(*impl_, c);
 }
 
-bool Lobby::QuitSession(int32_t frame, uint32_t max_wait_ms) {
-  uint64_t target = 0;
+int Lobby::QuitSession(int32_t frame, uint32_t max_wait_ms) {
+  // Review M1: a Leave already queued or still being repeated (e.g. a desync's) keeps its reason and frame: no second
+  // Leave replaces it; this call only waits for it to go out. Otherwise the quit Leave (kLeft) is queued.
+  uint64_t base = 0;
+  int expected = 3;
+  bool pending = false;
   {
     std::lock_guard<std::mutex> lock(impl_->mu);
-    target = impl_->leave_sends + 3;  // the Tick sends the Leave 3 times (leave_repeat)
+    base = impl_->leave_sends;
+    const bool queued = std::any_of(impl_->cmds.begin(), impl_->cmds.end(), [](const Command& c) { return c.cmd == Cmd::kLeave; });
+    pending = queued || impl_->leave_repeat > 0;
+    if (!queued && impl_->leave_repeat > 0) expected = impl_->leave_repeat;  // the rest of a Leave already being sent
   }
-  SendLeave(frame, wire::LeaveReason::kLeft);
+  if (!pending) SendLeave(frame, wire::LeaveReason::kLeft);
   const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_wait_ms);
-  bool sent = false;
+  uint64_t done = 0;
   for (;;) {
     {
       std::lock_guard<std::mutex> lock(impl_->mu);
-      sent = impl_->leave_sends >= target;
+      done = impl_->leave_sends - base;
     }
-    if (sent || std::chrono::steady_clock::now() >= end) break;
+    if (done >= uint64_t(expected) || std::chrono::steady_clock::now() >= end) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   impl_->t.Stop();  // only now: the Leave had its chance to go out (Task 15 G2)
-  return sent;
+  // Review M2: a send here is a sendto on the lobby's socket at once (Transport::SendTo -> SendOut -> RawSend,
+  // np_transport.cpp:263-266), or a hold/drop of the network simulator when one is configured (harness only).
+  return int(std::min<uint64_t>(done, uint64_t(expected))) + (3 - expected);
 }
 
 

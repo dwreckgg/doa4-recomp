@@ -706,17 +706,18 @@ class Pair:
                 self.problems.append(f"the {s.name} copy did not run (no session folder with an np_log.txt: {s.session_dir()})")
                 return
             lines.append(f"{s.name}: terminal {s.terminal()} checksums {s.checksums()} missing {missing}")
-        self.frame0_check(lines, host, joiner, fail=expect == "ok")
+        # review M5: every session expect (ok, desync, lost, quit) fails on a frame-0 difference or a missing frame-0 dump
+        self.frame0_check(lines, host, joiner, fail=True)
         th, tj = host.terminal(), joiner.terminal()
-        if expect == "lost":
+        if expect == "lost":  # the joiner was ended hard: it writes no terminal line
             self.judge_lost(lines, host, joiner, th, tj)
-            return
-        if expect == "quit":
-            self.judge_quit(lines, host, joiner, th, tj)
             return
         for s, t in ((host, th), (joiner, tj)):
             if t is None:
                 self.problems.append(f"the {s.name} copy's np_log.txt has no 'session ended at frame' line")
+        if expect == "quit":  # review M3: after the generic terminal check, not instead of it
+            self.judge_quit(lines, host, joiner, th, tj)
+            return
         if th is None or tj is None:
             return
         if expect == "desync":
@@ -766,16 +767,19 @@ class Pair:
         lines.append(f"host ended {th[1] if th else None!r}, joiner ended {tj[1] if tj else None!r}")
         if th is None or th[1] != "peer left":
             self.problems.append(f"the host copy ended {th[1] if th else None!r}, expected 'peer left'")
-        if tj is not None and tj[1] != "left":
-            self.problems.append(f"the joiner copy ended {tj[1]!r}, expected 'left' (a close request)")
+        if tj is None or tj[1] != "left":  # review M3: the joiner's own `left` line is required
+            self.problems.append(f"the joiner copy ended {tj[1] if tj else None!r}, expected 'left' (a close request)")
+        if any(p[1] == "offline" for p in read_pids(joiner.ctl)):  # review M3: a quit never relaunches the quitter
+            self.problems.append("the joiner relaunched offline after its quit (pids.txt has an offline line)")
         ended = next((int(l.split()[0]) for l in read_lines(os.path.join(host.session_dir(), "events.txt"))
                       if re.match(r"^\d+ session ended at frame", l)), None)
         if self.end_time_ms is None or ended is None:
             self.problems.append("no close request time or no session end in the host's events.txt")
         else:
-            lines.append(f"host session ended {ended - self.end_time_ms} ms after the close request")
-            if ended - self.end_time_ms > QUIT_TO_END_MS:
-                self.problems.append(f"the host ended {ended - self.end_time_ms} ms after the close request, expected <= {QUIT_TO_END_MS}")
+            delta = ended - self.end_time_ms
+            lines.append(f"host session ended {delta} ms after the close request")
+            if not 0 <= delta <= QUIT_TO_END_MS:  # review M3: an end before the close request is not the quit's either
+                self.problems.append(f"the host ended {delta} ms after the close request, expected 0..{QUIT_TO_END_MS}")
         if not any(p[1] == "offline" for p in read_pids(host.ctl)):
             self.problems.append("the host did not relaunch offline")
 
@@ -784,8 +788,8 @@ class Pair:
         DOA4_NP_FORCE_DESYNC names, when a copy has it); (2) the checksums cross-match (the host's "other side" is the joiner's
         "this side" and the reverse) and differ; (3) every digest and sweep row both copies wrote is equal (the row of frame f
         hashes the state entering f, so a forced flip shows only in rows after F, which the side that stops first never
-        writes): an earlier difference is a real desync behind the forced one; (4) both post-desync dumps (the newest
-        dumps/data_*.bin other than frame 0) exist and differ; (5) both relaunch offline DESYNC_RELAUNCH_MS +- 1000 ms after
+        writes): an earlier difference is a real desync behind the forced one; (4) each copy has a post-desync dump named for a
+        frame >= F (review I1; compared byte for byte only when both are for the same frame); (5) both relaunch offline DESYNC_RELAUNCH_MS +- 1000 ms after
         their end."""
         a = self.a
         parsed = {}
@@ -843,20 +847,25 @@ class Pair:
             self.problems.append(f"the copies differ on the common frames 0..{upto} ("
                                  f"{'no row compared' if not bad else '%s first differs at frame %d' % first_bad}): "
                                  f"a desync before the forced one")
-        dumps = {}  # (4)
+        # (4) review I1: each copy has a post-desync dump, named for a frame >= F (dumps/data_<frame>.bin); two dumps of
+        # different frames always differ, so bytes are compared only for the same frame (information, not a rule)
+        dumps = {}
         for s in (host, joiner):
             d = os.path.join(s.session_dir(), "dumps")
-            names = sorted(n for n in (os.listdir(d) if os.path.isdir(d) else []) if n.startswith("data_") and n != "data_000000.bin")
-            if not names:
-                self.problems.append(f"the {s.name} wrote no post-desync dump")
+            frames = sorted(int(m.group(1)) for m in (re.match(r"^data_(\d+)\.bin$", n) for n in (os.listdir(d) if os.path.isdir(d) else []))
+                            if m and int(m.group(1)) >= upto)
+            if not frames:
+                self.problems.append(f"the {s.name} has no post-desync dump at or after frame {upto}")
             else:
-                with open(os.path.join(d, names[-1]), "rb") as f:
-                    dumps[s.name] = (names[-1], f.read())
+                dumps[s.name] = (frames[0], os.path.join(d, f"data_{frames[0]:06d}.bin"))
         if len(dumps) == 2:
-            same = dumps["host"][1] == dumps["joiner"][1]
-            lines.append(f"post-desync dumps: host {dumps['host'][0]}, joiner {dumps['joiner'][0]}, {'equal' if same else 'differ'}")
-            if same:
-                self.problems.append("the post-desync dumps are equal: nothing diverged")
+            fa, fb = dumps["host"][0], dumps["joiner"][0]
+            if fa == fb:
+                with open(dumps["host"][1], "rb") as f1, open(dumps["joiner"][1], "rb") as f2:
+                    same = f1.read() == f2.read()
+                lines.append(f"post-desync dumps: both frame {fa}, {'equal' if same else 'differ'}")
+            else:
+                lines.append(f"post-desync dumps: host frame {fa}, joiner frame {fb}: not comparable (frames {fa}/{fb})")
         for s in (host, joiner):  # (5)
             ended = next((int(l.split()[0]) for l in read_lines(os.path.join(s.session_dir(), "events.txt"))
                           if re.match(r"^\d+ session ended at frame", l)), None)

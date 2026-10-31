@@ -505,7 +505,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     };
     host.transport = [this]() -> doa4::np::net::Transport* { return lobby_ ? &lobby_->transport() : nullptr; };
     host.session_refused = [this] { return lobby_ && lobby_->status().session_refused; };
-    host.quit_session = [this](int32_t frame) { return lobby_ ? lobby_->QuitSession(frame, 150) : false; };
+    host.quit_session = [this](int32_t frame) { return lobby_ ? lobby_->QuitSession(frame, 150) : 0; };
     host.stop_transport = [this] {
       if (lobby_) lobby_->transport().Stop();
     };
@@ -731,7 +731,11 @@ class DeadOrAlive4App : public rex::ReXApp {
     if (in.in_session) {
       switch (doa4::np::LastResult().end) {
         case doa4::np::live::End::kLeft: ending = ov::Ending::kLeft; break;
-        case doa4::np::live::End::kPeerLeft: ending = ov::Ending::kPeerLeft; break;
+        case doa4::np::live::End::kPeerLeft: {  // review I2: the text follows the reason
+          const doa4::np::live::FrameResult r = doa4::np::LastResult();
+          ending = ov::PeerLeftEnding(r.peer_reason, r.end_frame, doa4::np::SessionRefused());
+          break;
+        }
         case doa4::np::live::End::kLost: ending = ov::Ending::kLost; break;
         case doa4::np::live::End::kDesync: ending = ov::Ending::kDesync; break;
         case doa4::np::live::End::kFrame0Timeout: ending = ov::Ending::kFrame0Timeout; break;

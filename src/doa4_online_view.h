@@ -62,7 +62,11 @@ bool Refuse(Control control, bool in_session, std::string_view action, std::stri
 std::string LockedLine(bool in_session);
 
 // The banner (spec 7): how a session ended, as the overlay's own enum (the overlay maps live::End onto it).
-enum class Ending : uint8_t { kNone, kLeft, kPeerLeft, kLost, kDesync, kFrame0Timeout, kInternal };
+enum class Ending : uint8_t { kNone, kLeft, kPeerLeft, kPeerQuit, kPeerNotStarted, kLost, kDesync, kFrame0Timeout, kInternal };
+// Review I2: the ending of a peer-left end by its reason (wire::LeaveReason as a number: 0 left, 1 desync, 2 timeout,
+// 3 internal), its frame (-1: a Bye) and whether the other game answered as a lobby (the refused-session path):
+// refused -> kPeerNotStarted; a kLeft Leave with a frame -> kPeerQuit; anything else -> kPeerLeft.
+Ending PeerLeftEnding(int reason, int32_t frame, bool refused);
 // "" = no banner. An ending wins over a hold; a hold (waiting) is "Waiting for the other player...".
 std::string BannerText(bool waiting, Ending ending);
 
