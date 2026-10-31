@@ -45,6 +45,7 @@ set(DEADORALIVE4_SOURCES
     src/net/np_det_middleware.cpp
     src/net/np_det_workers.cpp
     src/net/np_det_trace.cpp
+    src/net/np_det_online.cpp
     src/net/np_wire.cpp
     src/net/np_rules.cpp
     src/net/np_handoff.cpp

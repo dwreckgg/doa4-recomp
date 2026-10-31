@@ -149,7 +149,8 @@ std::string MetaValue(std::string_view meta, std::string_view key);
 // ---- Fix sets (DOA4_NP_FIX; the recording's meta key "fixes") ----
 // The determinism layer's fixes in bit order: fix i is bit 1u << i (np_det_internal.h Fix, pinned there).
 inline constexpr const char* kFixNames[] = {"seed",  "clock",  "sdkclock", "xam",    "audio",     "movie", "loader",
-                                            "cri",   "crijob", "workers",  "notify", "keepalive", "reader"};
+                                            "cri",   "crijob", "workers",  "notify", "keepalive", "reader",
+                                            "port1000"};
 inline constexpr int kFixCount = int(sizeof(kFixNames) / sizeof(kFixNames[0]));
 // "all", empty or null: every bit (~0u); "none": 0; "a,b,c": those fixes; "all-a-b": all but a and b. Names that are
 // not fixes are ignored.
