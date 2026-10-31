@@ -46,6 +46,8 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
   NO_DUMP=1         no frame-0 dump even when DOA4_NP_DUMP lists 0
   BOOT_HOLD=1       the session starts with the real game's frame-0 hold (hold begin frame 0, banner 1.0 s later, hold end)
   LEFT_AT=<f>       after frame f the session ends `left` (a graceful quit), starts no offline relaunch and lingers until ended
+  DESYNC_AT=<f> / DESYNC_OTHER=<hex> / DESYNC_RELAUNCH_S=<s>   with END=desync: the frame named, this copy's "other side"
+                    value, the wait before the offline relaunch (default 8.0 s, as the game)
   LOST_ANY=1        with END=lost: a peer whose session process is gone counts as vanished even if it wrote a terminal line
   SKIP_PEER_CHECK=1 the session does not look for a lobby-only peer (plays its frames)   NO_OFFLINE=1  after the lobby-only
                     peer's end, no offline relaunch
@@ -358,7 +360,8 @@ def lobby(ctl):
                 atomic_write(os.path.join(st.peer_ctl, "start.now"), f"go\ndelay={st.delay}\n")
             st.state, st.event = "starting", "starting"
             st.write()
-            spawn_next("session", {"FAKE_ONLINE_PEER": st.peer_ctl or "", "FAKE_ONLINE_DELAY": str(st.delay)})
+            spawn_next("session", {"FAKE_ONLINE_PEER": st.peer_ctl or "", "FAKE_ONLINE_DELAY": str(st.delay),
+                                   "FAKE_ONLINE_HOST": "1" if st.can_start else "0"})
             return 0
         if time.time() - last >= 0.25:
             st.write()
@@ -506,8 +509,21 @@ def session(ctl):
         time.sleep(max(0.0, t0 + 10.0 - time.time()))
         reason = "lost"
     elif end == "desync":
-        first = diverge if diverge is not None else max(0, rows - 1)
-        reason = f"desync at frame {first} (this side 0000a1b2c3d4e5f6, other side 0000f6e5d4c3b2a1)"
+        # the real end text: both copies name the same frame F (DESYNC_AT, else DIVERGE, else the last) and their own and
+        # the other side's checksums of it, crossed (the host's "this side" is the joiner's "other side"); OTHER replaces
+        # this copy's "other side" value; the post-desync dump dumps/data_<end frame>.bin differs between the copies only
+        # when one of them diverged (DIVERGE)
+        at = os.environ.get("FAKE_ONLINE_DESYNC_AT")
+        first = int(at) if at else diverge if diverge is not None else max(0, rows - 1)
+        mine, theirs = ("64FF99A4", "25C3DF78") if os.environ.get("FAKE_ONLINE_HOST") == "1" else ("25C3DF78", "64FF99A4")
+        theirs = os.environ.get("FAKE_ONLINE_DESYNC_OTHER", theirs)
+        reason = f"desync at frame {first} (this side {mine}, other side {theirs})"
+        dump = bytearray(4096)
+        if diverge is not None:
+            dump[100] = 1
+        os.makedirs(os.path.join(sess, "dumps"), exist_ok=True)
+        with open(os.path.join(sess, "dumps", f"data_{frame:06d}.bin"), "wb") as f:
+            f.write(dump)
     elif end == "lost":
         reason = "left"  # nobody went away: an ordinary end
     write_digest(os.path.join(sess, "digest.d4d"), frame, diverge)
@@ -520,6 +536,8 @@ def session(ctl):
         log.write(f"checksums handed to GekkoNet: {int(count) if count else max(0, frame - delay)}\n")
     log.close()
     events.close()
+    if end == "desync" and not lost:
+        time.sleep(float(os.environ.get("FAKE_ONLINE_DESYNC_RELAUNCH_S", "8.0")))  # the game relaunches 8 s after a desync
     spawn_next("offline", {})
     return 0
 

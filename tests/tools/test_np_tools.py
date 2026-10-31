@@ -2400,11 +2400,35 @@ def test_pair_diverge(root):
 def test_pair_desync(root):
     # --expect desync: both sides name a desync AND the digests really differ. The control: sides that name a desync while their
     # digests never differ is an expected event that did not happen (#0331).
-    both = ("--env-host", "FAKE_ONLINE_END=desync", "--env-joiner", "FAKE_ONLINE_END=desync")
-    code, out, runs = np_pair(root, "ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DIVERGE=7")
-    check(code == 0 and "verdict desync" in out and "first differing digest frame: 7" in out, f"np_pair, desync expected and seen: exit {code}\n{out}")
-    code, out, runs = np_pair(root, "dn", "--expect", "desync", *both)
-    check(code == 1 and "never differ" in out, f"np_pair, desync expected but the digests never differ: exit {code}\n{out}")
+    # Task 15 R-S7: the game's shape. Both copies name frame F (7 here); the row of frame f hashes the state entering f, so rows
+    # 0..F are equal on both; the host stops at F+1 (rows 0..7), the joiner at F+3 (rows 0..9, the extra ones differ);
+    # checksums crossed; post-desync dumps differ; offline relaunch 8 s after the end.
+    both = ("--env-host", "FAKE_ONLINE_END=desync", "--env-joiner", "FAKE_ONLINE_END=desync",
+            "--env-host", "FAKE_ONLINE_DESYNC_AT=7", "--env-host", "FAKE_ONLINE_QUIT_AT=8",
+            "--env-joiner", "FAKE_ONLINE_QUIT_AT=10")
+    code, out, runs = np_pair(root, "ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8")
+    check(code == 0 and "verdict desync" in out, f"np_pair, desync expected and seen (the game's shape): exit {code}\n{out}")
+    check("frames on one side only" in out and "8..9" in out, f"np_pair, desync: np_compare names the frames on one side only\n{out}")
+    # (2) checksums that do not cross-match
+    code, out, runs = np_pair(root, "dx", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "FAKE_ONLINE_DESYNC_OTHER=DEADBEEF")
+    check(code == 1 and "do not cross-match" in out, f"np_pair, desync with checksums that do not cross-match: exit {code}\n{out}")
+    # (3) an earlier difference on a common row: a real desync hiding behind the forced one
+    code, out, runs = np_pair(root, "de", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=5")
+    check(code == 1 and "common frames" in out and "frame 5" in out, f"np_pair, desync with an earlier common-row difference: exit {code}\n{out}")
+    # (1) the sides name different frames
+    code, out, runs = np_pair(root, "df", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=6",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8")
+    check(code == 1 and "different frames" in out, f"np_pair, desync at different frames: exit {code}\n{out}")
+    # (1) the forced frame: F must be the frame DOA4_NP_FORCE_DESYNC names
+    code, out, runs = np_pair(root, "dfx", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "DOA4_NP_FORCE_DESYNC=6")
+    check(code == 1 and "forced at frame 6" in out, f"np_pair, desync at another frame than the forced one: exit {code}\n{out}")
+    # (4) both name a desync but nothing diverged: the post-desync dumps are equal (#0331)
+    code, out, runs = np_pair(root, "dn", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7")
+    check(code == 1 and "post-desync dumps are equal" in out, f"np_pair, desync named but nothing diverged: exit {code}\n{out}")
     code, out, runs = np_pair(root, "dm", "--expect", "desync", "--env-joiner", "FAKE_ONLINE_DIVERGE=7")
     check(code == 1 and "expected a desync" in out, f"np_pair, desync expected, the sides ended with a leave: exit {code}\n{out}")
 
@@ -3048,8 +3072,10 @@ def test_pair_frame0(root):
     code, out, runs = np_pair(root, "f0x", "--env-joiner", "FAKE_ONLINE_NO_DUMP=1")
     check(code == 1 and "joiner wrote no frame-0 dump" in out, f"np_pair, the joiner without a frame-0 dump: exit {code}\n{out}")
     # the frame-0 difference fails --expect ok only: a desync pair reports it and keeps its verdict
-    both = ("--env-host", "FAKE_ONLINE_END=desync", "--env-joiner", "FAKE_ONLINE_END=desync")
-    code, out, runs = np_pair(root, "f0ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DIVERGE=7",
+    # (the desync in the game's shape, Task 15 R-S7: same F, rows 0..F equal, the joiner's later rows differ)
+    both = ("--env-host", "FAKE_ONLINE_END=desync", "--env-joiner", "FAKE_ONLINE_END=desync", "--env-host", "FAKE_ONLINE_DESYNC_AT=7",
+            "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7", "--env-host", "FAKE_ONLINE_QUIT_AT=8", "--env-joiner", "FAKE_ONLINE_QUIT_AT=10")
+    code, out, runs = np_pair(root, "f0ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DIVERGE=8",
                               "--env-joiner", "FAKE_ONLINE_DUMP0_DIFF=82B8ABCD")
     check(code == 0 and "frame-0 .data dumps differ at 82B8ABCD" in out, f"np_pair, desync expected, the frame-0 line printed: exit {code}\n{out}")
 

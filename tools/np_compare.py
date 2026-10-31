@@ -234,6 +234,10 @@ def main():
     if len(fa) != len(fb):
         print(f"digest: run lengths differ (A {len(fa)} frames, B {len(fb)} frames)")
         result = 1
+    for label, mine, other in (("A", fa, fb), ("B", fb, fa)):  # informational (Task 15 R-S7): rows only one run wrote
+        only = sorted(f for f in mine if f not in other and f >= args.start)
+        if only:
+            print(f"digest: frames on one side only: run {label} {only[0]}..{only[-1]} ({len(only)} frames)")
     first_any = None
     differ = {}
     for f in common:

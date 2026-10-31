@@ -71,6 +71,7 @@ FRAME_LINE = re.compile(r"^frame (\d+)\b")
 TIMING_SLACK_MS = 50
 HOLD_TO_BANNER_MS = 1000
 HOLD_TO_END_MS = 10000
+DESYNC_RELAUNCH_MS = 8000  # R16: the offline relaunch comes 8 s after a desync (5 s after other ends)
 OK_REASONS = ("left", "peer left")
 POLL = 0.2
 CLOSE_REPEAT_S = 2.0  # end_all repeats its close request this often (fix round Q3)
@@ -713,13 +714,7 @@ class Pair:
         if th is None or tj is None:
             return
         if expect == "desync":
-            for s, t in ((host, th), (joiner, tj)):
-                if not t[1].startswith("desync at frame"):
-                    self.problems.append(f"the {s.name} copy ended {t[1]!r}, expected a desync")
-            code, out, first = self.compare(host, joiner)
-            lines.append(f"np_compare first differing digest frame: {first}")
-            if first is None:
-                self.problems.append("expected a desync but the two digests never differ (np_compare: digest first difference: none)")
+            self.judge_desync(lines, host, joiner, th, tj)
             return
         # expect ok
         for s, t in ((host, th), (joiner, tj)):
@@ -755,6 +750,66 @@ class Pair:
             self.problems.append(f"differ at frame {first}")
         elif code != 0:
             self.problems.append("np_compare failed: " + " | ".join(l.strip() for l in out if l.strip())[:600])
+
+    def judge_desync(self, lines, host, joiner, th, tj):
+        """Task 15 R-S7. An expected desync is ALL of: (1) both copies end `desync at frame F` with the same F (= the frame
+        DOA4_NP_FORCE_DESYNC names, when a copy has it); (2) the checksums cross-match (the host's "other side" is the joiner's
+        "this side" and the reverse) and differ; (3) every digest and sweep row both copies wrote is equal (the row of frame f
+        hashes the state entering f, so a forced flip shows only in rows after F, which the side that stops first never
+        writes): an earlier difference is a real desync behind the forced one; (4) both post-desync dumps (the newest
+        dumps/data_*.bin other than frame 0) exist and differ; (5) both relaunch offline DESYNC_RELAUNCH_MS +- 1000 ms after
+        their end."""
+        a = self.a
+        parsed = {}
+        for s, t in ((host, th), (joiner, tj)):
+            m = re.match(r"^desync at frame (\d+) \(this side ([0-9A-Fa-f]+), other side ([0-9A-Fa-f]+)\)", t[1])
+            if not m:
+                self.problems.append(f"the {s.name} copy ended {t[1]!r}, expected a desync")
+                continue
+            parsed[s.name] = (int(m.group(1)), m.group(2).upper(), m.group(3).upper())
+        if len(parsed) < 2:
+            return
+        (fh, mh, oh), (fj, mj, oj) = parsed["host"], parsed["joiner"]
+        lines.append(f"desync: host frame {fh} this {mh} other {oh}; joiner frame {fj} this {mj} other {oj}")
+        if fh != fj:  # (1)
+            self.problems.append(f"the copies name different frames: host desync at frame {fh}, joiner at frame {fj}")
+        forced = [kv.partition("=")[2] for kv in a.env_host + a.env_joiner if kv.startswith("DOA4_NP_FORCE_DESYNC=")]
+        for v in forced:
+            if v.isdigit() and (fh != int(v) or fj != int(v)):
+                self.problems.append(f"the desync is named at frame {fh}/{fj}, but it was forced at frame {v}")
+        if not (oh == mj and oj == mh and mh != mj):  # (2)
+            self.problems.append(f"the checksums do not cross-match: host this {mh} other {oh}, joiner this {mj} other {oj}")
+        code, out, first = self.compare(host, joiner)  # (3)
+        lines += [f"np_compare: {l.strip()}" for l in out if l.startswith(("digest", "sweep"))]
+        sweep_equal = any(re.match(r"sweep: .*; 0 blocks ever differ", l) for l in out)
+        if first is not None or not sweep_equal:
+            self.problems.append(f"the copies differ on the common frames (digest first difference: "
+                                 f"{'none' if first is None else 'frame %d' % first}; sweep equal: {sweep_equal}): "
+                                 f"a desync before the forced one")
+        dumps = {}  # (4)
+        for s in (host, joiner):
+            d = os.path.join(s.session_dir(), "dumps")
+            names = sorted(n for n in (os.listdir(d) if os.path.isdir(d) else []) if n.startswith("data_") and n != "data_000000.bin")
+            if not names:
+                self.problems.append(f"the {s.name} wrote no post-desync dump")
+            else:
+                with open(os.path.join(d, names[-1]), "rb") as f:
+                    dumps[s.name] = (names[-1], f.read())
+        if len(dumps) == 2:
+            same = dumps["host"][1] == dumps["joiner"][1]
+            lines.append(f"post-desync dumps: host {dumps['host'][0]}, joiner {dumps['joiner'][0]}, {'equal' if same else 'differ'}")
+            if same:
+                self.problems.append("the post-desync dumps are equal: nothing diverged")
+        for s in (host, joiner):  # (5)
+            ended = next((int(l.split()[0]) for l in read_lines(os.path.join(s.session_dir(), "events.txt"))
+                          if re.match(r"^\d+ session ended at frame", l)), None)
+            off = next((ms for pid, kind, ms in read_pids(s.ctl) if kind == "offline"), None)
+            if ended is None or off is None:
+                self.problems.append(f"the {s.name}: no session end in events.txt or no offline relaunch in pids.txt")
+                continue
+            lines.append(f"{s.name} offline relaunch {off - ended} ms after the end")
+            if abs((off - ended) - DESYNC_RELAUNCH_MS) > 1000:
+                self.problems.append(f"the {s.name} relaunched offline {off - ended} ms after the desync, expected {DESYNC_RELAUNCH_MS} +-1000")
 
     def judge_lost(self, lines, host, joiner, th, tj):
         a = self.a
