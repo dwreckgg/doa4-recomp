@@ -5,7 +5,7 @@ what each copy wrote.
   py -3 -I tools/np_pair.py NAME --script <pad script> --userdata <pristine save> --runs <folder> --exe <exe>
       [--joiner-exe EXE] [--cache DIR] [--joiner-affinity MASK] [--sim D,J,L] [--delay N] [--seed N]
       [--env-host K=V ...] [--env-joiner K=V ...] [--arg-host=ARG ...] [--arg-joiner=ARG ...]
-      [--kill-joiner-at-frame N] [--third-joiner] [--host-only SECONDS]
+      [--kill-joiner-at-frame N | --quit-joiner-at-frame N] [--third-joiner] [--host-only SECONDS]
       [--expect ok|desync|lost|refused-build|refused-files|refused-busy|refused-session|lobby] [--timeout S]
       [--game DIR] [--end-grace S] [--step-timeout S] [--settle S] [--orphan-watch S]
 
@@ -314,6 +314,8 @@ class Pair:
         self.ended = False
         self.joiner_event = ""
         self.delay_host = 0
+        self.ended_by_harness = set()  # copies whose session np_pair ended itself (--kill/--quit-joiner-at-frame)
+        self.end_frame = None  # the ended copy's passed frame when np_pair ended it
 
     # ------------------------------------------------------------------ setup
     def game_env(self, side, host):
@@ -521,18 +523,27 @@ class Pair:
                 want = int(a.joiner_affinity, 0)
                 if mask != want:
                     self.problems.append(f"joiner affinity read back {text}, expected {want:#x}")
-            if a.kill_joiner_at_frame is not None and not killed and joiner.passed_frame() >= a.kill_joiner_at_frame \
-                    and joiner.session_pids():
+            end_at = a.kill_joiner_at_frame if a.kill_joiner_at_frame is not None else a.quit_joiner_at_frame
+            if end_at is not None and not killed and joiner.passed_frame() >= end_at and joiner.session_pids():
                 killed = True
                 pid = joiner.session_pids()[-1][0]
                 if joiner.session_alive():  # ours: the creation time matches the pids.txt line
-                    self.notes.append(f"joiner session pid {pid} ended at frame {joiner.passed_frame()}")
-                    taskkill(pid, False)
-                    end = time.time() + a.end_grace
-                    while time.time() < end and joiner.session_alive():
-                        time.sleep(0.1)
-                    if joiner.session_alive():
+                    self.ended_by_harness.add("joiner")
+                    self.end_frame = joiner.passed_frame()
+                    if a.kill_joiner_at_frame is not None:
+                        # R-S6b: a disconnect (crash, cable pull) is a hard end of the process, never a close request
                         taskkill(pid, True)
+                        self.notes.append(f"joiner session pid {pid} ended hard (taskkill /F) at frame {self.end_frame}")
+                    else:
+                        taskkill(pid, False)  # the graceful quit: a close request, /F only after --end-grace
+                        end = time.time() + a.end_grace
+                        while time.time() < end and joiner.session_alive():
+                            time.sleep(0.1)
+                        forced = joiner.session_alive()
+                        if forced:
+                            taskkill(pid, True)
+                        self.notes.append(f"joiner session pid {pid} sent a close request at frame {self.end_frame}"
+                                          + (f" (still alive after {a.end_grace} s: /F)" if forced else ""))
             for s in (host, joiner):
                 finished[s.name] = side_done(s)
             if a.expect == "refused-session":  # the joiner stays a lobby: only the host's session is waited for
@@ -544,8 +555,8 @@ class Pair:
             self.problems.append(f"timeout after {a.timeout} s waiting for the sessions to end")
         if a.expect == "refused-session":
             self.snap["joiner_end"] = joiner.status()  # read before end_all ends the lobby that answered
-        for s in (host, joiner):  # the offline relaunch of every copy whose session ended
-            if s.terminal():
+        for s in (host, joiner):  # the offline relaunch of every copy whose session ended (not one np_pair ended itself:
+            if s.terminal() and s.name not in self.ended_by_harness:  # a graceful quit ends `left` and never relaunches)
                 self.wait(lambda s=s: any(p[1] == "offline" for p in read_pids(s.ctl)), a.step_timeout,
                           f"the {s.name}'s offline relaunch (pids.txt line)")
 
@@ -747,17 +758,25 @@ class Pair:
 
     def judge_lost(self, lines, host, joiner, th, tj):
         a = self.a
-        if a.kill_joiner_at_frame is None:
-            self.problems.append("--expect lost needs --kill-joiner-at-frame")
+        end_at = a.kill_joiner_at_frame if a.kill_joiner_at_frame is not None else a.quit_joiner_at_frame
+        if end_at is None:
+            self.problems.append("--expect lost needs --kill-joiner-at-frame (or --quit-joiner-at-frame)")
             return
         if th is None or th[1] != "lost":
             self.problems.append(f"the surviving host copy ended {th[1] if th else None!r}, expected 'lost'")
-        events = {}
+        # R-S6a: the session's first lines hold at frame 0 (both copies starting) with a banner of its own; the disconnect is
+        # the LAST hold that began at or after the frame the joiner was ended at, and its banner and end come after it
+        hold, banner, ended = None, None, None
+        rows = []
         for l in read_lines(os.path.join(host.session_dir(), "events.txt")):
-            m = re.match(r"^(\d+) (hold begin frame \d+|banner waiting|session ended\b.*)$", l)
+            m = re.match(r"^(\d+) (hold begin frame (\d+)|banner waiting|session ended\b.*)$", l)
             if m:
-                events.setdefault(m.group(2).split(" ")[0], int(m.group(1)))
-        hold, banner, ended = events.get("hold"), events.get("banner"), events.get("session")
+                rows.append((int(m.group(1)), m.group(2), int(m.group(3)) if m.group(3) else None))
+        holds = [t for t, text, f in rows if f is not None and f >= end_at]
+        if holds:
+            hold = holds[-1]
+            banner = next((t for t, text, f in rows if text == "banner waiting" and t >= hold), None)
+            ended = next((t for t, text, f in rows if text.startswith("session ended") and t >= hold), None)
         lines.append(f"events: hold {hold} banner {banner} ended {ended}")
         if hold is None or banner is None or ended is None:
             self.problems.append("events.txt lacks hold begin / banner waiting / session ended lines")
@@ -814,7 +833,8 @@ def main(argv=None):
     ap.add_argument("--env-joiner", action="append", default=[])
     ap.add_argument("--arg-host", action="append", default=[])
     ap.add_argument("--arg-joiner", action="append", default=[])
-    ap.add_argument("--kill-joiner-at-frame", type=int)
+    ap.add_argument("--kill-joiner-at-frame", type=int, help="end the joiner's session process hard (taskkill /F): a disconnect")
+    ap.add_argument("--quit-joiner-at-frame", type=int, help="send the joiner's session process a close request: a graceful quit")
     ap.add_argument("--third-joiner", action="store_true")
     ap.add_argument("--host-only", type=float, metavar="SECONDS")
     ap.add_argument("--expect", choices=EXPECTS, default="ok")
@@ -824,6 +844,8 @@ def main(argv=None):
     ap.add_argument("--settle", type=float, default=8, help="seconds a refused run is watched for a session that starts anyway")
     ap.add_argument("--orphan-watch", type=float, default=10, help="seconds pids.txt must stay unchanged after the last kill")
     a = ap.parse_args(argv)
+    if a.kill_joiner_at_frame is not None and a.quit_joiner_at_frame is not None:
+        sys.exit("--kill-joiner-at-frame and --quit-joiner-at-frame exclude each other")
     if a.host_only is not None and a.expect != "lobby":
         sys.exit("--host-only goes with --expect lobby")
     if a.expect == "lobby" and a.host_only is None:

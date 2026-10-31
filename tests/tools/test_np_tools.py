@@ -2646,6 +2646,32 @@ def test_pair_lost(root):
     check(code == 1 and "needs --kill-joiner-at-frame" in out, f"np_pair, lost without --kill-joiner-at-frame: exit {code}\n{out}")
 
 
+def test_pair_lost_s6(root):
+    # Task 15 R-S6a/b (gate S6 on p1g): the real survivor's events.txt starts with the frame-0 hold (with its own banner); the
+    # disconnect is judged on the LAST hold begin at or after the kill frame; a copy np_pair ended itself is not waited for
+    # (a graceful quit ends `left` and never relaunches offline); --kill-joiner-at-frame ends the joiner hard, and
+    # --quit-joiner-at-frame is the graceful path (a close request).
+    slow = ("--env-host", "FAKE_ONLINE_FRAME_MS=100", "--env-joiner", "FAKE_ONLINE_FRAME_MS=100")
+    lost = ("--expect", "lost", "--env-host", "FAKE_ONLINE_END=lost")
+    code, out, runs = np_pair(root, "lb", *lost, "--kill-joiner-at-frame", "5", "--env-host", "FAKE_ONLINE_BOOT_HOLD=1",
+                              "--env-joiner", "FAKE_ONLINE_BOOT_HOLD=1", *slow, quit_at=200)  # both copies hold at frame 0, as in the game
+    check(code == 0 and "verdict lost" in out, f"np_pair, lost after a frame-0 hold: the later hold is judged: exit {code}\n{out}")
+    events = open(os.path.join(runs, "lb_host", "ctl", "session", "events.txt")).read()
+    check(events.count("hold begin frame") == 2 and "hold begin frame 0" in events, f"np_pair, lost: the fixture has the frame-0 hold and the disconnect hold:\n{events}")
+    check("ended hard (taskkill /F)" in out, f"np_pair, --kill-joiner-at-frame ends the joiner hard:\n{out}")
+    t0 = time.time()
+    code, out, runs = np_pair(root, "lq", *lost, "--kill-joiner-at-frame", "8", "--env-joiner", "FAKE_ONLINE_LEFT_AT=8",
+                              "--env-host", "FAKE_ONLINE_LOST_ANY=1", *slow, quit_at=200)
+    took = time.time() - t0
+    check(code == 0 and "verdict lost" in out and "offline relaunch" not in out,
+          f"np_pair, the ended joiner wrote `left`: no wait for its offline relaunch: exit {code}\n{out}")
+    check(took < 28, f"np_pair, the ended joiner is not waited for (step timeout 30 s): took {took:.1f} s")
+    check([r[2] for r in pair_pids(runs, "lq", "joiner")] == ["lobby", "session"], f"np_pair, lq: the joiner never relaunched: {pair_pids(runs, 'lq', 'joiner')}")
+    code, out, runs = np_pair(root, "lg", *lost, "--quit-joiner-at-frame", "5", *slow, quit_at=200)
+    check(code == 0 and "verdict lost" in out and "close request" in out, f"np_pair, --quit-joiner-at-frame (graceful): exit {code}\n{out}")
+    check(leftover_pids(runs, "lg") == [], "np_pair, --quit-joiner-at-frame: nothing left")
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Task 10 fix round 1 (review I1-I4, M1-M5)
 # ---------------------------------------------------------------------------------------------------------------------

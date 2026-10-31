@@ -44,6 +44,9 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
   ROLE=decoy        (the tests) only logs its pid into its ctl/pids.txt and sleeps 120 s: a stand-in the harness does not own
   DUMP0_DIFF / HANDLE_SHIFT / STASH   the frame-0 dump this copy writes when DOA4_NP_DUMP lists 0 (write_dump0, Task 15 carry b)
   NO_DUMP=1         no frame-0 dump even when DOA4_NP_DUMP lists 0
+  BOOT_HOLD=1       the session starts with the real game's frame-0 hold (hold begin frame 0, banner 1.0 s later, hold end)
+  LEFT_AT=<f>       after frame f the session ends `left` (a graceful quit), starts no offline relaunch and lingers until ended
+  LOST_ANY=1        with END=lost: a peer whose session process is gone counts as vanished even if it wrote a terminal line
   SKIP_PEER_CHECK=1 the session does not look for a lobby-only peer (plays its frames)   NO_OFFLINE=1  after the lobby-only
                     peer's end, no offline relaunch
 The game's own test switch DOA4_NP_TEST_NO_RESTART=1 (Task 15 carry f) is honoured as the game does: the joiner says yes and
@@ -459,6 +462,15 @@ def session(ctl):
         return 0
     if "0" in os.environ.get("DOA4_NP_DUMP", "").split(",") and os.environ.get("FAKE_ONLINE_NO_DUMP") != "1":
         write_dump0(os.path.join(sess, "dumps", "data_000000.bin"))
+    if os.environ.get("FAKE_ONLINE_BOOT_HOLD") == "1":  # the real session's frame-0 hold (both copies start), with its banner
+        t0 = time.time()
+        event("hold begin frame 0")
+        time.sleep(max(0.0, t0 + 1.0 - time.time()))
+        event("banner waiting")
+        time.sleep(0.05)
+        event(f"hold end frame 0 after {int((time.time() - t0) * 1000)} ms")
+    left_at = os.environ.get("FAKE_ONLINE_LEFT_AT")
+    left_at = int(left_at) if left_at else None
     frame, lost, peer_seen = 0, False, False
     while frame < rows:
         if end == "lost" and peer:
@@ -468,10 +480,20 @@ def session(ctl):
                 # gone without a terminal line: a vanished peer (a peer that ended its session cleanly is not lost)
                 ended = any(l.startswith("session ended at frame") for l in
                             read_text(os.path.join(peer, "session", "np_log.txt")).splitlines())                     if os.path.exists(os.path.join(peer, "session", "np_log.txt")) else False
-                if not ended:
+                if not ended or os.environ.get("FAKE_ONLINE_LOST_ANY") == "1":
                     lost = True
                     break
         log.write(f"frame {frame}: ok\n")
+        if left_at is not None and frame >= left_at:
+            # the real game's graceful quit (a close request in a session): `left`, no Leave sent, no offline relaunch;
+            # the process lingers until it is ended
+            write_digest(os.path.join(sess, "digest.d4d"), frame + 1, diverge)
+            event(f"session ended at frame {frame + 1}: left")
+            log.write(f"session ended at frame {frame + 1}: left\nchecksums handed to GekkoNet: {max(0, frame + 1 - delay)}\n")
+            log.close()
+            events.close()
+            time.sleep(120)
+            return 0
         frame += 1
         if pace:
             time.sleep(pace)
