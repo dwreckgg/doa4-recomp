@@ -22,6 +22,7 @@ bool DecodePlayerInput(const uint8_t in[kPlayerInputBytes], Pad* out) {
 Executor::Executor(int num_players, ConfirmedTap tap)
     : num_players_(num_players < 1 ? 1 : (num_players > kUsers ? kUsers : num_players)), tap_(std::move(tap)) {}
 
+void Executor::DropPending() { pending_ = Pending(); }
 uint32_t Executor::saves_filled() const { return filled_; }
 int32_t Executor::next_frame() const { return next_; }
 

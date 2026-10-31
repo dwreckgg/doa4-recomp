@@ -34,7 +34,7 @@ struct Scope {
 
 void AdapterSend(GekkoNetAddress*, const char* data, int length) {
   SessionImpl* c = g_current;
-  if (!c || !c->send || length <= 0) return;
+  if (!c || !c->send || length <= 0) return;  // GekkoNet never sends an empty packet; the guards are defensive, untested
   c->send(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data), size_t(length)));
 }
 
@@ -48,7 +48,10 @@ GekkoNetResult** AdapterReceive(int* length) {
   if (c->receive) {
     std::vector<uint8_t> buf;
     while (c->receive(&buf)) {
-      if (buf.empty()) continue;  // nothing to parse in an empty payload
+      // GekkoNet refuses an empty buffer by itself (backend.cpp:155-158: the deserialise fails and a line is printed;
+      // the buffers are freed at :165-167), so this skip changes nothing it could observe; it only avoids building a
+      // result for nothing. Not tested for that reason.
+      if (buf.empty()) continue;
       auto* r = static_cast<GekkoNetResult*>(std::malloc(sizeof(GekkoNetResult)));
       r->addr.size = 1;
       r->addr.data = std::malloc(1);

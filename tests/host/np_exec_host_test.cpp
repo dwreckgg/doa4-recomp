@@ -405,6 +405,51 @@ static void TestExecutorPlayers() {
   }
 }
 
+// The constructor clamps the player count to 1..kUsers: a count outside it would index past the four-pad record
+// (and a zero-player executor could never connect anyone). Predicted RED with the clamp removed: 2 failures
+// (Executor(0) refuses the 16-byte list or takes mask 00; Executor(9) refuses the 64-byte list).
+static void TestExecutorClamp() {
+  Group("executor, player count clamp");
+  {
+    exec::Executor ex(0, nullptr);  // clamped up to one player: a 16-byte list, mask 01
+    exec::Step st = ex.Run(std::vector<exec::Event>{Advance(0, Bytes(16, 0))}, 0);
+    CHECKF(st.advanced && st.input.connected == 0x01, "Executor(0): advanced %d, mask %02X (expected 1, 01)", int(st.advanced),
+           st.input.connected);
+  }
+  {
+    exec::Executor ex(9, nullptr);  // clamped down to four players: a 64-byte list, mask 0F
+    exec::Step st = ex.Run(std::vector<exec::Event>{Advance(0, Bytes(64, 0))}, 0);
+    CHECKF(st.advanced && st.input.connected == 0x0F, "Executor(9): advanced %d, mask %02X (expected 1, 0F)", int(st.advanced),
+           st.input.connected);
+  }
+}
+
+// The pending Save holds pointers into GekkoNet's state storage, which die with the session: the owner drops the
+// pending Save BEFORE destroying the session (np_exec.h). Predicted RED with DropPending doing nothing: 2 failures
+// (the dropped slot is written, saves_filled is 1).
+static void TestExecutorDropPending() {
+  Group("executor, DropPending");
+  SaveSlots s0, s1;
+  exec::Executor ex(2, nullptr);
+  ex.Run(std::vector<exec::Event>{Advance(0, TwoPads(PadN(1), PadN(2))), Save(0, &s0)}, 0x11);  // Save 0 is pending
+  ex.DropPending();
+  exec::Step st = ex.Run({}, 0x55);  // what a Run after the session's death would have written through the pointers
+  CHECK(!st.advanced && st.end == exec::End::kNone && st.frame == -1);
+  CHECK(Untouched(s0));
+  CHECK(ex.saves_filled() == 0);
+  CHECK(ex.next_frame() == 1);
+  // The executor stays usable: the next frame stages and its Save is filled one call later as usual.
+  st = ex.Run(std::vector<exec::Event>{Advance(1, TwoPads(PadN(3), PadN(4))), Save(1, &s1)}, 0x22);
+  CHECK(st.advanced && st.frame == 1 && st.end == exec::End::kNone);
+  ex.Run({}, 0x33);
+  CHECK(s1.checksum == 0x33 && ex.saves_filled() == 1 && Untouched(s0));
+  // Dropping when nothing is pending changes nothing.
+  exec::Executor ex2(2, nullptr);
+  ex2.DropPending();
+  exec::Step e2 = ex2.Run({}, 1);
+  CHECK(!e2.advanced && e2.end == exec::End::kNone && ex2.saves_filled() == 0 && ex2.next_frame() == 0);
+}
+
 static void TestFoldChecksum() {
   Group("checksum fold");
   // Every expected value below was produced by an independent Python FNV-1a run (the brief's one-liner):
@@ -474,6 +519,8 @@ struct Link {
   int sent[2] = {0, 0};
   int delay = 0;  // ticks each way
   int now = 0;
+  bool dead = false;  // the link has been cut: every payload sent from now on is dropped, nothing is delivered
+  int dropped = 0;    // payloads dropped while dead
 };
 
 constexpr int kFrames = 300;
@@ -502,6 +549,7 @@ struct Side {
   std::vector<std::pair<int32_t, FrameInput>> staged;  // what Run returned for each Advance
   std::vector<gekko::SessionEvent> desyncs;
   std::vector<int> desync_tick;
+  int disconnects = 0;  // kDisconnected events seen
   Side() : ex(2, [this](int32_t f, const FrameInput& in) { taps.emplace_back(f, in); }) {}
 };
 
@@ -523,8 +571,27 @@ struct PairResult {
   Side side[2];
   Link link;
   int ticks = 0;
+  int take_every = 1;  // the harness takes a side's session events every Nth tick (and once more when the run ends)
   std::chrono::steady_clock::time_point stats_base{};  // when both sessions had started (Stats() read once there)
+  // Dead-link run (RunPair's cut_after_frames): the cut moment, and each side's advances at the cut and at the end.
+  std::chrono::steady_clock::time_point cut_at{};
+  int adv_at_cut[2] = {0, 0};
+  int adv_at_end[2] = {0, 0};
+  long long outage_ms = 0;
 };
+
+// Takes one side's session events (Update() has already drained GekkoNet's into the wrapper).
+static void DrainEvents(PairResult& r, int s) {
+  Side& S = r.side[s];
+  for (const gekko::SessionEvent& e : S.session.TakeSessionEvents()) {
+    if (e.kind == gekko::SessionEvent::kStarted) S.started = true;
+    if (e.kind == gekko::SessionEvent::kDisconnected) ++S.disconnects;
+    if (e.kind == gekko::SessionEvent::kDesync) {
+      S.desyncs.push_back(e);
+      S.desync_tick.push_back(r.ticks);
+    }
+  }
+}
 
 // Task 11's order, per frame: Run({}, checksum_entering) BEFORE the frame's first Update, AddLocalInput once, then
 // Update + Run(events, checksum_entering) until an Advance (one Update per tick here, since two sides share a thread).
@@ -557,13 +624,7 @@ static void StepSide(PairResult& r, int s, bool pre_run) {
   if (ev.empty() && S.advances > 0) ++S.empty_updates_after_first;
   exec::Step st = run(ev);
   if (st.end != exec::End::kNone) S.step_ended = true;
-  for (const gekko::SessionEvent& e : S.session.TakeSessionEvents()) {
-    if (e.kind == gekko::SessionEvent::kStarted) S.started = true;
-    if (e.kind == gekko::SessionEvent::kDesync) {
-      S.desyncs.push_back(e);
-      S.desync_tick.push_back(r.ticks);
-    }
-  }
+  if (r.ticks % r.take_every == 0) DrainEvents(r, s);
   if (st.advanced) {
     S.staged.emplace_back(st.frame, st.input);
     // The fake state advances from the staged inputs, identically on both sides.
@@ -581,8 +642,13 @@ static void StepSide(PairResult& r, int s, bool pre_run) {
   }
 }
 
-static void RunPair(PairResult& r, int bad_frame_side_b, bool pre_run, int delay_ticks, int tick_sleep_ms = 0) {
+// cut_after_frames >= 0: when both sides have that many Advances the link is cut (queues emptied, every later payload
+// dropped) and the run goes on for dead_ms of WALL CLOCK at 5 ms per tick, because GekkoNet's disconnect timeout
+// reads steady_clock (backend.cpp:733-759); the run ends there.
+static void RunPair(PairResult& r, int bad_frame_side_b, bool pre_run, int delay_ticks, int tick_sleep_ms = 0, int take_every = 1,
+                    int cut_after_frames = -1, int dead_ms = 0) {
   r.link.delay = delay_ticks;
+  r.take_every = take_every;
   for (int s = 0; s < 2; ++s) {
     gekko::Config cfg;
     cfg.num_players = 2;
@@ -591,12 +657,16 @@ static void RunPair(PairResult& r, int bad_frame_side_b, bool pre_run, int delay
     bool ok = r.side[s].session.Create(
         cfg,
         [&r, s](std::span<const uint8_t> payload) {
+          if (r.link.dead) {
+            ++r.link.dropped;
+            return;
+          }
           r.link.q[1 - s].push_back({r.link.now + r.link.delay, Bytes(payload.begin(), payload.end())});
           ++r.link.sent[s];
         },
         [&r, s](Bytes* out) {
           auto& q = r.link.q[s];
-          if (q.empty() || q.front().due > r.link.now) return false;
+          if (r.link.dead || q.empty() || q.front().due > r.link.now) return false;
           *out = std::move(q.front().bytes);
           q.pop_front();
           return true;
@@ -614,6 +684,25 @@ static void RunPair(PairResult& r, int bad_frame_side_b, bool pre_run, int delay
       r.side[0].session.Stats();  // GekkoNet's bandwidth rate has its baseline at the first read (net.cpp:92-100)
       r.side[1].session.Stats();
     }
+    if (cut_after_frames >= 0) {
+      if (!r.link.dead && both_started && std::min(r.side[0].advances, r.side[1].advances) >= cut_after_frames) {
+        r.link.dead = true;
+        r.link.q[0].clear();
+        r.link.q[1].clear();
+        r.cut_at = std::chrono::steady_clock::now();
+        for (int k = 0; k < 2; ++k) r.adv_at_cut[k] = r.side[k].advances;
+      }
+      if (r.link.dead) {
+        r.outage_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - r.cut_at).count();
+        if (r.outage_ms >= dead_ms) {
+          for (int k = 0; k < 2; ++k) r.adv_at_end[k] = r.side[k].advances;
+          ++r.ticks;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+    }
     if (both_started && r.side[0].advances >= kFrames && r.side[1].advances >= kFrames) {
       ++r.ticks;
       break;
@@ -621,6 +710,8 @@ static void RunPair(PairResult& r, int bad_frame_side_b, bool pre_run, int delay
     if (!both_started) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     else if (tick_sleep_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(tick_sleep_ms));
   }
+  DrainEvents(r, 0);  // the final take of a run that took only every Nth tick
+  DrainEvents(r, 1);
 }
 
 static void CommonChecks(const PairResult& r, const char* label) {
@@ -723,7 +814,7 @@ static void TestRealDesync() {
 static void TestRealOrderControl() {
   Group("real GekkoNet, order control: no Run({}) before the update");
   // The same perturbation, but the harness fills Save(f-1) only after the update for f (one update late). GekkoNet
-  // has already sent what the slot held: the checksum of frame f-2 (two states are kept, storage.cpp:12). Predicted
+  // has already sent what the slot held: the checksum of frame f-2 (two states are kept, storage.cpp:11). Predicted
   // before the run: frame 150's health is the good checksum of frame 148 on both sides (no desync at 150), and the
   // perturbed value of frame 150, written late into the slot frame 152 shares, is sent as frame 152's: both sides
   // report frame 152, not 150.
@@ -759,12 +850,63 @@ static void TestRealDelayed() {
                 st.jitter_ms, st.kb_sent, st.kb_received);
     CHECKF(st.kb_sent > 0 && st.kb_received > 0, "side %d: kb sent %.4f received %.4f", s, st.kb_sent, st.kb_received);
     CHECKF(st.ping_ms > 0, "side %d: ping %.3f ms on a link with a round trip of six ticks", s, st.ping_ms);
+    // Jitter is the spread of the round trips, not their average: on a link of constant delay it is a small fraction of
+    // the ping (observed 1.1 and 1.3 ms against 93.6 and 93.5 ms; a jitter that reads the average ping equals it).
+    // Predicted RED with the wrapper's jitter field fed from the average ping: 2 failures (one per side).
+    CHECKF(st.jitter_ms < 0.5f * st.ping_ms, "side %d: jitter %.2f ms against ping %.2f ms on a constant-delay link", s, st.jitter_ms,
+           st.ping_ms);
   }
   // And the desync detection still fires on a delayed link.
   PairResult d;
   RunPair(d, kBadFrame, true, 3);
   CommonChecks(d, "delayed desync");
   for (int s = 0; s < 2; ++s) ExpectOneDesync(d, s, kBadFrame, "delayed desync");
+}
+
+// "Since the last call": session events accumulate across Updates until the owner takes them (Task 11 takes them once
+// per frame, after however many stalled Updates). The harness here takes only every 5th tick and once at the end.
+// Predicted RED with Update() clearing the wrapper's event list at its start: 2 failures (the desync, raised in one
+// Update and taken some Updates later, is lost on each side).
+static void TestRealEventsBatched() {
+  Group("real GekkoNet, session events taken every 5th tick");
+  PairResult d;
+  RunPair(d, kBadFrame, true, 0, 0, 5);
+  CHECK(d.take_every == 5);
+  for (int s = 0; s < 2; ++s) ExpectOneDesync(d, s, kBadFrame, "batched take");
+  CHECK(d.side[0].started && d.side[1].started);
+}
+
+// R4 "no automatic disconnect". GekkoNet's own timeout defaults to 5000 ms (backend.cpp:16) and is judged against
+// steady_clock (backend.cpp:733-759), so only a wall-clock wait can tell whether the wrapper turned it off
+// (gekko_set_disconnect_timeout(session, 0), np_gekko.cpp Create). The link is cut after 100 frames and stays dead
+// for 5.7 s. With the timeout off: no kDisconnected on either side and no more Advances than the lockstep lead
+// allows. With it on (measured by the reviewer with the line deleted): kDisconnected on both sides at about 5.0 s and
+// about 100 Advances on neutral peer input, a ghost match on each PC.
+// Predicted RED with the line deleted: 4 failures (kDisconnected on each side, Advances in the outage on each side).
+constexpr int kDeadMs = 5700;
+static_assert(kDeadMs >= 5000 + 500, "the outage must outlast GekkoNet's default disconnect timeout (5000 ms) with a margin");
+// CEILING on Advances after the cut: observed 4 and 0. Lockstep lets a side run on only until it lacks the peer's input
+// for the next frame, i.e. by the lead it had plus the input delay (2): at most about 2 x 2 + 2; 8 leaves room and is
+// still far from the ~100 of a session that went on without its peer.
+constexpr int kDeadAdvanceCeiling = 2 * kDelay + 4;
+
+static void TestRealDeadLink() {
+  Group("real GekkoNet, link dead for 5.7 s of wall clock: no automatic disconnect");
+  PairResult r;
+  RunPair(r, -1, true, 0, 0, 1, 100, kDeadMs);
+  CHECKF(r.link.dead, "the link was never cut (both sides must reach 100 Advances first)");
+  CHECKF(r.adv_at_cut[0] >= 100 && r.adv_at_cut[1] >= 100, "Advances at the cut: A %d, B %d", r.adv_at_cut[0], r.adv_at_cut[1]);
+  CHECKF(r.outage_ms >= kDeadMs, "the outage lasted %lld ms (expected >= %d)", r.outage_ms, kDeadMs);
+  CHECKF(r.link.dropped > 0, "no payload was dropped while the link was dead: the sessions did not keep talking");
+  for (int s = 0; s < 2; ++s) {
+    const int adv = r.adv_at_end[s] - r.adv_at_cut[s];
+    std::printf("info: dead link side %d: %d Advances in %lld ms of outage, %d kDisconnected, %d payloads dropped in all\n", s, adv,
+                r.outage_ms, r.side[s].disconnects, r.link.dropped);
+    CHECKF(r.side[s].disconnects == 0, "side %d: %d kDisconnected events during a %lld ms outage (R4: no automatic disconnect)", s,
+           r.side[s].disconnects, r.outage_ms);
+    CHECKF(adv <= kDeadAdvanceCeiling, "side %d: %d Advances while the link was dead (ceiling %d)", s, adv, kDeadAdvanceCeiling);
+    CHECKF(!r.side[s].step_ended, "side %d: the executor ended the session", s);
+  }
 }
 
 int main(int argc, char** argv) {
@@ -776,12 +918,16 @@ int main(int argc, char** argv) {
   TestExecutorFrameMinusOne();
   TestExecutorRefusals();
   TestExecutorPlayers();
+  TestExecutorClamp();
+  TestExecutorDropPending();
   TestFoldChecksum();
   TestWrapperLifecycle();
   TestRealClean();
   TestRealDesync();
   TestRealOrderControl();
   TestRealDelayed();
+  TestRealEventsBatched();
+  TestRealDeadLink();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

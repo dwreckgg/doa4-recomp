@@ -54,6 +54,11 @@ class Executor {
   // first event of the first call that holds any event, once, before any Advance. A refused list is refused whole:
   // nothing of it is staged or tapped. Once an end is returned every later call returns it.
   Step Run(std::span<const Event> events, uint32_t checksum_entering);
+  // Lifetime: a pending Save holds the pointers GekkoNet handed out, into the state storage of its session; they are
+  // valid only until that session is destroyed (Session::Destroy, or a new Create on the same object), and a Run after
+  // that writes freed memory. The owner calls DropPending() BEFORE destroying the session (or destroys the Executor
+  // first). It forgets the pending Save without writing it; the next Run writes nothing for it.
+  void DropPending();
   uint32_t saves_filled() const;  // pending Saves filled so far ("checksums handed to GekkoNet", Task 12)
   int32_t next_frame() const;
 
