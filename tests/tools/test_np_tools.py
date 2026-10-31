@@ -2234,8 +2234,393 @@ def test_dumpdiff_label(root):
     check(code == 0 and lines == [], f"dumpdiff: equal dumps print no range: {lines}")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Task 10: the hidden launch, the dot-product self-test rule, and the two-copy harness np_pair.py on the online stand-in
+# (fake_online.py). Every pair runs end to end: real processes, the request files, the pids.txt hand-over.
+# ---------------------------------------------------------------------------------------------------------------------
+def startup_note(runs, name):
+    """(wShowWindow, dwFlags) the stand-in read from its own GetStartupInfoW, or None."""
+    path = os.path.join(runs, name, "startup.txt")
+    m = re.match(r"show_window=(\d+) flags=(0x[0-9a-f]+)", open(path).read()) if os.path.exists(path) else None
+    return (int(m.group(1)), int(m.group(2), 16)) if m else None
+
+
+STARTF_USESHOWWINDOW = 0x1
+SW_SHOWMINNOACTIVE = 7
+
+
+def test_hidden_launch(root):
+    # np_run.py starts the game minimized without activation (STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE); --show-window turns
+    # that off. The stand-in reads its own GetStartupInfoW, so this is what the started process itself sees.
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+
+    def np_run(name, *extra):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60", *extra],
+                           capture_output=True, text=True, env=stand_in_env(FAKE_STARTUP_NOTE="1"), timeout=120)
+        return p.returncode, p.stdout + p.stderr
+    code, out = np_run("hid")
+    got = startup_note(runs, "hid")
+    check(code == 0 and got is not None, f"np_run hidden launch: run ended well and the stand-in wrote its note: exit {code} {got}\n{out}")
+    check(got is not None and got[0] == SW_SHOWMINNOACTIVE and got[1] & STARTF_USESHOWWINDOW,
+          f"np_run starts the game with wShowWindow 7 and STARTF_USESHOWWINDOW: {got}")
+    code, out = np_run("shown", "--show-window")
+    shown = startup_note(runs, "shown")
+    check(code == 0 and shown is not None and not shown[1] & STARTF_USESHOWWINDOW and shown[0] != SW_SHOWMINNOACTIVE,
+          f"np_run --show-window: no show-window flag, not 7: exit {code} {shown}")
+    check(shown != got, "np_run: the startup note differs between a hidden and a shown launch (it is a measurement)")
+
+
+def test_selftest_rule(root):
+    # M2 of Task 1's review: a run whose game.log lacks the dot-product self-test line, or reports OFF, is not a good run.
+    mod = load("np_run")
+    on = ["x [doa4][LIFE] dot products: canonical NaN on"]
+    check(mod.selftest_problem(on) is None, "selftest_problem: the on line is fine")
+    check(mod.selftest_problem([]) is not None and mod.selftest_problem(["nothing here"]) is not None,
+          "selftest_problem: no line is a problem")
+    off = mod.selftest_problem(["a [doa4][LIFE] dot products: canonical NaN OFF (7FC00000 0 0 0)"])
+    check(off is not None and "OFF" in off, f"selftest_problem: OFF is a problem: {off!r}")
+    check(mod.selftest_problem(on + ["b [doa4][LIFE] dot products: canonical NaN OFF (1 2 3 4)"]) is not None,
+          "selftest_problem: one OFF line among on lines is a problem")
+    check(mod.selftest_problem(["[doa4][LIFE] dot products: canonical NaN once"]) is not None,
+          "selftest_problem: only the word 'on' counts")
+    # judge: the otherwise good run fails with the problem and keeps its quit line in the reason
+    log = ["quit at frame 11: quit frame"]
+    check(mod.judge("record", 0, False, log, None, on) == ("ok", "quit at frame 11: quit frame"), "judge: good run with the self-test line")
+    status, why = mod.judge("record", 0, False, log, None, [])
+    check(status == "failed" and "NO SELFTEST" in why and "quit at frame 11" in why, f"judge: no self-test line: {status} {why!r}")
+    status, why = mod.judge("record", 0, False, log, None, ["[doa4][LIFE] dot products: canonical NaN OFF (1 2 3 4)"])
+    check(status == "failed" and "OFF" in why, f"judge: OFF: {status} {why!r}")
+    # through np_run and np_gate end to end, with the stand-in leaving the line out / saying OFF
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+
+    def np_run(name, **env):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60"],
+                           capture_output=True, text=True, env=stand_in_env(**env), timeout=120)
+        return p.returncode, p.stdout + p.stderr
+    code, out = np_run("st_ok")
+    check(code == 0 and result(runs, "st_ok") == REC_OK, f"np_run, self-test line present: exit {code} {result(runs, 'st_ok')!r}")
+    code, out = np_run("st_none", FAKE_NO_SELFTEST="1")
+    check(code == 1 and "NO SELFTEST" in (result(runs, "st_none") or ""), f"np_run, no self-test line: exit {code} {result(runs, 'st_none')!r}")
+    code, out = np_run("st_off", FAKE_SELFTEST_OFF="1")
+    check(code == 1 and "SELFTEST not on" in (result(runs, "st_off") or ""), f"np_run, self-test OFF: exit {code} {result(runs, 'st_off')!r}")
+    code, out, runs = gate(root, "sg", "--script", SCRIPT, "--replays", "1", FAKE_NO_SELFTEST="1")
+    check(code == 1 and "gate FAILED" in out, f"np_gate, no self-test line: exit {code}\n{out}")
+
+
+PAIR_SAVE = os.path.join("B13EBABEBABEBABE", "544307D1")
+
+
+def make_pair_userdata(root):
+    ud = os.path.join(root, "pair_ud")
+    os.makedirs(os.path.join(ud, PAIR_SAVE), exist_ok=True)
+    for name, data in (("save0.bin", b"first save"), ("save1.bin", b"second save")):
+        with open(os.path.join(ud, PAIR_SAVE, name), "wb") as f:
+            f.write(data)
+    return ud
+
+
+def pair_script(root, quit_at=10):
+    path = os.path.join(root, "pair_script.txt")
+    with open(path, "w") as f:
+        f.write(f"connect 0 1\n{quit_at} -\nquit\n")
+    return path
+
+
+def np_pair(root, name, *args, quit_at=10, tools=None, **env):
+    """np_pair.py end to end on the online stand-in; (exit code, output, runs folder)."""
+    runs = os.path.join(root, "pruns")
+    cmd = [sys.executable, "-I", os.path.join(tools or TOOLS, "np_pair.py"), name, "--script", pair_script(root, quit_at),
+           "--userdata", make_pair_userdata(root), "--runs", runs, "--exe", FAKE_EXE, "--end-grace", "1",
+           "--step-timeout", "30", "--timeout", "60", *args]
+    p = subprocess.run(cmd, capture_output=True, text=True, env=stand_in_env(**env), timeout=240)
+    return p.returncode, p.stdout + p.stderr, runs
+
+
+def pair_pids(runs, name, side):
+    path = os.path.join(runs, f"{name}_{side}", "ctl", "pids.txt")
+    return [l.split() for l in open(path).read().splitlines()] if os.path.exists(path) else []
+
+
+def pair_verdict(runs, name):
+    path = os.path.join(runs, f"{name}_pair.txt")
+    return open(path).read() if os.path.exists(path) else ""
+
+
+def leftover_pids(runs, name, sides=("host", "joiner")):
+    """The pids of the pair's own pids.txt files that are still alive (there must be none once np_pair has returned)."""
+    mod = load("np_pair")
+    return [int(row[1]) for side in sides for row in pair_pids(runs, name, side) if mod.pid_alive(int(row[1]))]
+
+
+def test_pair_ok(root):
+    code, out, runs = np_pair(root, "ok")
+    check(code == 0 and "verdict ok" in out, f"np_pair, an ok pair: exit {code}\n{out}")
+    check("real saves unchanged" in out and "4 save files hashed" in out, f"np_pair, ok: the save check ran on 2 files x 2 copies\n{out}")
+    check(pair_verdict(runs, "ok").rstrip().endswith("verdict ok"), f"np_pair, ok: verdict file\n{pair_verdict(runs, 'ok')}")
+    for side in ("host", "joiner"):
+        kinds = [r[2] for r in pair_pids(runs, "ok", side)]
+        check(kinds == ["lobby", "session", "offline"], f"np_pair, ok: {side} pids.txt hand-over {kinds}")
+        folder = os.path.join(runs, f"ok_{side}")
+        check(all(os.path.exists(os.path.join(folder, n)) for n in ("ud", "ctl", "game.log", "command.txt", "run_result.txt")),
+              f"np_pair, ok: {side} run folder has ud, ctl, game.log, command.txt, run_result.txt")
+        text = open(os.path.join(folder, "command.txt")).read()
+        for needle in ("DOA4_NP_BIND=loopback", "DOA4_NP_STUN=off", "DOA4_NP_UPNP=off", "DOA4_NP_TEST_DIR=",
+                       "DOA4_NP_LOCAL_SCRIPT=", "SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000", "--headless=true",
+                       "--user_data_root="):
+            check(needle in text, f"np_pair, ok: {side} command.txt has {needle}")
+    st = {side: open(os.path.join(runs, f"ok_{side}", "ctl", "session", "digest.d4d"), "rb").read() for side in ("host", "joiner")}
+    check(st["host"] == st["joiner"] and len(st["host"]) > 100, "np_pair, ok: both digests exist and are equal (non-empty)")
+    check(leftover_pids(runs, "ok") == [], f"np_pair, ok: no process of the pair is left: {leftover_pids(runs, 'ok')}")
+
+
+def test_pair_options(root):
+    # --delay and --seed reach the host only, --sim both, --env-*/--arg-* their own copy, --cache both
+    code, out, runs = np_pair(root, "opt", "--delay", "3", "--seed", "77", "--sim", "40,5,2", "--env-host", "FAKE_X=h",
+                              "--env-joiner", "FAKE_X=j", "--arg-host=--netplay_show_stats=true", "--cache", os.path.join(root, "cache"))
+    check(code == 0, f"np_pair options: exit {code}\n{out}")
+    host = open(os.path.join(runs, "opt_host", "command.txt")).read()
+    joiner = open(os.path.join(runs, "opt_joiner", "command.txt")).read()
+    check("DOA4_NP_DELAY=3" in host and "DOA4_NP_SEED=77" in host, f"np_pair options: the host has delay and seed\n{host}")
+    check("DOA4_NP_DELAY" not in joiner and "DOA4_NP_SEED" not in joiner, f"np_pair options: the joiner has neither\n{joiner}")
+    check("DOA4_NP_SIM=40,5,2" in host and "DOA4_NP_SIM=40,5,2" in joiner, "np_pair options: --sim on both sides")
+    check("--netplay_show_stats=true" in host and "--netplay_show_stats=true" not in joiner, "np_pair options: --arg-host only on the host")
+    check("--cache_path=" in host and "--cache_path=" in joiner, "np_pair options: --cache on both")
+
+
+def test_pair_diverge(root):
+    # digests that differ from frame 7: the verdict names the frame
+    code, out, runs = np_pair(root, "dv", "--env-joiner", "FAKE_ONLINE_DIVERGE=7")
+    check(code == 1 and "differ at frame 7" in out, f"np_pair, digests differ from frame 7: exit {code}\n{out}")
+    check("verdict FAILED" in pair_verdict(runs, "dv"), "np_pair, differ: the verdict file says FAILED")
+    check(leftover_pids(runs, "dv") == [], "np_pair, differ: no process of the pair is left")
+
+
+def test_pair_desync(root):
+    # --expect desync: both sides name a desync AND the digests really differ. The control: sides that name a desync while their
+    # digests never differ is an expected event that did not happen (#0331).
+    both = ("--env-host", "FAKE_ONLINE_END=desync", "--env-joiner", "FAKE_ONLINE_END=desync")
+    code, out, runs = np_pair(root, "ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DIVERGE=7")
+    check(code == 0 and "verdict desync" in out and "first differing digest frame: 7" in out, f"np_pair, desync expected and seen: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "dn", "--expect", "desync", *both)
+    check(code == 1 and "never differ" in out, f"np_pair, desync expected but the digests never differ: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "dm", "--expect", "desync", "--env-joiner", "FAKE_ONLINE_DIVERGE=7")
+    check(code == 1 and "expected a desync" in out, f"np_pair, desync expected, the sides ended with a leave: exit {code}\n{out}")
+
+
+def test_pair_did_not_run(root):
+    code, out, runs = np_pair(root, "nr", "--env-joiner", "FAKE_ONLINE_NO_SESSION=1")
+    check(code == 1 and "joiner copy did not run" in out, f"np_pair, one side without a session folder: exit {code}\n{out}")
+    check("host copy did not run" not in out, "np_pair, one side without a session folder: only the joiner is named")
+
+
+def test_pair_end_frames(root):
+    # both sides play the same prefix but one ends earlier: equality over a common prefix is not equality (#0311)
+    code, out, runs = np_pair(root, "ef", "--env-joiner", "FAKE_ONLINE_QUIT_AT=8")
+    check(code == 1 and "ended at different frames: host 10, joiner 8" in out, f"np_pair, different end frames: exit {code}\n{out}")
+    check("digests have different lengths: host 10 frames, joiner 8" in out, f"np_pair, different lengths: both lengths named\n{out}")
+    # the digest must reach the script's quit frame (10): both sides end at 6 together
+    code, out, runs = np_pair(root, "sh", "--env-host", "FAKE_ONLINE_QUIT_AT=6", "--env-joiner", "FAKE_ONLINE_QUIT_AT=6")
+    check(code == 1 and "fewer than the script's quit frame 10" in out, f"np_pair, both short of the script's quit frame: exit {code}\n{out}")
+
+
+def test_pair_judge_rules(root):
+    code, out, runs = np_pair(root, "wn", "--env-host", "FAKE_ONLINE_WARN=1")
+    check(code == 1 and "np_log holds a WARN line" in out, f"np_pair, a WARN line in one np_log: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "fb", "--env-joiner", "FAKE_ONLINE_FALLBACK=1")
+    check(code == 1 and "verdict FAILED" in out, f"np_pair, a fallback counter above 0: exit {code}\n{out}")
+    check("fb_main_wait" in out or "np_compare failed" in out, f"np_pair, fallback: the counter or np_compare is named\n{out}")
+    code, out, runs = np_pair(root, "nc", "--env-host", "FAKE_ONLINE_NO_CHECKSUMS=1")
+    check(code == 1 and "no 'checksums handed to GekkoNet' line" in out, f"np_pair, no checksums line: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "lc", "--env-joiner", "FAKE_ONLINE_CHECKSUMS=2")
+    check(code == 1 and "handed 2 checksums" in out and "fewer than end frame - delay - 1 = 7" in out,
+          f"np_pair, too few checksums (10 - 2 - 1 = 7): exit {code}\n{out}")
+    # the boundary: end frame - delay - 1 exactly is enough
+    code, out, runs = np_pair(root, "lb", "--env-joiner", "FAKE_ONLINE_CHECKSUMS=7")
+    check(code == 0, f"np_pair, exactly end frame - delay - 1 checksums: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "lr", "--env-host", "FAKE_ONLINE_END=lost")
+    check(code == 0, f"np_pair, control: a copy that watches its peer but nobody vanishes ends well: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "ie", "--env-host", "FAKE_ONLINE_END=internal: boom")
+    check(code == 1 and "ended 'internal: boom'" in out, f"np_pair, an internal end: exit {code}\n{out}")
+
+
+def test_pair_refusals(root):
+    for kind, extra in (("build", ()), ("files", ("--env-joiner", "DOA4_NP_TEST_FILES_SALT=data"))):
+        code, out, runs = np_pair(root, f"r_{kind}", "--expect", f"refused-{kind}", "--env-joiner", f"FAKE_ONLINE_REFUSE={kind}", *extra)
+        check(code == 0 and f"verdict refused-{kind}" in out, f"np_pair, {kind} refusal expected and seen: exit {code}\n{out}")
+        check(all(r[2] != "session" for s in ("host", "joiner") for r in pair_pids(runs, f"r_{kind}", s)),
+              f"np_pair, {kind} refusal: no session line in either pids.txt")
+    check("data" in pair_verdict(runs, "r_files"), f"np_pair, files refusal: the salted group's name is in the event\n{pair_verdict(runs, 'r_files')}")
+    # a real host-side refusal: the build id salted on the joiner only, the host decides
+    code, out, runs = np_pair(root, "r_hb", "--expect", "refused-build", "--env-joiner", "DOA4_NP_TEST_BUILD_SALT=1")
+    check(code == 0 and "different build" in out, f"np_pair, host refuses a salted build: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "r_hf", "--expect", "refused-files", "--env-joiner", "DOA4_NP_TEST_FILES_SALT=audio")
+    check(code == 0 and "audio" in out, f"np_pair, host refuses a salted file group (named): exit {code}\n{out}")
+    # busy: a third copy joins a host that has its peer
+    code, out, runs = np_pair(root, "r_busy", "--expect", "refused-busy", "--third-joiner")
+    check(code == 0 and "verdict refused-busy" in out and "busy" in out, f"np_pair, busy refusal of a third joiner: exit {code}\n{out}")
+    check(not os.path.exists(os.path.join(runs, "r_busy_host", "ctl", "session")), "np_pair, busy: the pair never started a session")
+    # the kind is judged (#0342/#0344): a files refusal where a build refusal is expected, and the reverse
+    code, out, runs = np_pair(root, "r_k1", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=files")
+    check(code == 1 and "not a build refusal" in out, f"np_pair, expect refused-build but files refused: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "r_k2", "--expect", "refused-files", "--env-joiner", "FAKE_ONLINE_REFUSE=build")
+    check(code == 1 and "not a files refusal" in out, f"np_pair, expect refused-files but build refused: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "r_k3", "--expect", "refused-busy", "--env-joiner", "FAKE_ONLINE_REFUSE=build")
+    check(code == 1 and "not a busy refusal" in out, f"np_pair, expect refused-busy but build refused: exit {code}\n{out}")
+    # a refusal that did not hold: the refused copy reports it and a session starts anyway
+    code, out, runs = np_pair(root, "r_leak", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build",
+                              "--env-joiner", "FAKE_ONLINE_LEAKY=1")
+    check(any(r[2] == "session" for r in pair_pids(runs, "r_leak", "joiner")), "np_pair, leaky refusal: the joiner's pids.txt has the session line (fixture precondition)")
+    check(code == 1 and "a session started on the joiner copy" in out, f"np_pair, refused but a session line exists: exit {code}\n{out}")
+    # the control: no refusal where one was expected
+    code, out, runs = np_pair(root, "r_none", "--expect", "refused-build")
+    check(code == 1 and "expected offline (refused)" in out, f"np_pair, a refusal expected, the pair connected: exit {code}\n{out}")
+    check(all(r[2] != "session" for s in ("host", "joiner") for r in pair_pids(runs, "r_none", s)), "np_pair, no refusal: the harness did not start the session")
+
+
+def test_pair_saves(root):
+    code, out, runs = np_pair(root, "sv", "--env-joiner", "FAKE_ONLINE_WRITE_SAVE=1")
+    check(code == 1 and "joiner copy's real save changed" in out and "save0.bin" in out, f"np_pair, a session wrote the real save: exit {code}\n{out}")
+    check("real saves unchanged" not in out, "np_pair, changed save: the unchanged line must not be printed")
+    check("host copy's real save changed" not in out, "np_pair, changed save: only the joiner's copy is named")
+    # the pristine itself is only read
+    check(open(os.path.join(root, "pair_ud", PAIR_SAVE, "save0.bin"), "rb").read() == b"first save", "np_pair: the pristine save is untouched")
+    # a pristine without save files makes the check vacuous: refused
+    empty = os.path.join(root, "empty_ud")
+    os.makedirs(os.path.join(empty, "cache"))
+    runs = os.path.join(root, "eruns")
+    p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_pair.py"), "ev", "--script", pair_script(root), "--userdata", empty,
+                        "--runs", runs, "--exe", FAKE_EXE, "--end-grace", "1", "--step-timeout", "30", "--timeout", "60"],
+                       capture_output=True, text=True, env=stand_in_env(), timeout=240)
+    check(p.returncode == 1 and "vacuous" in p.stdout, f"np_pair, no save files to hash: exit {p.returncode}\n{p.stdout}{p.stderr}")
+
+
+def test_pair_own_processes(root):
+    # the harness ends only what it started and what its pids.txt files list: another stand-in (a decoy, started here, outside
+    # the harness, whose pids.txt sits in the same runs folder) is still alive afterwards.
+    runs = os.path.join(root, "pruns")
+    decoy_ctl = os.path.join(runs, "decoy", "ctl")
+    os.makedirs(decoy_ctl)
+    decoy = subprocess.Popen([FAKE_EXE], env=stand_in_env(DOA4_NP_TEST_DIR=decoy_ctl, FAKE_ONLINE_ROLE="decoy"),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    mod = load("np_pair")
+    pids_file = os.path.join(decoy_ctl, "pids.txt")
+    end = time.time() + 30
+    while time.time() < end and not os.path.exists(pids_file):
+        time.sleep(0.1)
+    rows = [l.split() for l in open(pids_file).read().splitlines()] if os.path.exists(pids_file) else []
+    decoy_pid = int(rows[0][1]) if rows else None
+    try:
+        check(decoy_pid is not None and mod.pid_alive(decoy_pid), "np_pair own processes: the decoy stand-in runs (fixture precondition)")
+        code, out, runs = np_pair(root, "own")
+        check(code == 0, f"np_pair own processes: the pair itself ended well: exit {code}\n{out}")
+        check(decoy_pid is not None and mod.pid_alive(decoy_pid), "np_pair own processes: the decoy stand-in is still alive afterwards")
+        check(leftover_pids(runs, "own") == [], "np_pair own processes: the pair's own processes are all gone")
+    finally:
+        if decoy_pid:
+            subprocess.run(["taskkill", "/F", "/PID", str(decoy_pid)], capture_output=True)
+        decoy.kill()
+
+
+def test_pair_pid_reuse(root):
+    # a pids.txt line whose pid belongs to another process now (reused) is not ours: its creation time does not match the line
+    mod = load("np_pair")
+    other = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+    try:
+        ctl = os.path.join(root, "reuse_host", "ctl")
+        os.makedirs(ctl)
+        with open(os.path.join(ctl, "pids.txt"), "w") as f:
+            f.write(f"pid {other.pid} session {int((time.time() - 86400) * 1000)}\n")
+        pair = mod.Pair(type("A", (), {"end_grace": 0.5})())
+        pair.sides.append(mod.Side("host", os.path.join(root, "reuse_host")))
+        check(other.pid not in pair.owned_pids(), "np_pair: a pid whose creation time does not match its pids.txt line is not owned")
+        with open(os.path.join(ctl, "pids.txt"), "w") as f:
+            f.write(f"pid {other.pid} session {int(time.time() * 1000)}\n")
+        check(other.pid in pair.owned_pids(), "np_pair: the same pid with a matching line is owned (control)")
+        pair.end_all()
+        time.sleep(0.5)
+        check(other.poll() is not None, "np_pair: end_all ended the owned pid (control)")
+    finally:
+        other.kill()
+
+
+def test_pair_affinity(root):
+    # the joiner's job limit is read back from its live session process (the stand-in widens its own mask the way the runtime
+    # does; a job limit holds), and logged in command.txt
+    system = system_affinity()
+    one = system & -system
+    check(system != one, f"np_pair affinity: the test needs at least two CPUs (system {system:#x})")
+    slow = ("--env-joiner", "FAKE_ONLINE_FRAME_MS=50", "--env-host", "FAKE_ONLINE_FRAME_MS=50")
+    code, out, runs = np_pair(root, "af", "--joiner-affinity", hex(one), *slow, quit_at=30)
+    text = open(os.path.join(runs, "af_joiner", "command.txt")).read()
+    check(code == 0, f"np_pair affinity: exit {code}\n{out}")
+    check(f"affinity read back {one:#x}" in text, f"np_pair affinity: command.txt logs the read-back mask {one:#x}\n{text}")
+    check("affinity read back" not in open(os.path.join(runs, "af_host", "command.txt")).read(), "np_pair affinity: the host has no read-back line")
+    code, out, runs = np_pair(root, "af0", *slow, quit_at=30)
+    check("affinity read back" not in open(os.path.join(runs, "af0_joiner", "command.txt")).read(),
+          "np_pair affinity: without --joiner-affinity nothing is read back (control)")
+
+
+def test_pair_hidden_launch(root):
+    code, out, runs = np_pair(root, "hl", FAKE_STARTUP_NOTE="1")
+    check(code == 0, f"np_pair hidden launch: exit {code}\n{out}")
+    for side in ("host", "joiner"):
+        got = startup_note(runs, f"hl_{side}")
+        check(got is not None and got[0] == SW_SHOWMINNOACTIVE and got[1] & STARTF_USESHOWWINDOW,
+              f"np_pair starts the {side} with wShowWindow 7 and STARTF_USESHOWWINDOW: {got}")
+    code, out, runs = np_pair(root, "hl3", "--third-joiner", "--expect", "refused-busy", FAKE_STARTUP_NOTE="1")
+    got = startup_note(runs, "hl3_third")
+    check(got is not None and got[0] == SW_SHOWMINNOACTIVE and got[1] & STARTF_USESHOWWINDOW,
+          f"np_pair starts the third joiner hidden too: {got}")
+
+
+def test_pair_selftest(root):
+    code, out, runs = np_pair(root, "stn", "--env-joiner", "FAKE_NO_SELFTEST=1")
+    check(code == 1 and "joiner game.log: NO SELFTEST" in out, f"np_pair, no self-test line in the joiner's game.log: exit {code}\n{out}")
+    check("host game.log" not in out, "np_pair, no self-test line: only the joiner is named")
+    code, out, runs = np_pair(root, "sto", "--env-host", "FAKE_SELFTEST_OFF=1")
+    check(code == 1 and "host game.log: SELFTEST not on" in out, f"np_pair, self-test OFF in the host's game.log: exit {code}\n{out}")
+
+
+def test_pair_host_only(root):
+    code, out, runs = np_pair(root, "ho", "--host-only", "1", "--expect", "lobby")
+    check(code == 0 and "verdict lobby" in out and "state=hosting" in out, f"np_pair --host-only: exit {code}\n{out}")
+    check(not os.path.exists(os.path.join(runs, "ho_joiner")), "np_pair --host-only: no joiner run folder")
+    check(leftover_pids(runs, "ho", ("host",)) == [], "np_pair --host-only: the host is ended")
+
+
+def test_pair_lost(root):
+    # the survivor (host) sees its peer vanish: --kill-joiner-at-frame ends the joiner's own session pid once its np_log passed
+    # the frame; the host holds, shows the banner 1.0 s after, ends `lost` 10.0 s after (each within 50 ms)
+    slow = ("--env-host", "FAKE_ONLINE_FRAME_MS=100", "--env-joiner", "FAKE_ONLINE_FRAME_MS=100")
+    code, out, runs = np_pair(root, "lo", "--expect", "lost", "--kill-joiner-at-frame", "5", "--env-host", "FAKE_ONLINE_END=lost", *slow, quit_at=200)
+    check(code == 0 and "verdict lost" in out, f"np_pair, lost: exit {code}\n{out}")
+    events = open(os.path.join(runs, "lo_host", "ctl", "session", "events.txt")).read()
+    stamps = {m.group(2).split()[0]: int(m.group(1)) for m in re.finditer(r"^(\d+) (hold begin frame \d+|banner waiting|session ended .*)$", events, re.M)}
+    check(set(stamps) == {"hold", "banner", "session"}, f"np_pair, lost: the stand-in's events.txt has the three events: {stamps}")
+    check(len(stamps) == 3 and abs(stamps["banner"] - stamps["hold"] - 1000) <= 50 and abs(stamps["session"] - stamps["hold"] - 10000) <= 50,
+          f"np_pair, lost: the fixture itself keeps 1.0 s / 10.0 s: {stamps}")
+    joiner_frames = [l for l in open(os.path.join(runs, "lo_joiner", "ctl", "session", "np_log.txt")).read().splitlines() if l.startswith("frame ")]
+    check(0 < len(joiner_frames) < 100, f"np_pair, lost: the joiner was ended mid-session, after {len(joiner_frames)} frame lines")
+    check(leftover_pids(runs, "lo") == [], "np_pair, lost: no process of the pair is left")
+    # the survivor that does not notice: its reason is not `lost`
+    code, out, runs = np_pair(root, "ln", "--expect", "lost", "--kill-joiner-at-frame", "5", *slow, quit_at=40)
+    check(code == 1 and "expected 'lost'" in out, f"np_pair, lost expected but the host ended on its own: exit {code}\n{out}")
+    # the timing is judged: the stand-in can be told to show its banner late
+    code, out, runs = np_pair(root, "lt", "--expect", "lost", "--kill-joiner-at-frame", "5", "--env-host", "FAKE_ONLINE_END=lost",
+                              "--env-host", "FAKE_ONLINE_BANNER_S=1.5", *slow, quit_at=200)
+    check(code == 1 and "the banner came" in out, f"np_pair, lost with a late banner: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "lw", "--expect", "lost", "--env-host", "FAKE_ONLINE_END=lost", *slow)
+    check(code == 1 and "needs --kill-joiner-at-frame" in out, f"np_pair, lost without --kill-joiner-at-frame: exit {code}\n{out}")
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    only = os.environ.get("NP_TOOLS_ONLY")  # a probe's fast route: run the tests whose name contains this text (the full run is the default)
+    if only:
+        tests = [(n, f) for n, f in tests if only in n]
+        print(f"NP_TOOLS_ONLY={only}: {len(tests)} tests")
     for name, fn in tests:
         root = tempfile.mkdtemp(prefix="np_tools_")
         try:
