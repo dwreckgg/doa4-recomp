@@ -598,31 +598,44 @@ static void TestMtSeeds() {
 // np_log "determinism fixes: ..." and rec.d4r's "fixes=" line): the eleven fixes before keepalive and reader.
 static const std::string kT11Fixes = "seed,clock,sdkclock,xam,audio,movie,loader,cri,crijob,workers,notify";
 
+// Task 13: the fix set the Task 12 builds (p1t12d, netplay-p1 0e1ad01) logged and wrote into every recording's meta.
+static const std::string kT12Fixes = kT11Fixes + ",keepalive,reader";
+
 static void TestFixSets() {
-  CHECK(kFixCount == 13);
-  // The default (DOA4_NP_FIX unset, empty or "all") turns the two new fixes on, after the eleven, in fix order.
-  CHECK(FixSetText(ParseFixSet(nullptr)) == kT11Fixes + ",keepalive,reader");
-  CHECK(FixSetText(ParseFixSet("")) == kT11Fixes + ",keepalive,reader");
-  CHECK(FixSetText(ParseFixSet("all")) == kT11Fixes + ",keepalive,reader");
+  CHECK(kFixCount == 14);
+  // The default (DOA4_NP_FIX unset, empty or "all") turns every fix on, port1000 (Task 13) last, in fix order.
+  CHECK(FixSetText(ParseFixSet(nullptr)) == kT12Fixes + ",port1000");
+  CHECK(FixSetText(ParseFixSet("")) == kT12Fixes + ",port1000");
+  CHECK(FixSetText(ParseFixSet("all")) == kT12Fixes + ",port1000");
   // Each name is its own bit, in kFixNames order (np_det_internal.h Fix pins the same bits).
   CHECK(ParseFixSet("keepalive") == 1u << 11);
   CHECK(ParseFixSet("reader") == 1u << 12);
+  CHECK(ParseFixSet("port1000") == 1u << 13);
   CHECK(ParseFixSet("notify") == 1u << 10);
+  // Task 13's before-half (DOA4_NP_FIX=all-port1000) is exactly the Task 12 set: port1000 cleared, the thirteen kept.
+  CHECK((ParseFixSet("all-port1000") & (1u << 13)) == 0);
+  CHECK(FixSetText(ParseFixSet("all-port1000")) == kT12Fixes);
+  CHECK(FixSetText(ParseFixSet("reader,port1000,seed")) == "seed,reader,port1000");
+  CHECK(ParseFixSet("port") == 0);
+  CHECK(ParseFixSet("port1000x") == 0);
+  CHECK(ParseFixSet("port100") == 0);
   for (int i = 0; i < kFixCount; ++i) {
     CHECK(ParseFixSet(kFixNames[i]) == 1u << i);
     CHECK(FixSetText(ParseFixSet(kFixNames[i])) == kFixNames[i]);
   }
   // The text is in fix order, not in the order the list was written.
   CHECK(FixSetText(ParseFixSet("reader,keepalive")) == "keepalive,reader");
-  // The fixes-off before-half (DOA4_NP_FIX=all-keepalive-reader) is exactly the t11 set: both bits cleared, the
-  // eleven kept (NOT "all", which would leave the two on, and NOT "none").
+  // Task 11's fixes-off before-half (DOA4_NP_FIX=all-keepalive-reader): both bits cleared, the eleven kept (NOT
+  // "all", which would leave the two on, and NOT "none"). Since Task 13 it keeps port1000 too, so the t11 set itself
+  // is now all-keepalive-reader-port1000.
   const uint32_t off = ParseFixSet("all-keepalive-reader");
   CHECK((off & (1u << 11)) == 0);
   CHECK((off & (1u << 12)) == 0);
-  CHECK(FixSetText(off) == kT11Fixes);
+  CHECK(FixSetText(off) == kT11Fixes + ",port1000");
+  CHECK(FixSetText(ParseFixSet("all-keepalive-reader-port1000")) == kT11Fixes);
   // One fix at a time (Task 11a's keepalive-only and reader-only runs).
-  CHECK(FixSetText(ParseFixSet("all-reader")) == kT11Fixes + ",keepalive");
-  CHECK(FixSetText(ParseFixSet("all-keepalive")) == kT11Fixes + ",reader");
+  CHECK(FixSetText(ParseFixSet("all-reader")) == kT11Fixes + ",keepalive,port1000");
+  CHECK(FixSetText(ParseFixSet("all-keepalive")) == kT11Fixes + ",reader,port1000");
   // Unchanged: "none", and names that are not fixes (whole names only: no prefix match).
   CHECK(ParseFixSet("none") == 0 && FixSetText(0) == "none");
   CHECK(ParseFixSet("keep") == 0);
@@ -647,7 +660,16 @@ static void TestMetaFixSet() {
   // A t11 recording (the eleven fixes) is refused by a session with the default set (Task 11a: t11a_p8limfix2 - an
   // old record replayed with the fixes on still diverges), with the reason naming both sets.
   const std::string t11 = meta(kT11Fixes);  // np_runs/t11single_rec/out/rec.d4r's meta, byte for byte
-  CHECK(MetaMismatch(t11, cur) == "fixes " + kT11Fixes + " vs " + kT11Fixes + ",keepalive,reader");
+  CHECK(MetaMismatch(t11, cur) == "fixes " + kT11Fixes + " vs " + kT12Fixes + ",port1000");
+  // Task 13: a recording made with and without port1000 must not replay into each other. A Task 12 recording (the
+  // thirteen fixes) is refused by a default session, and a default recording by an all-port1000 session; a
+  // before-half recording (all-port1000) replays with the same setting.
+  const std::string t12 = meta(kT12Fixes);
+  CHECK(MetaMismatch(t12, cur) == "fixes " + kT12Fixes + " vs " + kT12Fixes + ",port1000");
+  const std::string no1000 = meta(FixSetText(ParseFixSet("all-port1000")));
+  CHECK(MetaMismatch(cur, no1000) == "fixes " + kT12Fixes + ",port1000 vs " + kT12Fixes);
+  CHECK(MetaMismatch(no1000, t12).empty());
+  CHECK(MetaMismatch(no1000, no1000).empty());
   // A fixes-off record (all-keepalive-reader) replays only with the same setting: refused by a default session,
   // accepted by a session with the same setting.
   const std::string off = meta(FixSetText(ParseFixSet("all-keepalive-reader")));

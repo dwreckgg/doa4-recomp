@@ -44,6 +44,7 @@
 //             the game polls the thread with a zero wait every frame, so under load the save manager went on
 //             a frame later (Task 11a: the save-slot time 0x831B99D0 and the thread's state block 0x82E476A0).
 //             A thread not found or not ended after 2 s is a fallback (fb_reader).
+//   port1000  the game's online manager does not open its own socket (VDP, port 1000): np_det_online.cpp.
 // DOA4_NP_FIX: "all" (the default), "none", a comma list, or "all-x-y" (all but
 // x and y); names and bits: np_core.h kFixNames.
 
@@ -105,7 +106,8 @@ static_assert(FixIs(kSeed, 0, "seed") && FixIs(kClock, 1, "clock") && FixIs(kSdk
                   FixIs(kXam, 3, "xam") && FixIs(kAudio, 4, "audio") && FixIs(kMovie, 5, "movie") &&
                   FixIs(kLoader, 6, "loader") && FixIs(kCri, 7, "cri") && FixIs(kCriJob, 8, "crijob") &&
                   FixIs(kWorkers, 9, "workers") && FixIs(kNotify, 10, "notify") &&
-                  FixIs(kKeepAlive, 11, "keepalive") && FixIs(kReader, 12, "reader") && kFixCount == 13,
+                  FixIs(kKeepAlive, 11, "keepalive") && FixIs(kReader, 12, "reader") &&
+                  FixIs(kPort1000, 13, "port1000") && kFixCount == 14,
               "one Fix bit per kFixNames entry, in that order");
 
 std::atomic<uint32_t> g_fixes{0};
