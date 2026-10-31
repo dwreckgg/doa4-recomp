@@ -54,8 +54,9 @@ struct Config {
   // interface as it starts, logs one line with the number set, and closes the WLAN handle as it ends (Stop), which
   // releases the mode. Off by default: the session process turns it on (Task 9/12); offline nothing calls WLAN.
   bool wifi_streaming = false;
-  // Map the port on the router (np_upnp) when hosting. Read by the lobby (np_online) only, never with loopback; the
-  // app sets it from netplay_upnp and DOA4_NP_UPNP. Off by default: host tests never call np_upnp.
+  // Map the port on the router (np_upnp) when hosting and in a session process. Read by the lobby (np_online) only; the
+  // app sets it from netplay_upnp and DOA4_NP_UPNP and leaves it off with loopback. Off by default: host tests call
+  // np_upnp only through stand-ins.
   bool upnp = false;
 };
 

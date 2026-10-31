@@ -20,12 +20,30 @@
 //     ok carrying the hand-off's token (never on the chunk acks); a refusal (its token, or 0 when the joiner could not
 //     read the hand-off) leaves it Connected with the joiner's reason; no reply within 15 s leaves it Connected with
 //     "The other player's game did not answer the session start." The joiner restarts 700 ms after its first ok
-//     (DOA2U 2230: the last acks go out first) and repeats the reply every 100 ms until then.
+//     (DOA2U 2230: the last acks go out first) and repeats the reply every 100 ms until then. A yes that arrives after
+//     the 15 s (packet token and the hand-off's token both right) still restarts the host, as long as it is Connected to
+//     the same peer and no newer StartSession was made (fix round I-1b); a yes for an older boot token is ignored. A
+//     joiner that cancels (Disconnect, Join, Host, the peer lost) before its restart fires deletes its hand-off (M-2).
+//   Hello carrying a session token (a session process) -> a lobby (any state) answers Welcome(kSession), as a stranger
+//     reply; a session process that gets Welcome(kSession) from its hand-off peer before the peer's Hello gives up at
+//     once: Offline, Status::session_refused, event "The other player's game did not start the session." (I-1a; the
+//     app polls the flag - Task 12 ends the session and restarts offline; np_live's frame-0 limit stays the backstop).
 //   Ping -> Pong (peer only). Leave / Bye: no reply (one-way, sent 3 times).
 // Authentication: Ping, Pong, Chunk, Ack, Leave, Bye and BootReply are taken only from the peer (else kSource) with
 // the peer's token (else kToken); a kGekko is the transport's to filter. Every reply to a datagram from anyone but an
 // authenticated peer (Welcome, the protocol answer) is at most one per datagram, never larger than that datagram (a
-// refusal text is shortened to fit; if even an empty one does not fit, nothing is sent), and at most 10 in any 1,000 ms.
+// refusal text is shortened to fit; if even an empty one does not fit, nothing is sent), and at most 10 in any 1,000 ms;
+// the Welcome to the joiner being accepted (or resent to the known peer) keeps the size rule but not that budget (M-4).
+// A refusal of a stranger changes the event line (and writes a log/events.txt line) at most once per refusal kind per
+// kStrangerEventMs (I-3).
+// LAN answers: a joiner also takes the Welcome from a private address on a 7200-7215 port (the answer to its LAN
+// broadcast Hello) - DOA2U's behaviour; the lobby token travels in clear, so it authenticates the path, not the person.
+// Input delay: the host decides it (auto from its ping, or its manual value) and carries it in the hand-off; the
+// joiner's Hello preference is only logged/displayed.
+// Effects: log lines, file writes (events.txt, status.txt, the hand-off) and the callbacks run on the I/O thread with
+// the mutex released, in the order they were decided (M-1).
+// UPnP: with net::Config::upnp, Host maps the port and so does StartInSession (the session process maps it again);
+// Stop unmaps. The app leaves upnp off with loopback.
 #pragma once
 #include <array>
 #include <cstdint>
@@ -65,6 +83,12 @@ struct Status {
   std::array<uint32_t, size_t(wire::Drop::kCount)> drops{};
   uint32_t gekko_early = 0;
   uint16_t peer_port = 0;           // the peer's port as the socket saw it (status.txt; 0 without a peer)
+  bool session_refused = false;     // session process: the hand-off's peer answered as a lobby (I-1a); end the session
+  // The kind of the latest refusal this side received (joiner, session process) or issued (host), for the harness:
+  // "none" | "build" | "files" | "busy" | "proto" | "session" | "other". Set with the refusal; "none" again with the
+  // next event that is not a refusal (and so with a new Host or Join). A host's busy and kSession refusals set it
+  // without changing the event line (the pair's own event stays). status.txt carries it as its last line, refusal=<kind>.
+  std::string refusal = "none";
 };
 
 struct Providers {
@@ -91,6 +115,7 @@ inline constexpr uint32_t kRetxMs = 150, kBootAnswerMs = 15000, kJoinerRestartMs
 inline constexpr uint32_t kRxIdleResetMs = 5000;       // carry 2a: a partial transfer with no chunk for 5 s is Reset
 inline constexpr uint32_t kCtlPollMs = 250, kStatusEveryMs = 1000;
 inline constexpr int kUnauthRepliesPerSecond = 10;     // carry 2d
+inline constexpr uint32_t kStrangerEventMs = 10000;    // fix round I-3: one stranger-refusal event per kind per 10 s
 
 class Lobby {
  public:

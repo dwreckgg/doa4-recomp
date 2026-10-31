@@ -25,6 +25,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -97,17 +98,23 @@ static rules::Endpoint Loop(uint16_t port) {
 }
 static std::string Addr(uint16_t port) { return "127.0.0.1:" + std::to_string(port); }
 
-// ---- np_upnp is not linked: these stand-ins count calls, and the run asserts there were none (the router is the
-// user's; net::Config::upnp is off in every group, so the lobby must never reach np_upnp) ----
-static std::atomic<int> g_upnp_calls{0};
+// ---- np_upnp is not linked: these stand-ins count calls per function. Only the UPnP group (net::Config::upnp on)
+// may reach them; the run asserts every call was made there (the router is the user's) ----
+static std::atomic<int> g_upnp_map{0}, g_upnp_get{0}, g_upnp_unmap{0}, g_upnp_shutdown{0};
+static std::atomic<uint16_t> g_upnp_port{0};
+static int UpnpCalls() { return g_upnp_map + g_upnp_get + g_upnp_unmap + g_upnp_shutdown; }
+static int g_upnp_expected = 0;  // the calls the UPnP group made
 namespace doa4::np::upnp {
-void MapAsync(uint16_t) { ++g_upnp_calls; }
+void MapAsync(uint16_t port) {
+  g_upnp_port = port;
+  ++g_upnp_map;
+}
 Result Get() {
-  ++g_upnp_calls;
+  ++g_upnp_get;
   return {};
 }
-void Unmap() { ++g_upnp_calls; }
-void Shutdown(uint32_t) { ++g_upnp_calls; }
+void Unmap() { ++g_upnp_unmap; }
+void Shutdown(uint32_t) { ++g_upnp_shutdown; }
 }  // namespace doa4::np::upnp
 
 // ---- per-run folder ----
@@ -537,6 +544,7 @@ static void TestConnect() {
   CHECKF(!j.hint.empty() && !h.hint.empty(), "hints '%s' / '%s'", h.hint.c_str(), j.hint.c_str());
   CHECKF(Contains(h.event, "Connected") && Contains(j.event, "Connected"), "events '%s' / '%s'", h.event.c_str(), j.event.c_str());
   CHECKF(h.dropped == 0 && j.dropped == 0 && h.gekko_early == 0, "dropped %u / %u", h.dropped, j.dropped);
+  CHECKF(h.refusal == "none" && j.refusal == "none", "refusal %s / %s", h.refusal.c_str(), j.refusal.c_str());
   // carry 2g: Providers::files ran once, on neither the thread that called Start nor the I/O thread (whose lines the
   // "event: Connected" log line shows)
   const DWORD io = js.log.TidOf("event: Connected");
@@ -588,6 +596,7 @@ static void TestBuildDiffers() {
     CHECKF(!Contains(j.event, rules::MismatchAdvice("netplay-v1.0.5", "dev")), "joiner shows the host-seat text: '%s'", j.event.c_str());
     CHECK(rules::MismatchAdvice("dev", "netplay-v1.0.5") != rules::MismatchAdvice("netplay-v1.0.5", "dev"));  // the fixture tells them apart
     CHECKF(Contains(host.status().event, "Refused a player with a different build"), "host event '%s'", host.status().event.c_str());
+    CHECKF(j.refusal == "build" && host.status().refusal == "build", "refusal %s / %s", j.refusal.c_str(), host.status().refusal.c_str());
     CHECK(host.status().state == State::kHosting);
   }
   {  // build 0 (unreadable) on both sides: refused kBuild all the same
@@ -602,6 +611,7 @@ static void TestBuildDiffers() {
     CHECKF(WaitFor([&] { return joiner.status().state == State::kOffline && !joiner.status().event.empty(); }, 2000), "joiner %s '%s'",
            online::StateName(joiner.status().state), joiner.status().event.c_str());
     CHECKF(Contains(joiner.status().event, "could not read its own build"), "joiner event '%s'", joiner.status().event.c_str());
+    CHECK(joiner.status().refusal == "build");
     CHECK(host.status().state == State::kHosting);
   }
   {  // DOA4_NP_TEST_BUILD_SALT=1 on the joiner (with a test dir): refused; the same map without a test dir: ignored
@@ -618,6 +628,7 @@ static void TestBuildDiffers() {
     CHECK(WaitFor([&] { return joiner.status().state == State::kOffline && !joiner.status().event.empty(); }, 2000));
     CHECKF(Contains(host.status().event, "different build"), "host event '%s'", host.status().event.c_str());
     nodir.Join(Addr(host.status().port));
+    CHECK(host.status().refusal == "build");
     CHECKF(WaitState(nodir, State::kConnected, 2000), "the salt without a test dir was not ignored: %s '%s'",
            online::StateName(nodir.status().state), nodir.status().event.c_str());
   }
@@ -638,6 +649,7 @@ static void TestFilesDiffer() {
     CHECK(WaitFor([&] { return joiner.status().state == State::kOffline && !joiner.status().event.empty(); }, 2000));
     CHECKF(Contains(joiner.status().event, "chrone.afs") && !Contains(joiner.status().event, "anm.afs"), "joiner event '%s'",
            joiner.status().event.c_str());
+    CHECK(joiner.status().refusal == "files" && host.status().refusal == "files");
     CHECKF(Contains(host.status().event, "chrone.afs") && !Contains(host.status().event, "anm.afs"), "host event '%s'",
            host.status().event.c_str());
   }
@@ -652,6 +664,7 @@ static void TestFilesDiffer() {
     CHECK(WaitFor([&] { return joiner.status().state == State::kOffline && !joiner.status().event.empty(); }, 2000));
     const std::string want = std::string("your game files: chrone.afs ") + (value[0] == 'u' ? "cannot be read" : "is missing");
     CHECKF(Contains(joiner.status().event, want), "joiner event '%s' (want '%s')", joiner.status().event.c_str(), want.c_str());
+    CHECK(joiner.status().refusal == "files");
     CHECKF(!Contains(joiner.status().event, "both players need the same game files"), "joiner event blames the other side: '%s'",
            joiner.status().event.c_str());
   }
@@ -668,6 +681,7 @@ static void TestFilesDiffer() {
     CHECKF(Contains(host.status().event, "your game files: chrone.afs cannot be read"), "host event '%s'", host.status().event.c_str());
     CHECK(WaitFor([&] { return joiner.status().state == State::kOffline && !joiner.status().event.empty(); }, 1000));
     CHECKF(!Contains(joiner.status().event, "your game files"), "the joiner blames its own files: '%s'", joiner.status().event.c_str());
+    CHECK(joiner.status().refusal == "files" && host.status().refusal == "files");
   }
 }
 
@@ -681,6 +695,8 @@ static void TestBusy() {
   third.Join(Addr(host.status().port));
   CHECK(WaitFor([&] { return third.status().state == State::kOffline && !third.status().event.empty(); }, 2000));
   CHECKF(Contains(third.status().event, "already in an online session"), "third's event '%s'", third.status().event.c_str());
+  CHECKF(third.status().refusal == "busy" && host.status().refusal == "busy" && joiner.status().refusal == "none", "refusal %s / %s / %s",
+         third.status().refusal.c_str(), host.status().refusal.c_str(), joiner.status().refusal.c_str());
   CHECK(host.status().state == State::kConnected && joiner.status().state == State::kConnected);
   CHECK(host.status().peer_port == joiner.status().port);
   CHECK(WaitFor([&] { return host.status().ping_samples >= samples + 2; }, 1500));  // the pair still talks
@@ -814,6 +830,12 @@ static void TestSpoofHost() {
          "kToken %u -> %u, kSource %u -> %u", Drops(s0, wire::Drop::kToken), Drops(s1, wire::Drop::kToken), Drops(s0, wire::Drop::kSource),
          Drops(s1, wire::Drop::kSource));
   CHECK(s1.dropped == s0.dropped + 10);
+  // fix round I-2: the right packet token but another body token (the hand-off's ^ 1): not this boot's yes
+  fake.Send(hp, wire::Type::kBootReply, T, BootReplyBody(h.session_token ^ 1, 1, ""));
+  SleepMs(300);
+  CHECKF(host.status().state == State::kStarting, "state %s after a yes with the wrong hand-off token",
+         online::StateName(host.status().state));
+  CHECK(hs.restarts == 0 && !fs::exists(hs.HandoffPath()));
   // the real reply: the restart, once; the restart callback tries Stop on the I/O thread, which refuses (carry 2d)
   hs.on_restart = [&] { host.Stop(); };
   fake.Send(hp, wire::Type::kBootReply, T, BootReplyBody(h.session_token, 1, ""));
@@ -1204,7 +1226,7 @@ static void TestSessionSpoof() {
 // =====================================================================================================
 
 static std::map<std::string, std::string> ParseStatus(const std::string& text, bool* ok) {
-  static const char* const kKeys[] = {"state", "port", "peer_port", "ping", "delay", "can_start", "event"};
+  static const char* const kKeys[] = {"state", "port", "peer_port", "ping", "delay", "can_start", "event", "refusal"};
   std::map<std::string, std::string> m;
   *ok = !text.empty() && text.back() == '\n';
   std::istringstream in(text);
@@ -1212,14 +1234,14 @@ static std::map<std::string, std::string> ParseStatus(const std::string& text, b
   size_t i = 0;
   while (std::getline(in, line)) {
     const size_t eq = line.find('=');
-    if (i >= 7 || eq == std::string::npos || line.substr(0, eq) != kKeys[i]) {
+    if (i >= 8 || eq == std::string::npos || line.substr(0, eq) != kKeys[i]) {
       *ok = false;
       break;
     }
     m[line.substr(0, eq)] = line.substr(eq + 1);
     ++i;
   }
-  *ok = *ok && i == 7;
+  *ok = *ok && i == 8;
   return m;
 }
 static void WriteCtl(const fs::path& dir, const std::string& text) {
@@ -1257,6 +1279,33 @@ static void TestRequestFiles() {
     bool p = false;
     const auto m = ParseStatus(ReadText(st), &p);
     CHECK(p && m.at("port") == std::to_string(lobby.status().port) && m.at("can_start") == "0" && m.at("peer_port") == "0");
+  }
+  // the refusal key (Task 10's harness reads it): none, then build after a refused Hello, none again after a new host
+  CHECK(WaitFor([&] { bool p = false; const auto m = ParseStatus(ReadText(st), &p); return p && m.at("refusal") == "none"; }, 1000));
+  {
+    Udp u;
+    u.SendTo(lobby.status().port, wire::Encode(wire::Type::kHello, 0, HelloBody(s.build + 1, "dev", kFilesText)));
+  }
+  CHECKF(WaitFor([&] { bool p = false; const auto m = ParseStatus(ReadText(st), &p); return p && m.at("refusal") == "build"; }, 1500),
+         "status.txt after a refused Hello: '%s'", ReadText(st).c_str());
+  WriteCtl(s.test_dir, "host 0\n");
+  CHECK(WaitFor([&] { bool p = false; const auto m = ParseStatus(ReadText(st), &p); return p && m.at("refusal") == "none"; }, 1500));
+  // joiner side: a lobby with its own test dir joins a fake host that answers kBusy -> refusal=busy
+  {
+    Side js("ctl_join");
+    js.test_dir = js.dir / "ctl";
+    fs::create_directories(js.test_dir);
+    online::Lobby joiner;
+    if (StartLobby(joiner, js)) {
+      FakePeer fake;
+      joiner.Join(Addr(fake.sock.port));
+      Rx hello;
+      CHECK(fake.Wait(wire::Type::kHello, 1000, &hello));
+      fake.Send(hello.from, wire::Type::kWelcome, 0, WelcomeBody(wire::Refusal::kBusy, js.build, "dev", "busy", 0));
+      const fs::path jst = js.test_dir / "status.txt";
+      CHECKF(WaitFor([&] { bool p = false; const auto m = ParseStatus(ReadText(jst), &p); return p && m.at("refusal") == "busy"; }, 1500),
+             "joiner status.txt: '%s'", ReadText(jst).c_str());
+    }
   }
   WriteCtl(s.test_dir, "delay 5\n");
   CHECK(WaitFor([&] { bool p = false; const auto m = ParseStatus(ReadText(st), &p); return p && m.at("delay") == "5"; }, 1000));
@@ -1439,6 +1488,7 @@ static void TestProto() {
   CHECK(wire::Decode(d, &pk) == wire::Drop::kNone && pk.type == wire::Type::kWelcome && wire::DecodeWelcome(pk.body, &w) &&
         w.refusal == wire::Refusal::kProto);
   CHECKF(Contains(host.status().event, "network protocol"), "host event '%s'", host.status().event.c_str());
+  CHECK(host.status().refusal == "proto");
   Bytes bare = wire::Encode(wire::Type::kHello, 0, Bytes{});  // 12 bytes: no answer fits
   bare[4] = uint8_t(wire::kProto + 1);
   a.SendTo(hp, bare);
@@ -1461,11 +1511,355 @@ static void TestProto() {
   CHECK(WaitState(joiner, State::kOffline, 1000));
   const std::string ev = joiner.status().event;
   CHECKF(Contains(ev, "network protocol " + std::to_string(wire::kProto + 1)) && Contains(ev, "yours " + std::to_string(wire::kProto)) &&
-             Contains(ev, "Check for Updates"),
+             Contains(ev, "Check for Updates") && joiner.status().refusal == "proto",
          "joiner event '%s'", ev.c_str());
 }
 
 // =====================================================================================================
+
+// =====================================================================================================
+// Fix round 1
+// =====================================================================================================
+
+// The hand-off a fake joiner received over the chunks carrying token T (all the chunks it has seen; Clear it before
+// a second start). False when no complete boot message arrived within ms.
+// With ack_to, the fake also acknowledges the whole message to that port (as a joiner that received it), so the
+// host's transfer is complete: only a BootReply may then restart it.
+static bool BootFrom(FakePeer& f, uint32_t T, handoff::Handoff* h, int ms = 1000, uint16_t ack_to = 0) {
+  std::vector<uint8_t> msg;
+  wire::Ack done;
+  WaitFor([&] {
+    wire::ReliableReceiver rr;
+    for (const Rx& r : f.Of(wire::Type::kChunk)) {
+      wire::Chunk c;
+      wire::Ack a;
+      if (r.token == T && wire::DecodeChunk(r.body, &c) && rr.OnChunk(c, &a) == wire::ReliableReceiver::Result::kComplete) {
+        uint8_t type = 0;
+        msg = rr.Take(&type);
+        done = a;
+        return true;
+      }
+    }
+    return false;
+  }, ms);
+  if (!msg.empty() && ack_to) f.Send(ack_to, wire::Type::kAck, T, wire::EncodeAck(done));
+  return !msg.empty() && handoff::Unpack(msg, h).empty();
+}
+
+// I-1b: every yes is lost, the host gives up at 15 s ('did not answer'); a late yes for that boot still restarts it
+// with the same hand-off. A second StartSession ends that window: a yes for the OLD token is then ignored. Two pairs
+// run at once, so the 15 s are waited once.
+static void TestLateBootReply() {
+  if (!Group("fix I-1b: a late yes restarts the host with the same hand-off; a yes for an older boot does not")) return;
+  Side as("late_a"), bs("late_b");
+  online::Lobby a, b;
+  if (!StartLobby(a, as) || !StartLobby(b, bs)) return;
+  a.Host(0);
+  b.Host(0);
+  CHECK(WaitState(a, State::kHosting, 1000) && WaitState(b, State::kHosting, 1000));
+  FakePeer fa, fb;
+  const uint32_t Ta = FakeJoin(fa, a, as.build), Tb = FakeJoin(fb, b, bs.build);
+  CHECK(Ta != 0 && Tb != 0 && WaitCanStart(a) && WaitCanStart(b));
+  const uint16_t ap = a.status().port, bp = b.status().port;
+  a.StartSession();
+  b.StartSession();
+  handoff::Handoff ha, hb1;
+  // the fakes acknowledge every chunk (the transfers complete) and never answer (every yes lost): neither host may
+  // restart on the acks (plan mutant (a), now deterministic)
+  CHECK(BootFrom(fa, Ta, &ha, 1000, ap) && BootFrom(fb, Tb, &hb1, 1000, bp));
+  SleepMs(500);
+  CHECKF(a.status().state == State::kStarting && b.status().state == State::kStarting && as.restarts == 0 && bs.restarts == 0,
+         "after the acks: A %s B %s, restarts %d/%d", online::StateName(a.status().state), online::StateName(b.status().state),
+         as.restarts.load(), bs.restarts.load());
+  CHECK(WaitFor([&] { return a.status().state == State::kConnected && b.status().state == State::kConnected; }, 16500));
+  CHECKF(Contains(a.status().event, "did not answer") && Contains(b.status().event, "did not answer"), "events '%s' / '%s'",
+         a.status().event.c_str(), b.status().event.c_str());
+  // B: a newer start, then a yes for the OLD token
+  fb.Clear();
+  b.StartSession();
+  CHECK(WaitState(b, State::kStarting, 500));
+  handoff::Handoff hb2;
+  CHECK(BootFrom(fb, Tb, &hb2) && hb2.session_token != hb1.session_token);
+  fb.Send(bp, wire::Type::kBootReply, Tb, BootReplyBody(hb1.session_token, 1, ""));
+  // A: the late yes for its (only) boot
+  fa.Send(ap, wire::Type::kBootReply, Ta, BootReplyBody(ha.session_token, 1, ""));
+  CHECKF(WaitFor([&] { return as.restarts.load() == 1; }, 1000), "the late yes did not restart the host (state %s)",
+         online::StateName(a.status().state));
+  Bytes written;
+  handoff::Handoff hw;
+  CHECK(ReadFile(as.HandoffPath(), &written) && handoff::Unpack(written, &hw).empty());
+  CHECK(hw.session_token == ha.session_token && hw.seed == ha.seed && hw.role == handoff::Role::kHost);
+  SleepMs(300);
+  CHECKF(b.status().state == State::kStarting && bs.restarts == 0 && !fs::exists(bs.HandoffPath()),
+         "a yes for the old boot moved B: %s, restarts %d", online::StateName(b.status().state), bs.restarts.load());
+  // positive control: the yes for B's current boot restarts it
+  fb.Send(bp, wire::Type::kBootReply, Tb, BootReplyBody(hb2.session_token, 1, ""));
+  CHECK(WaitFor([&] { return bs.restarts.load() == 1; }, 1000));
+}
+
+static handoff::Handoff SessionHandoff(uint16_t peer_port, uint32_t token) {
+  handoff::Handoff h;
+  h.build = 0x0DA4000000000001ull;
+  h.release = "dev";
+  h.role = handoff::Role::kJoiner;
+  h.delay = 2;
+  h.local_port = DeadPort();
+  h.peer = Loop(peer_port);
+  h.session_token = token;
+  h.seed = 1;
+  h.guest_settings = GuestText();
+  return h;
+}
+
+// I-1a: the restarted side's session Hello reaches a game that did NOT restart (a lobby): the lobby answers kSession and
+// the session process gives up at once (Status::session_refused), well before np_live's frame-0 limit.
+static void TestSessionRefused() {
+  if (!Group("fix I-1a: a lobby answers a session Hello with kSession; the session process gives up within 1 s")) return;
+  Side hs("sref_host"), ss("sref_sess");
+  online::Lobby host;
+  if (!StartLobby(host, hs)) return;
+  host.Host(0);
+  CHECK(WaitState(host, State::kHosting, 1000));
+  std::atomic<int> left{0};
+  online::Lobby sess;
+  std::string e;
+  const int64_t t0 = NowUs();
+  CHECKF(sess.StartInSession(ss.P(), LoopCfg(), SessionHandoff(host.status().port, 0x5E55BEEFu),
+                             [&](int32_t, wire::LeaveReason) { ++left; }, &e),
+         "StartInSession: %s", e.c_str());
+  CHECKF(WaitFor([&] { return sess.status().session_refused; }, 1000), "the session process did not give up within 1 s (state %s)",
+         online::StateName(sess.status().state));
+  std::printf("info: session refused %lld ms after StartInSession\n", (long long)((NowUs() - t0) / 1000));
+  const online::Status s = sess.status();
+  CHECK(s.state == State::kOffline);
+  CHECKF(Contains(s.event, "did not start the session"), "event '%s'", s.event.c_str());
+  CHECKF(s.refusal == "session" && host.status().refusal == "session", "refusal %s / %s", s.refusal.c_str(), host.status().refusal.c_str());
+  CHECK(host.status().state == State::kHosting && Drops(host.status(), wire::Drop::kToken) >= 1);
+  // the source rule: a Welcome kSession from anyone but the hand-off's peer changes nothing
+  FakePeer quiet;
+  Side qs("sref_quiet");
+  online::Lobby q;
+  CHECK(q.StartInSession(qs.P(), LoopCfg(), SessionHandoff(quiet.sock.port, 0x5E55BEEFu), nullptr, &e));
+  CHECK(quiet.Wait(wire::Type::kHello, 1000));
+  Udp third;
+  const Bytes ks = WelcomeBody(wire::Refusal::kSession, 1, "", "no", 0);
+  third.SendTo(q.status().port, wire::Encode(wire::Type::kWelcome, 0, ks));
+  SleepMs(300);
+  CHECK(!q.status().session_refused && q.status().state == State::kConnecting);
+  CHECK(Drops(q.status(), wire::Drop::kSource) >= 1);
+  quiet.sock.SendTo(q.status().port, wire::Encode(wire::Type::kWelcome, 0, ks));  // from the peer: taken
+  CHECK(WaitFor([&] { return q.status().session_refused; }, 1000));
+}
+
+// I-3: refusals of strangers cannot flood the event line, game.log or events.txt: one per refusal kind per 10 s.
+static void TestStrangerEvents() {
+  if (!Group("fix I-3: a flood of refused Hellos and foreign datagrams gives at most one event per kind")) return;
+  Side hs("flood_host");
+  online::Lobby host;
+  if (!StartLobby(host, hs)) return;
+  host.Host(0);
+  CHECK(WaitState(host, State::kHosting, 1000));
+  const uint16_t hp = host.status().port;
+  Udp a;
+  for (int i = 0; i < 200; ++i) {
+    a.SendTo(hp, wire::Encode(wire::Type::kHello, 0, HelloBody(hs.build + 1, "netplay-v1.0." + std::to_string(i), kFilesText)));
+    char f[64];
+    std::snprintf(f, sizeof f, "anm.afs=%016x\n", i);
+    a.SendTo(hp, wire::Encode(wire::Type::kHello, 0, HelloBody(hs.build, "", f)));
+    Bytes d = wire::Encode(wire::Type::kHello, 0, Bytes(40, 1));
+    d[4] = uint8_t(wire::kProto + 1 + i % 50);
+    a.SendTo(hp, d);
+    if (i % 20 == 19) SleepMs(2);
+  }
+  SleepMs(500);
+  const int build_lines = hs.log.Count("event: Refused a player with a different build");
+  const int files_lines = hs.log.Count("event: Refused a player: ");
+  const int proto_lines = hs.log.Count("event: Refused a player whose game speaks network protocol");
+  std::printf("info: flood of 600: event lines build %d, files %d, protocol %d\n", build_lines, files_lines, proto_lines);
+  CHECKF(build_lines == 1 && files_lines == 1 && proto_lines == 1, "event lines build %d files %d proto %d (want 1 each)", build_lines,
+         files_lines, proto_lines);
+  const std::string ev = hs.Events();
+  const int ev_lines = int(std::count(ev.begin(), ev.end(), '\n'));
+  CHECKF(ev_lines <= 4, "events.txt has %d lines after the flood", ev_lines);  // Hosting + one per kind
+  CHECK(host.status().state == State::kHosting);
+}
+
+// M-2: a joiner that cancels inside the 700 ms before its restart deletes the hand-off it wrote, and does not restart.
+static void TestJoinerCancel() {
+  if (!Group("fix M-2: the joiner withdraws its hand-off when it cancels before the restart")) return;
+  Side js("cancel_join");
+  online::Lobby joiner;
+  if (!StartLobby(joiner, js)) return;
+  FakePeer fake;
+  joiner.Join(Addr(fake.sock.port));
+  Rx hello;
+  CHECK(fake.Wait(wire::Type::kHello, 1000, &hello));
+  const uint32_t T = 0x51DE0002u;
+  fake.pong_token = T;
+  fake.Send(hello.from, wire::Type::kWelcome, 0, WelcomeBody(wire::Refusal::kNone, js.build, "dev", "", T));
+  CHECK(WaitState(joiner, State::kConnected, 1000));
+  const uint16_t jp = joiner.status().port;
+  for (const Bytes& b : Chunks(PackedHandoff(fake.sock.port, jp, 0xB007B008u), 2000)) fake.Send(jp, wire::Type::kChunk, T, b);
+  CHECK(fake.Wait(wire::Type::kBootReply, 1000));
+  CHECK(fs::exists(js.HandoffPath()));  // precondition: written before the yes went out
+  joiner.Disconnect();
+  CHECK(WaitState(joiner, State::kOffline, 300));
+  SleepMs(1000);
+  CHECKF(js.restarts == 0 && !fs::exists(js.HandoffPath()), "restarts %d, hand-off still there: %d", js.restarts.load(),
+         int(fs::exists(js.HandoffPath())));
+}
+
+// M-3: with Config::upnp the lobby maps its port when hosting, and a session process maps its port again; Stop unmaps.
+static void TestUpnpCalls() {
+  if (!Group("fix M-3: UPnP mapped by Host and by StartInSession, unmapped by Stop (stand-ins)")) return;
+  const int before = UpnpCalls();
+  net::Config c = LoopCfg();
+  c.upnp = true;
+  {
+    Side s("upnp_lobby");
+    online::Lobby l;
+    const int m0 = g_upnp_map, u0 = g_upnp_unmap;
+    if (!StartLobby(l, s, c)) return;
+    l.Host(0);
+    CHECK(WaitFor([&] { return g_upnp_map.load() == m0 + 1; }, 1000));
+    CHECK(g_upnp_port.load() == l.status().port);
+    l.Stop();
+    CHECK(g_upnp_unmap.load() == u0 + 1);
+  }
+  {
+    Side s("upnp_sess");
+    online::Lobby l;
+    const int m0 = g_upnp_map, u0 = g_upnp_unmap;
+    const handoff::Handoff h = SessionHandoff(DeadPort(), 0x77u);
+    std::string e;
+    CHECKF(l.StartInSession(s.P(), c, h, nullptr, &e), "StartInSession: %s", e.c_str());
+    CHECKF(g_upnp_map.load() == m0 + 1 && g_upnp_port.load() == h.local_port, "session map calls %d, port %u (want %u)",
+           g_upnp_map.load() - m0, g_upnp_port.load(), h.local_port);
+    l.Stop();
+    CHECK(g_upnp_unmap.load() == u0 + 1);
+  }
+  g_upnp_expected += UpnpCalls() - before;
+}
+
+// M-4: a junk flood of >= 10 Hellos/s fills the stranger budget; the real joiner still connects (its Welcome is not a
+// stranger reply).
+static void TestJunkFloodJoin() {
+  if (!Group("fix M-4: a junk-Hello flood does not keep the real joiner out")) return;
+  Side hs("junk_host"), js("junk_join");
+  online::Lobby host, joiner;
+  if (!StartLobby(host, hs) || !StartLobby(joiner, js)) return;
+  host.Host(0);
+  CHECK(WaitState(host, State::kHosting, 1000));
+  const uint16_t hp = host.status().port;
+  std::atomic<bool> stop{false};
+  std::atomic<int> sent{0};
+  std::thread junk([&] {
+    Udp u;
+    const Bytes d = wire::Encode(wire::Type::kHello, 0, HelloBody(hs.build + 1, "", kFilesText));
+    // about 5,000 a second, paced by a 1 ms spin (Sleep(1) rounds up to the 15.6 ms timer tick here, and the budget
+    // refills all 10 slots at once every second: with a 15 ms gap the joiner's Hello slipped into the refill gap)
+    while (!stop.load()) {
+      for (int i = 0; i < 5; ++i) u.SendTo(hp, d);
+      sent += 5;
+      const int64_t until = NowUs() + 1000;
+      while (NowUs() < until) std::this_thread::yield();
+    }
+  });
+  SleepMs(1200);  // the stranger budget is full from here on
+  joiner.Join(Addr(hp));
+  const bool ok = WaitState(joiner, State::kConnected, 3000);
+  stop = true;
+  junk.join();
+  std::printf("info: junk flood: %d junk Hellos sent\n", sent.load());
+  CHECKF(sent.load() >= 1000, "the flood sent only %d", sent.load());
+  CHECKF(ok, "the joiner did not connect under the flood (state %s, '%s')", online::StateName(joiner.status().state),
+         joiner.status().event.c_str());
+}
+
+// M-6: concurrent Stop calls are safe (a GUARD: the race window is a few instructions; see the report's probe row).
+static void TestConcurrentStop() {
+  if (!Group("fix M-6: eight threads calling Stop at once")) return;
+  for (int round = 0; round < 5; ++round) {
+    Side s("stop");
+    online::Lobby l;
+    if (!StartLobby(l, s)) return;
+    l.Host(0);
+    WaitState(l, State::kHosting, 500);
+    std::vector<std::thread> ts;
+    std::atomic<bool> go{false};
+    for (int i = 0; i < 8; ++i)
+      ts.emplace_back([&] {
+        while (!go.load()) std::this_thread::yield();
+        l.Stop();
+      });
+    go = true;
+    for (auto& t : ts) t.join();
+    l.Stop();
+  }
+  CHECK(true);  // reaching here is the check (a double join ends the process)
+}
+
+// M-1: no log line is written while the lobby's mutex is held. The log sink asks status() on another thread and waits
+// up to 500 ms: a sink called with the mutex held makes that call wait for it.
+struct ProbeSink {
+  std::atomic<online::Lobby*> lobby{nullptr};
+  std::atomic<int> lines{0}, blocked{0};
+  std::mutex mu;
+  std::vector<std::string> blocked_lines;
+  std::function<void(const std::string&)> Fn() {
+    return [this](const std::string& line) {
+      ++lines;
+      online::Lobby* l = lobby;
+      if (!l) return;
+      auto done = std::make_shared<std::atomic<bool>>(false);
+      std::thread([l, done] {
+        (void)l->status();
+        *done = true;
+      }).detach();
+      if (!WaitFor([&] { return done->load(); }, 500)) {
+        ++blocked;
+        std::lock_guard<std::mutex> lock(mu);
+        blocked_lines.push_back(line);
+      }
+    };
+  }
+};
+static void TestNoLogUnderLock() {
+  if (!Group("fix M-1: no log line while the lobby mutex is held (connect, start, restart on both sides)")) return;
+  Side hs("nolock_host"), js("nolock_join");
+  ProbeSink ph, pj;
+  online::Lobby host, joiner;
+  ph.lobby = &host;
+  pj.lobby = &joiner;
+  online::Providers p1 = hs.P(), p2 = js.P();
+  p1.log = ph.Fn();
+  p2.log = pj.Fn();
+  std::string e;
+  CHECK(host.Start(p1, LoopCfg(), &e) && joiner.Start(p2, LoopCfg(), &e));
+  CHECK(ConnectPair(host, joiner));
+  CHECK(WaitCanStart(host));
+  host.StartSession();
+  CHECK(WaitFor([&] { return hs.restarts.load() == 1 && js.restarts.load() == 1; }, 8000));
+  SleepMs(600);
+  std::printf("info: no-lock probe: host %d lines (%d blocked), joiner %d lines (%d blocked)\n", ph.lines.load(), ph.blocked.load(),
+              pj.lines.load(), pj.blocked.load());
+  CHECK(ph.lines >= 5 && pj.lines >= 5);  // the probe saw the session start's lines
+  {
+    std::lock_guard<std::mutex> lock(ph.mu);
+    CHECKF(ph.blocked == 0, "host: %d lines logged under the mutex, first '%s'", ph.blocked.load(),
+           ph.blocked_lines.empty() ? "" : ph.blocked_lines[0].c_str());
+  }
+  {
+    std::lock_guard<std::mutex> lock(pj.mu);
+    CHECKF(pj.blocked == 0, "joiner: %d lines logged under the mutex, first '%s'", pj.blocked.load(),
+           pj.blocked_lines.empty() ? "" : pj.blocked_lines[0].c_str());
+  }
+  host.Stop();
+  joiner.Stop();
+  ph.lobby = nullptr;
+  pj.lobby = nullptr;
+  SleepMs(100);  // detached status() calls end
+}
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1513,7 +1907,15 @@ int main(int argc, char** argv) {
   TestConnectTimeout();
   TestReplyBounds();
   TestProto();
-  CHECKF(g_upnp_calls.load() == 0, "np_upnp was called %d times", g_upnp_calls.load());
+  TestLateBootReply();
+  TestSessionRefused();
+  TestStrangerEvents();
+  TestJoinerCancel();
+  TestUpnpCalls();
+  TestJunkFloodJoin();
+  TestConcurrentStop();
+  TestNoLogUnderLock();
+  CHECKF(UpnpCalls() == g_upnp_expected, "np_upnp was called %d times, %d of them by the UPnP group", UpnpCalls(), g_upnp_expected);
   std::error_code ec;
   fs::remove_all(g_root, ec);
   std::printf("info: run time %lld ms\n", (long long)((NowUs() - t0) / 1000));

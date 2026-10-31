@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -214,6 +215,19 @@ std::string LocalFilesProblem(const std::string& files) {
   return out;
 }
 
+// Status::refusal / status.txt refusal= (Task 10's harness judges refusal kinds by it, never by the prose).
+const char* KindName(wire::Refusal r) {
+  switch (r) {
+    case wire::Refusal::kNone: return "none";
+    case wire::Refusal::kBuild: return "build";
+    case wire::Refusal::kFiles: return "files";
+    case wire::Refusal::kBusy: return "busy";
+    case wire::Refusal::kProto: return "proto";
+    case wire::Refusal::kSession: return "session";
+  }
+  return "other";
+}
+
 std::string ProtoAdvice(uint8_t theirs) {
   return "The other player's game speaks network protocol " + std::to_string(theirs) + ", yours " + std::to_string(wire::kProto) + ": " +
          (theirs > wire::kProto ? "you have the older game - press Check for Updates, then restart the game."
@@ -298,7 +312,12 @@ struct Lobby::Impl {
   wire::BootReply reply;
   uint32_t reply_first = 0, reply_last = 0;
   int reply_left = 0;  // a refusal is sent 3 times
-  bool restarted = false;
+  bool handoff_written = false;  // M-2: the joiner's hand-off is on disk and its restart has not fired yet
+  bool boot_late = false;        // I-1b: the host's boot timed out but is still answerable (no newer start, same peer)
+  uint64_t epoch = 0;            // bumped whenever the connection is left or replaced (a pending hand-off write checks it)
+  bool session_refused = false;  // I-1a: the hand-off's peer answered our session Hello as a lobby
+  std::string refusal = "none";  // Status::refusal: the latest refusal's kind (status.txt refusal=)
+  std::map<int, uint32_t> stranger_events;  // I-3: per refusal kind, when its last event was shown
   // session
   handoff::Handoff sh;
   std::function<void(int32_t, wire::LeaveReason)> on_left;
@@ -311,11 +330,25 @@ struct Lobby::Impl {
   uint32_t ctl_last = 0, status_last = 0;
   bool status_dirty = true, status_ever = false;
 
+  std::mutex stop_mu;  // M-6: Stop is serialised
   net::Transport t;  // last: destroyed first (its destructor stops the I/O thread before the state above goes)
 
   uint32_t Now() const { return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count()); }
-  void Log(const std::string& line) const {
+  // M-1: called with `mu` held; the line goes out once the mutex is released (RunDeferred), in order with the other
+  // effects queued there (file writes, the restart). LogNow is for the few places that do not hold `mu`.
+  void Log(const std::string& line) {
+    if (!p.log) return;
+    auto fn = p.log;
+    deferred.push_back([fn, line] { fn(line); });
+  }
+  void LogNow(const std::string& line) const {
     if (p.log) p.log(line);
+  }
+  bool StrangerEvent(int kind, uint32_t now) {  // I-3: one event (and its log line) per refusal kind per 10 s
+    const auto it = stranger_events.find(kind);
+    if (it != stranger_events.end() && now - it->second < kStrangerEventMs) return false;
+    stranger_events[kind] = now;
+    return true;
   }
   std::string Test(const char* name) const {
     if (p.test_dir.empty()) return "";
@@ -334,10 +367,10 @@ struct Lobby::Impl {
     return rules::DelayFromRtt(rtt_n ? int(std::lround(rtt)) : -1);
   }
   void Drop(wire::Drop why) { ++drops[size_t(why)]; }
-  void SetEvent(const std::string& text);
+  void SetEvent(const std::string& text, const char* refusal_kind = "none");
   Status SnapshotLocked() const;
   void WriteStatus(uint32_t now);
-  void TakeRequests(uint32_t now);
+  void ApplyRequests(const std::string& text, uint32_t now);
   void Apply(const Command& c, uint32_t now);
   void GoOffline();
   void DropPeer(const std::string& why);
@@ -346,17 +379,19 @@ struct Lobby::Impl {
     if (!d.empty()) t.SendTo(to, std::move(d));
   }
   void SendPeer(wire::Type type, const std::vector<uint8_t>& body) { SendTo(peer, type, token, body); }
-  bool ReplyWelcome(const rules::Endpoint& to, wire::Welcome w, size_t trigger_bytes, uint32_t now);
+  bool ReplyWelcome(const rules::Endpoint& to, wire::Welcome w, size_t trigger_bytes, uint32_t now, bool stranger);
   wire::Hello OwnHello(uint32_t session_token) const;
   void Connected(const rules::Endpoint& from, uint32_t tok, const std::string& release, uint32_t now);
 
   void OnPacket(const rules::Endpoint& from, const wire::Packet& pk);
   void OnForeign(const rules::Endpoint& from, uint8_t proto, uint8_t type, size_t bytes);
+  void ForeignLocked(const rules::Endpoint& from, uint8_t proto, uint8_t type, size_t bytes);
   void OnTick();
   void HandlePacket(const rules::Endpoint& from, const wire::Packet& pk, uint32_t now);
   void HandleHello(const rules::Endpoint& from, const wire::Packet& pk, uint32_t now);
   void HandleSessionHello(const rules::Endpoint& from, const wire::Packet& pk, uint32_t now);
   void HandleWelcome(const rules::Endpoint& from, const wire::Packet& pk, uint32_t now);
+  void HandleSessionWelcome(const rules::Endpoint& from, const wire::Packet& pk);
   void Tick(uint32_t now);
   void StartSessionNow(uint32_t now);
   void HostRestart();
@@ -367,19 +402,24 @@ struct Lobby::Impl {
   bool StartTransport(std::string* error);
 };
 
-void Lobby::Impl::SetEvent(const std::string& text) {
+void Lobby::Impl::SetEvent(const std::string& text, const char* refusal_kind) {
   event = text;
+  refusal = refusal_kind;
   status_dirty = true;
   if (text == events_written) return;
   events_written = text;
   Log("[doa4][NET] event: " + text);
   if (p.events_path.empty()) return;
-  std::error_code ec;
-  if (p.events_path.has_parent_path()) fs::create_directories(p.events_path.parent_path(), ec);
-  std::ofstream f(p.events_path, std::ios::binary | std::ios::app);
   const long long unix_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-  if (f) f << unix_ms << ' ' << Sanitize(text, 1000) << '\n';
+  const fs::path path = p.events_path;
+  const std::string line = std::to_string(unix_ms) + ' ' + Sanitize(text, 1000) + '\n';
+  deferred.push_back([path, line] {  // M-1: no disk write while `mu` is held
+    std::error_code ec;
+    if (path.has_parent_path()) fs::create_directories(path.parent_path(), ec);
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    if (f) f << line;
+  });
 }
 
 Status Lobby::Impl::SnapshotLocked() const {
@@ -408,7 +448,9 @@ Status Lobby::Impl::SnapshotLocked() const {
     e.port = s.port;
     s.my_code = rules::MakeJoinCode(e);
   }
-  s.upnp = cfg.upnp && !cfg.loopback ? (upnp_started ? upnp::Get().message : "UPnP: not asked yet") : "UPnP off";
+  s.upnp = cfg.upnp ? (upnp_started ? upnp::Get().message : "UPnP: not asked yet") : "UPnP off";
+  s.session_refused = session_refused;
+  s.refusal = refusal;
   for (size_t r = 0; r < s.drops.size(); ++r) {
     s.drops[r] = ts.dropped[r] + drops[r];
     s.dropped += s.drops[r];
@@ -440,23 +482,35 @@ void Lobby::Impl::WriteStatus(uint32_t now) {
   std::snprintf(ping, sizeof ping, "%.1f", double(s.ping_ms));
   const std::string text = "state=" + std::string(StateName(s.state)) + "\nport=" + std::to_string(s.port) +
                            "\npeer_port=" + std::to_string(s.peer_port) + "\nping=" + ping + "\ndelay=" + std::to_string(s.delay) +
-                           "\ncan_start=" + (s.can_start ? "1" : "0") + "\nevent=" + Sanitize(s.event, 1000) + "\n";
-  // a reader holding status.txt open can make the rename fail: it stays dirty and is retried at the next tick
-  status_dirty = !WriteAtomic(p.test_dir / "status.txt", text.data(), text.size()).empty();
+                           "\ncan_start=" + (s.can_start ? "1" : "0") + "\nevent=" + Sanitize(s.event, 1000) +
+                           "\nrefusal=" + s.refusal + "\n";
+  status_dirty = false;
   status_last = now;
   status_ever = true;
+  // M-1: written once `mu` is released. A reader holding status.txt open can make the rename fail: it is marked dirty
+  // again and retried at the next tick.
+  const fs::path path = p.test_dir / "status.txt";
+  deferred.push_back([this, path, text] {
+    if (WriteAtomic(path, text.data(), text.size()).empty()) return;
+    std::lock_guard<std::mutex> lock(mu);
+    status_dirty = true;
+  });
 }
 
-void Lobby::Impl::TakeRequests(uint32_t now) {
-  const fs::path on = p.test_dir / "np_ctl.on", taking = p.test_dir / "np_ctl.taking";
-  if (!MoveFileExW(on.c_str(), taking.c_str(), MOVEFILE_REPLACE_EXISTING)) return;  // nothing to take
-  std::string text;
+// The request file, taken (renamed, read, deleted) by the I/O thread without `mu` (M-1). False when there is none.
+static bool TakeCtl(const fs::path& dir, std::string* text) {
+  const fs::path on = dir / "np_ctl.on", taking = dir / "np_ctl.taking";
+  if (!MoveFileExW(on.c_str(), taking.c_str(), MOVEFILE_REPLACE_EXISTING)) return false;
   {
     std::ifstream f(taking, std::ios::binary);
-    text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    text->assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
   }
   std::error_code ec;
   fs::remove(taking, ec);
+  return true;
+}
+
+void Lobby::Impl::ApplyRequests(const std::string& text, uint32_t now) {
   size_t pos = 0;
   while (pos < text.size()) {
     size_t end = text.find('\n', pos);
@@ -521,6 +575,17 @@ void Lobby::Impl::GoOffline() {
   rtt_n = 0;
   ping_ever = false;
   status_dirty = true;
+  ++epoch;
+  boot_late = false;
+  if (handoff_written) {  // M-2: the session start is cancelled before the restart fired: the hand-off goes too
+    handoff_written = false;
+    const fs::path path = p.handoff_path;
+    deferred.push_back([path] {
+      std::error_code ec;
+      fs::remove(path, ec);
+    });
+    Log("[doa4][NET] the session start was cancelled before the restart: hand-off withdrawn");
+  }
 }
 
 // The peer went away (Bye or silence): the host keeps hosting, the joiner is Offline.
@@ -546,16 +611,20 @@ wire::Hello Lobby::Impl::OwnHello(uint32_t session_token) const {
 }
 
 // carry 2d: a reply to a datagram from anyone not authenticated - one per datagram (the caller), never larger than it
-// (the text is shortened; nothing is sent when even an empty text does not fit), at most 10 in any 1,000 ms.
-bool Lobby::Impl::ReplyWelcome(const rules::Endpoint& to, wire::Welcome w, size_t trigger_bytes, uint32_t now) {
+// (the text is shortened; nothing is sent when even an empty text does not fit), at most 10 in any 1,000 ms. M-4: the
+// Welcome to the joiner being accepted, or resent to the known peer, keeps the size rule but not the stranger budget,
+// so a flood of junk Hellos cannot keep the real joiner out.
+bool Lobby::Impl::ReplyWelcome(const rules::Endpoint& to, wire::Welcome w, size_t trigger_bytes, uint32_t now, bool stranger) {
   w.release = Sanitize(w.release);
   w.text = Sanitize(w.text);
   const size_t fixed = wire::kHeaderBytes + 1 + 8 + 2 + w.release.size() + 2 + 4;
   if (fixed > trigger_bytes) return false;
   if (w.text.size() > trigger_bytes - fixed) w.text.resize(trigger_bytes - fixed);
-  while (!replies.empty() && now - replies.front() >= 1000) replies.pop_front();
-  if (replies.size() >= size_t(kUnauthRepliesPerSecond)) return false;
-  replies.push_back(now);
+  if (stranger) {
+    while (!replies.empty() && now - replies.front() >= 1000) replies.pop_front();
+    if (replies.size() >= size_t(kUnauthRepliesPerSecond)) return false;
+    replies.push_back(now);
+  }
   SendTo(to, wire::Type::kWelcome, 0, wire::EncodeWelcome(w));
   return true;
 }
@@ -576,6 +645,8 @@ void Lobby::Impl::Connected(const rules::Endpoint& from, uint32_t tok, const std
   rx_partial = false;
   have_completed = false;
   reply_pending = false;
+  boot_late = false;
+  ++epoch;
   state = State::kConnected;
   SetEvent("Connected to the other player.");
 }
@@ -594,7 +665,14 @@ void Lobby::Impl::OnPacket(const rules::Endpoint& from, const wire::Packet& pk) 
 
 void Lobby::Impl::OnForeign(const rules::Endpoint& from, uint8_t proto, uint8_t type, size_t bytes) {
   io_tid = GetCurrentThreadId();
-  std::lock_guard<std::mutex> lock(mu);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    ForeignLocked(from, proto, type, bytes);
+  }
+  RunDeferred();
+}
+
+void Lobby::Impl::ForeignLocked(const rules::Endpoint& from, uint8_t proto, uint8_t type, size_t bytes) {
   if (session) return;
   const uint32_t now = Now();
   if (is_host && state != State::kOffline && type == uint8_t(wire::Type::kHello)) {
@@ -603,12 +681,15 @@ void Lobby::Impl::OnForeign(const rules::Endpoint& from, uint8_t proto, uint8_t 
     w.build = Build();
     w.release = p.release;
     w.text = ProtoAdvice(proto);
-    ReplyWelcome(from, w, bytes, now);
-    if (state == State::kHosting)
-      SetEvent("Refused a player whose game speaks network protocol " + std::to_string(proto) + " (yours " + std::to_string(wire::kProto) + ").");
+    ReplyWelcome(from, w, bytes, now, true);
+    refusal = "proto";  // the kind is kept even when the event line is not changed (I-3)
+    status_dirty = true;
+    if (state == State::kHosting && StrangerEvent(1000, now))
+      SetEvent("Refused a player whose game speaks network protocol " + std::to_string(proto) + " (yours " + std::to_string(wire::kProto) + ").",
+               "proto");
   } else if (!is_host && state == State::kConnecting && from == target) {
     GoOffline();
-    SetEvent(ProtoAdvice(proto));
+    SetEvent(ProtoAdvice(proto), "proto");
   }
 }
 
@@ -620,6 +701,7 @@ void Lobby::Impl::HandlePacket(const rules::Endpoint& from, const wire::Packet& 
       return;
     case wire::Type::kWelcome:
       if (!session) HandleWelcome(from, pk, now);
+      else HandleSessionWelcome(from, pk);
       return;
     case wire::Type::kPunch:  // the host reaching out (strict routers): no reply to a stranger; a Hello sooner
       if (!punch_logged) {
@@ -702,7 +784,8 @@ void Lobby::Impl::HandlePacket(const rules::Endpoint& from, const wire::Packet& 
       return;
     }
     case wire::Type::kBootReply: {
-      if (!is_host || state != State::kStarting) return;
+      // I-1b: in kStarting, or Connected after the 15 s timeout while that boot is still the current one
+      if (!is_host || !(state == State::kStarting || (state == State::kConnected && boot_late))) return;
       wire::BootReply br;
       if (!wire::DecodeBootReply(pk.body, &br)) {
         Drop(wire::Drop::kBody);
@@ -711,9 +794,11 @@ void Lobby::Impl::HandlePacket(const rules::Endpoint& from, const wire::Packet& 
       const bool ok = br.ok == 1;  // carry 2a: any other value is not a yes
       if (!(br.session_token == boot.session_token || (!ok && br.session_token == 0))) return;
       if (ok) {
+        if (state == State::kConnected) Log("[doa4][NET] a late yes to the session start (after the 15 s): restarting");
         HostRestart();
         return;
       }
+      if (state != State::kStarting) return;  // a late refusal changes nothing
       booting = false;
       tx.Reset();
       state = State::kConnected;
@@ -752,23 +837,33 @@ void Lobby::Impl::PeerLeft(int32_t frame, wire::LeaveReason r) {
 }
 
 void Lobby::Impl::HandleHello(const rules::Endpoint& from, const wire::Packet& pk, uint32_t now) {
-  if (!is_host || state == State::kOffline || state == State::kConnecting) return;  // not hosting
+  const bool hosting = is_host && state != State::kOffline && state != State::kConnecting;
   wire::Hello hl;
   if (!wire::DecodeHello(pk.body, &hl)) {
-    Drop(wire::Drop::kBody);
+    if (hosting) Drop(wire::Drop::kBody);
     return;
   }
-  if (pk.token != 0 || hl.session_token != 0) {  // a session process's Hello: not for a lobby
+  if (pk.token != 0 || hl.session_token != 0) {
+    // I-1a: a session process's Hello (the other game restarted into a session this one never started): say so, so it
+    // gives up at once instead of waiting for np_live's frame-0 limit. A stranger reply like any other (size, budget).
     Drop(wire::Drop::kToken);
+    wire::Welcome w;
+    w.refusal = wire::Refusal::kSession;
+    w.build = Build();  // no release: a kSession answer must fit any Hello (2d size rule)
+    w.text = "That game is not in the online session.";
+    ReplyWelcome(from, w, pk.body.size() + wire::kHeaderBytes, now, true);
+    refusal = "session";
+    status_dirty = true;
     return;
   }
+  if (!hosting) return;
   wire::Welcome w;
   w.build = Build();
   w.release = p.release;
   if (has_peer && from == peer) {  // the joiner did not get the Welcome: the same one again
     if (state != State::kConnected) return;
     w.session_token = token;
-    ReplyWelcome(from, w, pk.body.size() + wire::kHeaderBytes, now);
+    ReplyWelcome(from, w, pk.body.size() + wire::kHeaderBytes, now, false);
     return;
   }
   if (!files_ready) return;  // the joiner repeats its Hello every 400 ms
@@ -780,21 +875,25 @@ void Lobby::Impl::HandleHello(const rules::Endpoint& from, const wire::Packet& p
     w.session_token = token;
     Log("[doa4][NET] joiner connected: release " + peer_release + ", delay preference " +
         (hl.delay_auto ? std::string("auto") : std::to_string(std::clamp(int(hl.delay_frames), 1, 8))));  // carry 2a: clamped
-    ReplyWelcome(from, w, trigger, now);
+    ReplyWelcome(from, w, trigger, now, false);
     return;
   }
   w.refusal = v.refusal;
   w.text = v.text;
-  ReplyWelcome(from, w, trigger, now);
+  ReplyWelcome(from, w, trigger, now, true);
+  const char* kind = KindName(v.refusal);
+  refusal = kind;  // kept even when the event line is not changed (busy; I-3)
+  status_dirty = true;
+  if (!StrangerEvent(int(v.refusal), now)) return;  // I-3: a stranger cannot flood the event line, game.log or events.txt
   switch (v.refusal) {
     case wire::Refusal::kBusy: break;  // the pair's own event stays
-    case wire::Refusal::kBuild: SetEvent("Refused a player with a different build. " + Sanitize(v.text)); break;
+    case wire::Refusal::kBuild: SetEvent("Refused a player with a different build. " + Sanitize(v.text), kind); break;
     case wire::Refusal::kFiles: {
       const std::string local = LocalFilesProblem(files_text);
-      SetEvent("Refused a player: " + (local.empty() ? Sanitize(v.text) : local + "."));
+      SetEvent("Refused a player: " + (local.empty() ? Sanitize(v.text) : local + "."), kind);
       break;
     }
-    default: SetEvent("Refused a player: " + Sanitize(v.text)); break;
+    default: SetEvent("Refused a player: " + Sanitize(v.text), kind); break;
   }
 }
 
@@ -838,7 +937,7 @@ void Lobby::Impl::HandleWelcome(const rules::Endpoint& from, const wire::Packet&
     default: text = w.text.empty() ? "The host refused the connection." : Sanitize(w.text); break;
   }
   GoOffline();
-  SetEvent(text);
+  SetEvent(text, KindName(w.refusal));
 }
 
 void Lobby::Impl::HandleSessionHello(const rules::Endpoint& from, const wire::Packet& pk, uint32_t now) {
@@ -851,10 +950,9 @@ void Lobby::Impl::HandleSessionHello(const rules::Endpoint& from, const wire::Pa
     Drop(wire::Drop::kToken);
     wire::Welcome w;
     w.refusal = wire::Refusal::kSession;
-    w.build = Build();
-    w.release = p.release;
+    w.build = Build();  // no release: a kSession answer must fit any Hello (2d size rule)
     w.text = "That game is in another online session.";
-    ReplyWelcome(from, w, pk.body.size() + wire::kHeaderBytes, now);
+    ReplyWelcome(from, w, pk.body.size() + wire::kHeaderBytes, now, true);
     return;
   }
   if (!(from == sh.peer)) {  // carry 2c: the peer is the address the lobby's socket saw (the hand-off's), only
@@ -880,10 +978,30 @@ void Lobby::Impl::HandleSessionHello(const rules::Endpoint& from, const wire::Pa
   }
 }
 
+// I-1a: the session process's Hello reached a lobby (the other game did not restart into the session): give up now and
+// say so through Status::session_refused, so the app (Task 12) ends the session and restarts offline.
+void Lobby::Impl::HandleSessionWelcome(const rules::Endpoint& from, const wire::Packet& pk) {
+  if (!(from == sh.peer)) {
+    Drop(wire::Drop::kSource);
+    return;
+  }
+  wire::Welcome w;
+  if (!wire::DecodeWelcome(pk.body, &w)) {
+    Drop(wire::Drop::kBody);
+    return;
+  }
+  if (w.refusal != wire::Refusal::kSession || state != State::kConnecting) return;
+  state = State::kOffline;
+  session_refused = true;
+  Log("[doa4][NET] the hand-off's peer answered as a lobby: the other game did not start the session; giving up");
+  SetEvent("The other player's game did not start the session.", "session");
+}
+
 // =====================================================================================================
 // Session start
 // =====================================================================================================
 void Lobby::Impl::StartSessionNow(uint32_t now) {
+  boot_late = false;  // I-1b: a newer start ends the window for a late yes to the old one
   if (!is_host || state != State::kConnected) {
     SetEvent("Connect to the other player first.");
     return;
@@ -943,25 +1061,33 @@ void Lobby::Impl::StartSessionNow(uint32_t now) {
 }
 
 // The host: the joiner said yes with the hand-off's token. Write our side, then restart.
+// M-1: the file is written once `mu` is released; the outcome (restart, or back to Connected) is applied under it
+// again, in the same order as before: write, log, event, restart.
 void Lobby::Impl::HostRestart() {
   booting = false;
+  boot_late = false;
   tx.Reset();
   handoff::Handoff h = boot;
   h.role = handoff::Role::kHost;
   h.local_port = t.port();
   h.peer = peer;
   const std::vector<uint8_t> bytes = handoff::Pack(h);
-  const std::string err = bytes.empty() ? "it does not pack" : WriteAtomic(p.handoff_path, bytes.data(), bytes.size());
-  if (!err.empty()) {
-    state = State::kConnected;
-    SetEvent("Could not write the session hand-off (" + err + ").");
-    return;
-  }
-  state = State::kRestarting;
-  restarted = true;
-  Log("[doa4][NET] hand-off written; restarting into the session");
-  SetEvent("Starting the online session: restarting...");
-  if (p.restart_into_session) deferred.push_back(p.restart_into_session);
+  state = State::kRestarting;  // no second yes is taken while the file is written
+  const uint64_t at = epoch;
+  const fs::path path = p.handoff_path;
+  deferred.push_back([this, bytes, path, at] {
+    const std::string err = bytes.empty() ? "it does not pack" : WriteAtomic(path, bytes.data(), bytes.size());
+    std::lock_guard<std::mutex> lock(mu);
+    if (at != epoch || state != State::kRestarting) return;  // left meanwhile
+    if (!err.empty()) {
+      state = State::kConnected;
+      SetEvent("Could not write the session hand-off (" + err + ").");
+      return;
+    }
+    Log("[doa4][NET] hand-off written; restarting into the session");
+    SetEvent("Starting the online session: restarting...");
+    if (p.restart_into_session) deferred.push_back(p.restart_into_session);
+  });
 }
 
 // The joiner: the host's hand-off arrived complete.
@@ -987,16 +1113,32 @@ void Lobby::Impl::OnBootMessage(const std::vector<uint8_t>& msg, uint8_t type) {
   h.local_port = t.port();
   h.peer = peer;  // carry 2c: the host as this socket saw it
   const std::vector<uint8_t> bytes = handoff::Pack(h);
-  const std::string werr = bytes.empty() ? "it does not pack" : WriteAtomic(p.handoff_path, bytes.data(), bytes.size());
-  if (!werr.empty()) {
-    const std::string text = "Could not write the session hand-off (" + werr + ").";
-    Answer(h.session_token, false, text);
-    SetEvent(text);
-    return;
-  }
-  Answer(h.session_token, true, "");
-  state = State::kRestarting;
-  SetEvent("The host started the online session: restarting...");
+  const uint32_t tok = h.session_token;
+  const uint64_t at = epoch;
+  const fs::path path = p.handoff_path;
+  // M-1: written once `mu` is released; then, under it again, the answer (a yes only once the file is on disk)
+  deferred.push_back([this, bytes, path, tok, at] {
+    const std::string werr = bytes.empty() ? "it does not pack" : WriteAtomic(path, bytes.data(), bytes.size());
+    std::lock_guard<std::mutex> lock(mu);
+    if (at != epoch || state != State::kConnected) {  // M-2: cancelled while it was written
+      if (werr.empty())
+        deferred.push_back([path] {
+          std::error_code ec;
+          fs::remove(path, ec);
+        });
+      return;
+    }
+    if (!werr.empty()) {
+      const std::string text = "Could not write the session hand-off (" + werr + ").";
+      Answer(tok, false, text);
+      SetEvent(text);
+      return;
+    }
+    handoff_written = true;
+    Answer(tok, true, "");
+    state = State::kRestarting;
+    SetEvent("The host started the online session: restarting...");
+  });
 }
 
 void Lobby::Impl::Answer(uint32_t tok, bool ok, const std::string& text) {
@@ -1014,33 +1156,39 @@ void Lobby::Impl::Answer(uint32_t tok, bool ok, const std::string& text) {
 // =====================================================================================================
 void Lobby::Impl::OnTick() {
   io_tid = GetCurrentThreadId();
+  const uint32_t now = Now();
+  std::string ctl;
+  bool have_ctl = false;
+  if (!p.test_dir.empty() && now - ctl_last >= kCtlPollMs) {  // ctl_last: the I/O thread's own
+    ctl_last = now;
+    have_ctl = TakeCtl(p.test_dir, &ctl);
+  }
   {
     std::lock_guard<std::mutex> lock(mu);
-    const uint32_t now = Now();
     while (!cmds.empty()) {
       const Command c = cmds.front();
       cmds.pop_front();
       Apply(c, now);
     }
     Tick(now);
-    if (!p.test_dir.empty()) {
-      if (now - ctl_last >= kCtlPollMs) {
-        ctl_last = now;
-        TakeRequests(now);
-      }
-      if (status_dirty || !status_ever || now - status_last >= kStatusEveryMs) WriteStatus(now);
-    }
+    if (have_ctl) ApplyRequests(ctl, now);
+    if (!p.test_dir.empty() && (status_dirty || !status_ever || now - status_last >= kStatusEveryMs)) WriteStatus(now);
   }
   RunDeferred();
 }
 
+// Runs the effects queued under `mu` (log lines, file writes, the restart, on_peer_left), in order, without it; an effect
+// may queue more (a hand-off write queues the restart), which run in the same call.
 void Lobby::Impl::RunDeferred() {
-  std::vector<std::function<void()>> d;
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    d.swap(deferred);
+  for (;;) {
+    std::vector<std::function<void()>> d;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      d.swap(deferred);
+    }
+    if (d.empty()) return;
+    for (auto& f : d) f();
   }
-  for (auto& f : d) f();
 }
 
 void Lobby::Impl::Apply(const Command& c, uint32_t now) {
@@ -1054,7 +1202,7 @@ void Lobby::Impl::Apply(const Command& c, uint32_t now) {
       GoOffline();
       is_host = true;
       state = State::kHosting;
-      if (cfg.upnp && !cfg.loopback && !upnp_started) {
+      if (cfg.upnp && !upnp_started) {
         upnp_started = true;
         upnp::MapAsync(t.port());
       }
@@ -1130,7 +1278,7 @@ void Lobby::Impl::Tick(uint32_t now) {
     }
     if (reply_pending && reply.ok && now - reply_first >= kJoinerRestartMs) {
       reply_pending = false;
-      restarted = true;
+      handoff_written = false;  // the restart owns the file now
       Log("[doa4][NET] hand-off written; restarting into the session");
       if (p.restart_into_session) deferred.push_back(p.restart_into_session);
     }
@@ -1198,6 +1346,7 @@ void Lobby::Impl::Tick(uint32_t now) {
           booting = false;
           tx.Reset();
           state = State::kConnected;
+          boot_late = true;  // I-1b: a yes that arrives later for this boot still starts it
           SetEvent("The other player's game did not answer the session start.");
         }
       }
@@ -1250,7 +1399,7 @@ bool Lobby::Start(Providers providers, const net::Config& transport, std::string
     m.files_ready = true;
     m.Log("[doa4][NET] game files fingerprinted (" + std::to_string(std::count(m.files_text.begin(), m.files_text.end(), '\n')) + " groups)");
   });
-  m.Log("[doa4][NET] lobby started on port " + std::to_string(m.t.port()) + " (release " + Sanitize(m.p.release) + ")");
+  m.LogNow("[doa4][NET] lobby started on port " + std::to_string(m.t.port()) + " (release " + Sanitize(m.p.release) + ")");
   return true;
 }
 
@@ -1285,7 +1434,12 @@ bool Lobby::StartInSession(Providers providers, const net::Config& transport, co
     m.state = State::kConnecting;
   }
   if (!m.StartTransport(error)) return false;
-  m.Log("[doa4][NET] session process: port " + std::to_string(m.t.port()) + ", peer " + rules::EndpointText(h.peer) + ", " +
+  if (m.cfg.upnp) {  // M-3: the session process maps its port again (the lobby's mapping went with the old process)
+    std::lock_guard<std::mutex> lock(m.mu);
+    m.upnp_started = true;
+    upnp::MapAsync(m.t.port());
+  }
+  m.LogNow("[doa4][NET] session process: port " + std::to_string(m.t.port()) + ", peer " + rules::EndpointText(h.peer) + ", " +
         (m.is_host ? "host" : "joiner"));
   return true;
 }
@@ -1293,16 +1447,20 @@ bool Lobby::StartInSession(Providers providers, const net::Config& transport, co
 void Lobby::Stop() {
   Impl& m = *impl_;
   if (GetCurrentThreadId() == m.io_tid.load()) {  // carry 2d (Task 7 review M-2): joining the I/O thread from itself
-    m.Log("[doa4][NET] WARN Stop called on the I/O thread (from a callback); ignored");
+    m.LogNow("[doa4][NET] WARN Stop called on the I/O thread (from a callback); ignored");
     return;
   }
+  std::lock_guard<std::mutex> stop_lock(m.stop_mu);  // M-6: concurrent Stop calls are safe
   m.t.Stop();
   m.io_tid = 0;
   if (m.files_thread.joinable()) m.files_thread.join();
-  if (m.upnp_started) {
+  bool unmap = false;
+  {
+    std::lock_guard<std::mutex> lock(m.mu);
+    unmap = m.upnp_started;
     m.upnp_started = false;
-    upnp::Unmap();
   }
+  if (unmap) upnp::Unmap();
 }
 
 static void Push(Lobby::Impl& m, Command c) {
