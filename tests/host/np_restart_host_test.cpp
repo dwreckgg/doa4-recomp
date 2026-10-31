@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cwctype>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -206,6 +207,32 @@ static void TestRelaunchPlan() {
   CHECK(p.use_show && p.show == 0);
 }
 
+// Fix round I2 / M1: the redirect proof and the names a session may skip.
+static void TestRedirectAndNames() {
+  const fs::path sess = g_root / "u9" / "netplay" / "session";
+  CHECK(restart::RedirectHolds(sess, sess));
+  CHECK(restart::RedirectHolds(sess.wstring() + L"\\", sess));                       // a trailing separator
+  CHECK(restart::RedirectHolds(fs::path(sess.generic_wstring()), sess));             // '/' against '\'
+  std::wstring upper = sess.wstring();
+  for (wchar_t& c : upper) c = wchar_t(towupper(c));
+  CHECK(restart::RedirectHolds(upper, sess));                                        // one folder on Windows
+  CHECK(restart::RedirectHolds(g_root / "u9" / "netplay" / "x" / ".." / "session", sess));
+  // the likeliest wrong answers: the real user data (the redirect did not happen), a parent, a sibling, empty
+  CHECK(!restart::RedirectHolds(g_root / "u9", sess));
+  CHECK(!restart::RedirectHolds(g_root / "u9" / "netplay", sess));
+  CHECK(!restart::RedirectHolds(g_root / "u9" / "netplay" / "sessions", sess));
+  CHECK(!restart::RedirectHolds(g_root / "u9" / "netplay" / "session2", sess));
+  CHECK(!restart::RedirectHolds({}, sess) && !restart::RedirectHolds(sess, {}));
+  // exactly the three known unregistered names
+  CHECK(restart::KnownUnregisteredSetting("kernel_pix"));
+  CHECK(restart::KnownUnregisteredSetting("vulkan_readback_resolve"));
+  CHECK(restart::KnownUnregisteredSetting("vulkan_readback_memexport"));
+  CHECK(!restart::KnownUnregisteredSetting("kernel_debug_monitor"));
+  CHECK(!restart::KnownUnregisteredSetting("d3d12_readback_resolve"));
+  CHECK(!restart::KnownUnregisteredSetting("kernel_pix2") && !restart::KnownUnregisteredSetting("kernel_pi"));
+  CHECK(!restart::KnownUnregisteredSetting(""));
+}
+
 int main() {
   wchar_t tmp[MAX_PATH];
   GetTempPathW(MAX_PATH, tmp);
@@ -216,6 +243,7 @@ int main() {
   TestClearFolder();
   TestWriteSaveFiles();
   TestRelaunchPlan();
+  TestRedirectAndNames();
   // clean up only what this run made: remove junctions as links first (never through them)
   std::string error;
   restart::ClearFolder(g_root, &error);

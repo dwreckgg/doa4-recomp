@@ -48,6 +48,7 @@
 #include "np_det.h"
 #include "np_det_internal.h"
 #include "np_exec.h"
+#include "np_restart.h"
 #include "np_gekko.h"
 #include "np_rules.h"
 #include "np_selftest.h"
@@ -238,6 +239,7 @@ std::atomic<bool> g_switch_online{false};
 std::atomic<bool> g_switch_test_dir{false};
 std::mutex g_early_mu;
 std::vector<std::string> g_early;  // EarlyLog lines, written into np_log.txt when it opens
+std::string g_skipped;             // fix round M1: guest settings skipped as unregistered (comma list; meta key)
 
 void Log(const std::string& line) {
   State& s = S();
@@ -1309,7 +1311,8 @@ void StartOnline(Host host) {
   s.unlock = true;
   s.guest_meta = GuestMeta(s.ho.guest_settings);
   s.unlock_meta = "1";
-  const std::string extra = "guest=" + s.guest_meta + "\nunlock=1\nsession=online role=" +
+  const std::string extra = "guest=" + s.guest_meta + "\nunlock=1\nguest_skipped=" +
+                            (g_skipped.empty() ? std::string("none") : g_skipped) + "\nsession=online role=" +
                             std::string(s.slot == 0 ? "host" : "joiner") + " delay=" + std::to_string(s.ho.delay) + "\n";
   const std::string meta = CurrentMeta(s.host.game_data_root, s.sweep_per_frame, extra);
   s.rec = _wfopen((s.dir / "rec.d4r").wstring().c_str(), L"wb");
@@ -1371,18 +1374,25 @@ void EarlyLog(const std::string& line) {
   g_early.push_back(line);
 }
 
-bool ApplyGuestText(const std::string& text, std::string* why) {
+bool ApplyGuestText(const std::string& text, std::string* why, bool* touched) {
   why->clear();
+  bool any_set = false;
+  std::string skipped;
   const std::string err = handoff::ApplyGuestSettings(
-      text, [](const std::string& name, const std::string& value) {
-        // A carried name this build does not register (Task 4's census lists kernel_pix, defined in
-        // sdk src/kernel/xboxkrnl/debug_monitor.cpp, which src/kernel/CMakeLists.txt:37 leaves out, and the two
-        // vulkan_readback_* of the Vulkan backend, not built on Windows): nothing in this exe reads it, so it cannot
-        // change what the guest sees, and both sides run the same build (the hand-off's build id is checked first).
-        // It is skipped, not refused; the read-back below says so.
-        if (!rex::cvar::GetFlagInfo(name)) return true;
+      text, [&](const std::string& name, const std::string& value) {
+        // Fix round M1: only the three names this build is known not to register (np_restart.h
+        // KnownUnregisteredSetting: nothing in this exe reads them, and both sides run the same build - the hand-off's
+        // build id is checked first) are skipped; any other unknown name is refused like a refused value.
+        if (!rex::cvar::GetFlagInfo(name)) {
+          if (!restart::KnownUnregisteredSetting(name)) return false;
+          skipped += (skipped.empty() ? "" : ",") + name;
+          return true;
+        }
+        any_set = true;  // fix round I1: from here on this process holds host-imposed values
         return rex::cvar::SetFlagByName(name, value);
       });
+  if (touched) *touched = any_set;
+  g_skipped = skipped;
   if (!err.empty()) {
     *why = err;
     EarlyLog("WARN session: guest settings refused: " + err);
@@ -1398,7 +1408,7 @@ bool ApplyGuestText(const std::string& text, std::string* why) {
     const size_t eq = line.find('=');
     if (eq == std::string::npos) continue;
     const std::string name = line.substr(0, eq), value = line.substr(eq + 1);
-    if (!rex::cvar::GetFlagInfo(name)) {
+    if (!rex::cvar::GetFlagInfo(name) && restart::KnownUnregisteredSetting(name)) {
       EarlyLog("[doa4][NET] guest setting " + name + "=" + value + " (not registered in this build: skipped)");
       continue;
     }
@@ -1425,7 +1435,7 @@ void PrepareReplayRules() {
     std::string text = guest;
     std::replace(text.begin(), text.end(), ';', '\n');
     std::string why;
-    if (ApplyGuestText(text, &why)) {
+    if (ApplyGuestText(text, &why, nullptr)) {
       EarlyLog("replay: the recording's guest settings applied (R21)");
     } else {
       EarlyLog("replay: the recording's guest settings could not be applied: " + why);

@@ -73,6 +73,9 @@ struct MenuHost {
   // its saves from.
   std::filesystem::path backup_root;
   ExtrasState* extras = nullptr;   // owned by the app: survives closing the menu
+  // Netplay (Task 12 fix round I3): asked before an Extras action (an unlock, a tweak toggle); true = refused (in an
+  // online session: *status says why, a log line is written). Empty: never refused.
+  std::function<bool(std::string_view action, std::string* status)> refuse;
   // Game tab: the folder the game started from, whether --game_data_root
   // chose it, and the action that closes the menu and opens the setup screen
   // to choose another (used from the next start).

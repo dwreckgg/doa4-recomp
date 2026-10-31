@@ -13,6 +13,7 @@
 #include <ctime>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "np_handoff.h"
@@ -24,6 +25,17 @@ std::filesystem::path SessionUserData(const std::filesystem::path& user_data);  
 // <T>/session when test_dir is not empty, else <U>/netplay/sessions/<yyyymmdd-hhmmss>_<host|joiner> (local time of now)
 std::filesystem::path SessionDir(const std::filesystem::path& user_data, const std::filesystem::path& test_dir, bool host,
                                  std::time_t now);
+
+// The redirect proof (#0282, fix round I2): the RUNTIME's user data root is the session folder. Both are made absolute
+// and normal; the comparison ignores the case of letters and the separator style (one folder on Windows). False when
+// either is empty.
+bool RedirectHolds(const std::filesystem::path& runtime_user_data, const std::filesystem::path& session_user_data);
+
+// The carried guest settings this build never registers (fix round M1): kernel_pix (sdk src/kernel/xboxkrnl/
+// debug_monitor.cpp, left out by src/kernel/CMakeLists.txt:37) and the Vulkan backend's vulkan_readback_resolve /
+// vulkan_readback_memexport (not built on Windows). Only these are skipped when the registry does not know them; any
+// other unknown name fails the session start.
+bool KnownUnregisteredSetting(std::string_view name);
 
 // Makes `dir` an existing, empty folder. Refuses (false, *error) when `dir` itself is a reparse point (a junction or a
 // symbolic link): the session folder must be a real folder. Inside it, a reparse point is removed as a LINK (the

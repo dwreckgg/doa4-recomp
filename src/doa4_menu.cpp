@@ -411,7 +411,8 @@ void MenuDialog::DrawExtrasTab() {
   for (const UnlockRow& row : kUnlockRows) {
     const bool done = profile && unlocks::IsUnlocked(*host_.guest, *profile, row.what);
     ImGui::BeginDisabled(!profile || done);
-    if (ImGui::Button(row.label, ImVec2(220.0f, 0.0f))) {
+    if (ImGui::Button(row.label, ImVec2(220.0f, 0.0f)) &&
+        !(host_.refuse && host_.refuse(std::string("unlock ") + row.label, &status_))) {
       std::string error;
       if (UnlockWithBackup(*host_.guest, *profile, row.what, host_.save_dir, host_.backup_root,
                            BackupStamp(), host_.extras, &error)) {
@@ -579,6 +580,7 @@ void MenuDialog::DrawPhotoTab() {
 
 void MenuDialog::SetTweak(size_t index, bool on) {
   const tweaks::Tweak& tweak = tweaks::AllTweaks()[index];
+  if (host_.refuse && host_.refuse(std::string("tweak ") + tweak.cvar, &status_)) return;
   const char* value = on ? "true" : "false";
   // Saved first: when the save fails the running game keeps its state.
   std::string error = SaveTomlKey(host_.config_path, tweak.cvar, value);

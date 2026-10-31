@@ -89,6 +89,11 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::optional<rex::PathConfig> OnFinalizePaths(
       const rex::PathConfig& sdk_defaults, std::function<void(rex::PathConfig)> resume) override {
     const rex::PathConfig defaults = WithUserData(sdk_defaults);
+    if (launch_refused_) {  // fix round I1: a session start that failed after a host setting was applied
+      REXLOG_WARN("[doa4][NET] the runtime is not built: this process quits (the offline relaunch runs instead)");
+      app_context().CallInUIThreadDeferred([this] { app_context().QuitFromUIThread(); });
+      return std::nullopt;
+    }
     const std::filesystem::path saved =
         doa4::PathFromUtf8(rex::cvar::Query<std::string>("doa4_game_files"));
     const doa4::gamefiles::StartChoice choice =
@@ -156,9 +161,10 @@ class DeadOrAlive4App : public rex::ReXApp {
     const std::filesystem::path session = restart::SessionUserData(user_data_);
     std::string error;
     if (!restart::ClearFolder(session, &error) || !restart::WriteSaveFiles(session, session_->files, &error)) {
-      REXLOG_WARN("[doa4][NET] WARN session: the session folder {} cannot be prepared ({}): starting offline",
+      REXLOG_WARN("[doa4][NET] WARN session: the session folder {} cannot be prepared ({}): relaunching offline",
                   doa4::Utf8(session), error);
       session_.reset();
+      AbortIntoOfflineRelaunch("the session folder cannot be prepared");
       return;
     }
     size_t bytes = 0;
@@ -267,6 +273,12 @@ class DeadOrAlive4App : public rex::ReXApp {
     bool had_handoff = false;
     if (const wchar_t* h = _wgetenv(L"DOA4_NP_HANDOFF"); h && *h) {
       had_handoff = true;
+      {  // carry 2b: the config file as it was before any host setting is applied
+        std::error_code ec;
+        std::ifstream f(ConfigPath(), std::ios::binary);
+        if (f) toml_snapshot_ = std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        toml_had_ = bool(f) || std::filesystem::exists(ConfigPath(), ec);
+      }
       const std::filesystem::path path(h);
       SetEnvironmentVariableW(L"DOA4_NP_HANDOFF", nullptr);  // the offline relaunch at the end must not inherit it
       _wputenv(L"DOA4_NP_HANDOFF=");
@@ -274,14 +286,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     }
     doa4::np::SetSwitchContext(session_.has_value(), !test_dir_.empty());
     doa4::np::PrepareReplayRules();
-    if (session_) {  // carry 2b: the config file as it was; a session never saves host-imposed values
-      std::error_code ec;
-      std::ifstream f(ConfigPath(), std::ios::binary);
-      if (f) toml_snapshot_ = std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-      toml_had_ = bool(f) || std::filesystem::exists(ConfigPath(), ec);
-    }
     if (!test_dir_.empty()) {
-      const char* kind = session_ ? "session" : (had_handoff || AfterSession()) ? "offline" : "lobby";
+      const char* kind = (session_ || launch_refused_) ? "session" : (had_handoff || AfterSession()) ? "offline" : "lobby";
       std::error_code ec;
       std::filesystem::create_directories(test_dir_, ec);
       std::ofstream out(test_dir_ / "pids.txt", std::ios::binary | std::ios::app);
@@ -290,6 +296,22 @@ class DeadOrAlive4App : public rex::ReXApp {
                  std::chrono::system_clock::now().time_since_epoch()).count()
           << '\n';
     }
+    // fix round M2: like DOA4_WAIT_PID, the marker is for this process only (its own relaunches start clean)
+    SetEnvironmentVariableW(L"DOA4_NP_AFTER_SESSION", nullptr);
+    _wputenv(L"DOA4_NP_AFTER_SESSION=");
+  }
+
+  // Fix round I1/I2: a session start that fails once a host-imposed value was applied (or once the redirect is known
+  // wrong) never continues in this process: the offline relaunch (a clean process, DOA4_WAIT_PID) starts now, and this
+  // process never builds the runtime (OnFinalizePaths) or never launches the module (OnPreLaunchModule).
+  void AbortIntoOfflineRelaunch(const std::string& why) {
+    launch_refused_ = true;
+    guest_touched_ = true;
+    std::string e;
+    if (!doa4::np::restart::Relaunch(nullptr, true, &e)) {
+      REXLOG_ERROR("[doa4][NET] offline relaunch failed: {}", e);
+    }
+    REXLOG_WARN("[doa4][NET] session start aborted ({}): offline relaunch started, this process quits", why);
   }
 
   static bool AfterSession() {
@@ -332,11 +354,19 @@ class DeadOrAlive4App : public rex::ReXApp {
     // init-only cvars (rexcrt_heap_*) can still be set here, before the runtime exists; ApplyGuestSettings validates
     // the whole text before it sets anything.
     std::string why;
-    if (!doa4::np::ApplyGuestText(h.guest_settings, &why)) {
+    bool touched = false;
+    if (!doa4::np::ApplyGuestText(h.guest_settings, &why, &touched)) {
+      if (!touched) {  // refused before any set: this process is still the player's own, it starts offline
+        doa4::np::EarlyLog("[doa4][NET] WARN session: the host's guest settings were refused (" + why +
+                           "): the session does not start; starting offline");
+        return;
+      }
       doa4::np::EarlyLog("[doa4][NET] WARN session: the host's guest settings did not take (" + why +
-                         "): the session does not start; starting offline");
+                         ") after some were set: relaunching offline");
+      AbortIntoOfflineRelaunch("guest settings");
       return;
     }
+    guest_touched_ = true;
     doa4::np::EarlyLog(fmt::format("[doa4][NET] hand-off read: {}, delay {}, {} save files; the session starts",
                                    h.role == doa4::np::handoff::Role::kHost ? "host" : "joiner", int(h.delay),
                                    h.files.size()));
@@ -417,15 +447,14 @@ class DeadOrAlive4App : public rex::ReXApp {
     namespace restart = doa4::np::restart;
     // The redirect proof (#0282): the RUNTIME's user data (the root the content manager mounts), not the app's variable.
     rex::Runtime* rt = runtime();
-    const std::filesystem::path runtime_ud = rt ? std::filesystem::absolute(rt->user_data_root()).lexically_normal()
-                                                : std::filesystem::path();
-    const std::filesystem::path want = std::filesystem::absolute(session_user_data_).lexically_normal();
-    if (session_user_data_.empty() || runtime_ud != want) {
-      REXLOG_WARN("[doa4][NET] WARN session: user data is {}, not the session folder {}: restarting offline",
-                  doa4::Utf8Generic(runtime_ud), doa4::Utf8Generic(want));
-      RelaunchOffline();
+    const std::filesystem::path runtime_ud = rt ? rt->user_data_root() : std::filesystem::path();
+    if (!restart::RedirectHolds(runtime_ud, session_user_data_)) {
+      REXLOG_WARN("[doa4][NET] WARN session: user data is {}, not the session folder {}: relaunching offline",
+                  doa4::Utf8Generic(runtime_ud), doa4::Utf8Generic(session_user_data_));
+      AbortIntoOfflineRelaunch("the user-data redirect did not take");
       return;
     }
+    REXLOG_INFO("[doa4][NET] redirect verified: the runtime's user data is {}", doa4::Utf8Generic(runtime_ud));
     const bool is_host = session_->role == doa4::np::handoff::Role::kHost;
     const std::filesystem::path dir = restart::SessionDir(user_data_, test_dir_, is_host, std::time(nullptr));
     std::string error;
@@ -457,6 +486,10 @@ class DeadOrAlive4App : public rex::ReXApp {
         const std::filesystem::path h = restart::HandoffPath(user_data_);
         if (!restart::Relaunch(with_handoff ? &h : nullptr, !with_handoff, &e)) {
           REXLOG_ERROR("[doa4][NET] relaunch failed: {}", e);
+          if (with_handoff) {  // fix round M5: no hand-off is left for a later start to pick up
+            std::error_code ec;
+            std::filesystem::remove(h, ec);
+          }
         }
         app_context().QuitFromUIThread();
       });
@@ -553,7 +586,11 @@ class DeadOrAlive4App : public rex::ReXApp {
       app_context().CallInUIThreadDeferred([this] {
         std::string e;
         const std::filesystem::path h = doa4::np::restart::HandoffPath(user_data_);
-        if (!doa4::np::restart::Relaunch(&h, false, &e)) REXLOG_ERROR("[doa4][NET] relaunch into the session failed: {}", e);
+        if (!doa4::np::restart::Relaunch(&h, false, &e)) {
+          REXLOG_ERROR("[doa4][NET] relaunch into the session failed: {}", e);
+          std::error_code ec;
+          std::filesystem::remove(h, ec);  // fix round M5
+        }
         app_context().QuitFromUIThread();
       });
     };
@@ -636,6 +673,11 @@ class DeadOrAlive4App : public rex::ReXApp {
     }
   }
   void OnPreLaunchModule() override {
+    if (launch_refused_) {  // fix round I2: the guest never runs on the wrong user data (the module is not launched)
+      REXLOG_WARN("[doa4][NET] module launch refused: the session start was aborted; this process ends now");
+      if (auto l = ::rex::GetLogger()) l->flush();
+      TerminateProcess(GetCurrentProcess(), 0);
+    }
     REXLOG_INFO("[doa4][LIFE] OnPreLaunchModule: about to spawn main guest thread");
   }
   void OnPostLaunchModule(rex::system::XThread* thread) override {
@@ -648,7 +690,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
-    if (session_) CheckConfigUnchanged();  // carry 2b, while np_log is still open
+    if (session_ || guest_touched_) CheckConfigUnchanged();  // carry 2b, while np_log is still open
     // first: the session's writer captures frames through the presenter; np::Shutdown stops the session's transport
     // before anything else (Stop is bounded by 200 ms, Task 7)
     doa4::np::Shutdown();
@@ -936,6 +978,10 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.save_dir = SaveFolder();
     host.backup_root = BackupFolder();
     host.extras = &extras_;
+    host.refuse = [this](std::string_view action, std::string* status) {
+      return doa4::RefuseInSession(session_.has_value(), action, status,
+                                   [](const std::string& line) { REXLOG_INFO("{}", line); });
+    };
     host.game_files = game_files_;
     host.game_files_from_command_line = game_files_from_command_line_;
     host.user_data = UserData();
@@ -985,9 +1031,13 @@ class DeadOrAlive4App : public rex::ReXApp {
       }
     }
     if (has == toml_had_ && now == toml_snapshot_) return;
-    if (toml_had_) {
-      std::ofstream out(ConfigPath(), std::ios::binary | std::ios::trunc);
-      out << toml_snapshot_;
+    if (toml_had_) {  // fix round M3: a temp file, then a rename over the config
+      const std::filesystem::path tmp = ConfigPath().wstring() + L".np_restore";
+      {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out << toml_snapshot_;
+      }
+      MoveFileExW(tmp.c_str(), ConfigPath().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     } else {
       std::filesystem::remove(ConfigPath(), ec);
     }
@@ -1005,6 +1055,8 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::atomic<bool> lobby_watch_stop_{false};
   std::string toml_snapshot_;
   bool toml_had_ = false;
+  bool guest_touched_ = false;   // a host-imposed setting was applied in this process (fix round I1)
+  bool launch_refused_ = false;  // the session start was aborted: no runtime / no module launch (I1, I2)
 
   // First-run setup (doa4_setup_dialog.h): the screen while it is open, and
   // the folder the game started from.

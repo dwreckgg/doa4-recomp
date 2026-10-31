@@ -2,6 +2,7 @@
 #include "np_restart.h"
 
 #include <cstdio>
+#include <cwctype>
 #include <fstream>
 #include <system_error>
 
@@ -28,6 +29,24 @@ fs::path SessionDir(const fs::path& user_data, const fs::path& test_dir, bool ho
   std::snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d_%s", local.tm_year + 1900, local.tm_mon + 1,
                 local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec, host ? "host" : "joiner");
   return user_data / "netplay" / "sessions" / name;
+}
+
+bool RedirectHolds(const fs::path& runtime_user_data, const fs::path& session_user_data) {
+  if (runtime_user_data.empty() || session_user_data.empty()) return false;
+  auto norm = [](const fs::path& p) {
+    std::error_code ec;
+    fs::path a = fs::absolute(p, ec);
+    if (ec) a = p;
+    std::wstring s = a.lexically_normal().generic_wstring();
+    while (s.size() > 3 && s.back() == L'/') s.pop_back();
+    for (wchar_t& c : s) c = wchar_t(towlower(c));
+    return s;
+  };
+  return norm(runtime_user_data) == norm(session_user_data);
+}
+
+bool KnownUnregisteredSetting(std::string_view name) {
+  return name == "kernel_pix" || name == "vulkan_readback_resolve" || name == "vulkan_readback_memexport";
 }
 
 namespace {

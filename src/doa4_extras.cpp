@@ -122,4 +122,12 @@ const char* UnsavedUnlocksWarning(const ExtrasState& state) {
              : nullptr;
 }
 
+bool RefuseInSession(bool in_session, std::string_view action, std::string* status,
+                     const std::function<void(const std::string&)>& log) {
+  if (!in_session) return false;
+  if (status) *status = "Not during an online session";
+  if (log) log("[doa4][NET] menu: refused " + std::string(action) + " in session");
+  return true;
+}
+
 }  // namespace doa4

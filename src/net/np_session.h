@@ -103,7 +103,11 @@ void EarlyLog(const std::string& line);
 // Applies a guest settings text (handoff::ApplyGuestSettings through rex::cvar::SetFlagByName), then reads every name
 // back and logs "[doa4][NET] guest setting <name>=<value> (read back <value>)". False (and *why) when the text is
 // refused or any read-back differs ("WARN session: guest setting ..." logged).
-bool ApplyGuestText(const std::string& text, std::string* why);
+// *touched (may be null): whether any setting was set before the outcome (fix round I1: a failure after a set means
+// this process holds host-imposed values and must not go on). Only the three KnownUnregisteredSetting names
+// (np_restart.h) are skipped when the registry does not know them; they are recorded in the session meta
+// (guest_skipped=).
+bool ApplyGuestText(const std::string& text, std::string* why, bool* touched);
 // Replay parity (R21): at OnPostInitLogging, a replay (DOA4_NP=replay) reads its recording's meta and applies the
 // recording's guest settings (when it has any) exactly as a session does; the unlock (meta unlock=1) runs in the frame
 // hook. No-op otherwise.

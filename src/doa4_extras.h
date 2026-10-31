@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -61,5 +62,12 @@ void PollSaved(const GuestBytes& guest, const std::filesystem::path& save_dir,
 // The warning shown beside "Restart now" while unlocks are not saved yet
 // (a restart loses them), or nullptr.
 const char* UnsavedUnlocksWarning(const ExtrasState& state);
+
+// Netplay (Task 12 fix round I3): in an online session the Extras actions (an unlock, a tweak toggle: they would act
+// on the player's real save folder and change guest tables mid-session) are refused. True = refused: *status gets
+// "Not during an online session" and `log` gets "[doa4][NET] menu: refused <action> in session". False = go ahead
+// (nothing written).
+bool RefuseInSession(bool in_session, std::string_view action, std::string* status,
+                     const std::function<void(const std::string&)>& log);
 
 }  // namespace doa4
