@@ -1,0 +1,17 @@
+@echo off
+rem Builds and runs the session restart host test with clang-cl (no CMake): np_restart.cpp over np_handoff.cpp (NameOk),
+rem np_rules.cpp, np_wire.cpp and doa4_tweaks.cpp. Files only under %TEMP%\doa4_np_restart_<pid>\ (removed at the end).
+rem NP_RESTART_OUT (optional) names the output folder; the mutation probes use it so that they never share one.
+setlocal
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
+set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined NP_RESTART_OUT set "NP_RESTART_OUT=%TEMP%\doa4_np_restart_test"
+set "OUT=%NP_RESTART_OUT%"
+if not exist "%OUT%" mkdir "%OUT%"
+if exist "%OUT%\np_restart_host_test.exe" del "%OUT%\np_restart_host_test.exe"
+clang-cl /nologo /std:c++latest /EHsc /O2 /D_MSVC_STL_HARDENING=1 "%~dp0np_restart_host_test.cpp" "%~dp0..\..\src\net\np_restart.cpp" "%~dp0..\..\src\net\np_handoff.cpp" "%~dp0..\..\src\net\np_rules.cpp" "%~dp0..\..\src\net\np_wire.cpp" "%~dp0..\..\src\doa4_tweaks.cpp" /Fo"%OUT%\\" /Fe"%OUT%\np_restart_host_test.exe"
+if errorlevel 1 (
+  echo BUILD FAILED
+  exit /b 1
+)
+"%OUT%\np_restart_host_test.exe"

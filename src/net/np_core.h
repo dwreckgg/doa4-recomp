@@ -303,4 +303,13 @@ enum class ReaderWait {
 // thread; ended = that host thread ended within the wait (only read when found).
 ReaderWait ReaderOutcome(int32_t ret, bool found, bool ended);
 
+// ---- Task 12: the session's MXCSR watch (R10) and the test-switch gate (R22) ----
+// True when the MXCSR control bits (6..15: DAZ, the exception masks, rounding, FTZ) differ; the status flags (0..5)
+// are sticky exception flags any arithmetic sets and never count.
+bool MxcsrControlDiffers(uint32_t a, uint32_t b);
+// The phase-0 test switches (DOA4_NP_FIX, _SERIAL, _MAIN_WAIT_MS, _WATCH, _TRACE, _EXTRA_REGIONS) are read offline
+// (record / replay) and, in an online session, only when DOA4_NP_TEST_DIR is set: a player's environment cannot
+// change a session's determinism layer.
+bool SwitchesAllowed(bool online, bool test_dir);
+
 }  // namespace doa4::np

@@ -58,7 +58,13 @@
 #include "doa4_tweaks.h"
 #include "doa4_unlocks.h"
 #include "doa4_utf8.h"
+#include "net/np_files.h"
+#include "net/np_handoff.h"
+#include "net/np_online.h"
+#include "net/np_restart.h"
 #include "net/np_session.h"
+#include "net/np_transport.h"
+#include "net/np_upnp.h"
 
 REXCVAR_DECLARE(bool, log_noisy);
 
@@ -136,7 +142,33 @@ class DeadOrAlive4App : public rex::ReXApp {
     static constexpr const char* kSource[] = {"--user_data_root", "doa4_user_data", "default"};
     REXLOG_INFO("[doa4][SETUP] user data: {} ({}), cache {}", doa4::Utf8(user_data_),
                 kSource[int(choice.source)], doa4::Utf8(paths.cache_root));
+    if (session_) RedirectUserData(&paths);
     return paths;
+  }
+
+  // Netplay (Task 12): a process started for an online session runs the guest on <U>/netplay/session, a folder
+  // cleared and filled with the host's save. Only the RUNTIME is redirected: user_data_ keeps <U> (the pre-redirect
+  // root), which every app-side reader of UserData() reads (photos, the menu, the save backups), and the session's
+  // own folders are built from it. The cache stays the player's (<U>/cache or cache_path). A folder that cannot be
+  // cleared or written leaves the session off: the process starts offline on <U>.
+  void RedirectUserData(rex::PathConfig* paths) {
+    namespace restart = doa4::np::restart;
+    const std::filesystem::path session = restart::SessionUserData(user_data_);
+    std::string error;
+    if (!restart::ClearFolder(session, &error) || !restart::WriteSaveFiles(session, session_->files, &error)) {
+      REXLOG_WARN("[doa4][NET] WARN session: the session folder {} cannot be prepared ({}): starting offline",
+                  doa4::Utf8(session), error);
+      session_.reset();
+      return;
+    }
+    size_t bytes = 0;
+    for (const doa4::np::handoff::File& f : session_->files) bytes += f.data.size();
+    paths->user_data_root = session;
+    session_user_data_ = session;
+    const std::string line =
+        fmt::format("[doa4][NET] session user data: {} (save from the host: {} files, {} bytes), cache {}",
+                    doa4::Utf8Generic(session), session_->files.size(), bytes, doa4::Utf8Generic(paths->cache_root));
+    doa4::np::EarlyLog(line);
   }
 
   const std::filesystem::path& UserData() const {
@@ -217,6 +249,98 @@ class DeadOrAlive4App : public rex::ReXApp {
     // The netplay release identity (CMakeLists.txt: DOA4_RELEASE_*; "dev" for local builds). A [LIFE] line, so an
     // offline run still has no [NET]/[NP] line (gate S9); plan 1b reads it.
     REXLOG_INFO("[doa4][LIFE] version {} ({} releases of {})", DOA4_RELEASE_TAG, DOA4_RELEASE_CHANNEL, DOA4_RELEASE_REPO);
+    // Task 10 review I4 (carry 2k): how this process was asked to show its window (a relaunch passes it on).
+    {
+      STARTUPINFOW si{};
+      si.cb = sizeof si;
+      GetStartupInfoW(&si);
+      REXLOG_INFO("[doa4][LIFE] started show_window={}", (si.dwFlags & STARTF_USESHOWWINDOW) ? int(si.wShowWindow) : -1);
+    }
+    NetplayAtStart();
+  }
+
+  // Netplay (Task 12), before the runtime and the game's first thread: the test dir, the hand-off of a session process
+  // (read, deleted, the variable cleared, its build checked, the host's guest settings applied and read back), the
+  // switch gate (R22), a replay's recording rules (R21) and the pids.txt line.
+  void NetplayAtStart() {
+    if (const char* t = std::getenv("DOA4_NP_TEST_DIR"); t && *t) test_dir_ = doa4::PathFromUtf8(t);
+    bool had_handoff = false;
+    if (const wchar_t* h = _wgetenv(L"DOA4_NP_HANDOFF"); h && *h) {
+      had_handoff = true;
+      const std::filesystem::path path(h);
+      SetEnvironmentVariableW(L"DOA4_NP_HANDOFF", nullptr);  // the offline relaunch at the end must not inherit it
+      _wputenv(L"DOA4_NP_HANDOFF=");
+      ReadHandoff(path);
+    }
+    doa4::np::SetSwitchContext(session_.has_value(), !test_dir_.empty());
+    doa4::np::PrepareReplayRules();
+    if (session_) {  // carry 2b: the config file as it was; a session never saves host-imposed values
+      std::error_code ec;
+      std::ifstream f(ConfigPath(), std::ios::binary);
+      if (f) toml_snapshot_ = std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+      toml_had_ = bool(f) || std::filesystem::exists(ConfigPath(), ec);
+    }
+    if (!test_dir_.empty()) {
+      const char* kind = session_ ? "session" : (had_handoff || AfterSession()) ? "offline" : "lobby";
+      std::error_code ec;
+      std::filesystem::create_directories(test_dir_, ec);
+      std::ofstream out(test_dir_ / "pids.txt", std::ios::binary | std::ios::app);
+      out << "pid " << GetCurrentProcessId() << ' ' << kind << ' '
+          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count()
+          << '\n';
+    }
+  }
+
+  static bool AfterSession() {
+    const char* a = std::getenv("DOA4_NP_AFTER_SESSION");
+    return a && a[0] == '1';
+  }
+
+  // The hand-off of a session process: read and delete the file (one restart per hand-off), unpack, check the build,
+  // apply the host's guest settings. Anything wrong: this process starts offline (the peer gives up after 60 s).
+  void ReadHandoff(const std::filesystem::path& path) {
+    std::vector<uint8_t> bytes;
+    {
+      HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (h != INVALID_HANDLE_VALUE) {
+        uint8_t buf[65536];
+        DWORD n = 0;
+        while (::ReadFile(h, buf, sizeof buf, &n, nullptr) && n > 0) bytes.insert(bytes.end(), buf, buf + n);
+        CloseHandle(h);
+      }
+      DeleteFileW(path.c_str());
+    }
+    if (bytes.empty()) {
+      doa4::np::EarlyLog(fmt::format("[doa4][NET] hand-off {} unreadable: starting offline", doa4::Utf8Generic(path)));
+      return;
+    }
+    doa4::np::handoff::Handoff h;
+    if (const std::string err = doa4::np::handoff::Unpack(bytes, &h); !err.empty()) {
+      doa4::np::EarlyLog(fmt::format("[doa4][NET] hand-off {} unreadable ({}): starting offline",
+                                     doa4::Utf8Generic(path), err));
+      return;
+    }
+    const uint64_t own = doa4::np::BuildIdValue();
+    if (h.build != own || own == 0) {
+      doa4::np::EarlyLog(fmt::format("[doa4][NET] WARN session: the hand-off's build {:016x} is not this exe's {:016x}: "
+                                     "starting offline", h.build, own));
+      return;
+    }
+    // carry 2b: the SDK never calls rex::cvar::FinalizeInit (sdk-np1 src/core/cvar.cpp: defined, no caller), so the
+    // init-only cvars (rexcrt_heap_*) can still be set here, before the runtime exists; ApplyGuestSettings validates
+    // the whole text before it sets anything.
+    std::string why;
+    if (!doa4::np::ApplyGuestText(h.guest_settings, &why)) {
+      doa4::np::EarlyLog("[doa4][NET] WARN session: the host's guest settings did not take (" + why +
+                         "): the session does not start; starting offline");
+      return;
+    }
+    doa4::np::EarlyLog(fmt::format("[doa4][NET] hand-off read: {}, delay {}, {} save files; the session starts",
+                                   h.role == doa4::np::handoff::Role::kHost ? "host" : "joiner", int(h.delay),
+                                   h.files.size()));
+    session_ = std::move(h);
   }
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
@@ -236,6 +360,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     MountDiscRoot();
     MountCacheDevice();
     StartThreadSnapshotter();
+    StartTestLobbyWatch();  // netplay: DOA4_NP_TEST_DIR only (np_ctl.on creates the lobby)
 
     // Photo/snapshot capture reads the rendered frame back from GUEST memory.
     // rexglue's GPU defaults readback_resolve="none", so render-to-texture
@@ -268,7 +393,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     StartNetplaySession();   // DOA4_NP only: record / replay / hash from the first frame
   }
 
-  // Netplay phase 0 (src/net/np_session.h): inert unless DOA4_NP is set.
+  // Netplay phase 0 (src/net/np_session.h): inert unless DOA4_NP is set; phase 1 (Task 12): the online session of a
+  // process started from a hand-off.
   void StartNetplaySession() {
     doa4::np::Host host;
     host.capture = [this](doa4::photo::Image* image) { return CaptureFrame(image); };
@@ -279,7 +405,235 @@ class DeadOrAlive4App : public rex::ReXApp {
     // setup chose: the session hashes its default.xex into the recording's meta.
     if (auto* rt = runtime()) host.game_data_root = std::filesystem::absolute(rt->game_data_root());
     if (host.game_data_root.empty()) host.game_data_root = game_files_;
+    host.guest = guest_ready_ ? &guest_ : nullptr;  // the unlock of a session, and of a replay of one (R21)
+    if (!session_) {
+      doa4::np::Start(std::move(host));
+      return;
+    }
+    StartOnlineSession(std::move(host));
+  }
+
+  void StartOnlineSession(doa4::np::Host host) {
+    namespace restart = doa4::np::restart;
+    // The redirect proof (#0282): the RUNTIME's user data (the root the content manager mounts), not the app's variable.
+    rex::Runtime* rt = runtime();
+    const std::filesystem::path runtime_ud = rt ? std::filesystem::absolute(rt->user_data_root()).lexically_normal()
+                                                : std::filesystem::path();
+    const std::filesystem::path want = std::filesystem::absolute(session_user_data_).lexically_normal();
+    if (session_user_data_.empty() || runtime_ud != want) {
+      REXLOG_WARN("[doa4][NET] WARN session: user data is {}, not the session folder {}: restarting offline",
+                  doa4::Utf8Generic(runtime_ud), doa4::Utf8Generic(want));
+      RelaunchOffline();
+      return;
+    }
+    const bool is_host = session_->role == doa4::np::handoff::Role::kHost;
+    const std::filesystem::path dir = restart::SessionDir(user_data_, test_dir_, is_host, std::time(nullptr));
+    std::string error;
+    if (!restart::ClearFolder(dir, &error)) {
+      REXLOG_WARN("[doa4][NET] WARN session: the session folder {} cannot be prepared ({}): restarting offline",
+                  doa4::Utf8Generic(dir), error);
+      RelaunchOffline();
+      return;
+    }
+    // the save an offline replay of this session starts from (the session's user data without the cache)
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(dir / "ud_start", ec);
+      for (const auto& e : std::filesystem::directory_iterator(session_user_data_, ec)) {
+        if (e.path().filename() == "cache") continue;
+        std::filesystem::copy(e.path(), dir / "ud_start" / e.path().filename(),
+                              std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+                              ec);
+      }
+    }
+    host.online = *session_;
+    host.session_dir = dir;
+    host.test_dir = test_dir_;
+    host.release = DOA4_RELEASE_TAG;
+    host.read_local_pad = [this](doa4::np::Pad* pad) { return ReadLocalPad(pad); };
+    host.restart = [this](bool with_handoff) {
+      app_context().CallInUIThreadDeferred([this, with_handoff] {
+        std::string e;
+        const std::filesystem::path h = restart::HandoffPath(user_data_);
+        if (!restart::Relaunch(with_handoff ? &h : nullptr, !with_handoff, &e)) {
+          REXLOG_ERROR("[doa4][NET] relaunch failed: {}", e);
+        }
+        app_context().QuitFromUIThread();
+      });
+    };
+    host.overlay_changed = [] {};  // the Online tab and the banner arrive with Task 14
+    host.send_leave = [this](int32_t frame, doa4::np::wire::LeaveReason reason) {
+      if (lobby_) lobby_->SendLeave(frame, reason);
+    };
+    host.transport = [this]() -> doa4::np::net::Transport* { return lobby_ ? &lobby_->transport() : nullptr; };
+    host.session_refused = [this] { return lobby_ && lobby_->status().session_refused; };
+    host.stop_transport = [this] {
+      if (lobby_) lobby_->transport().Stop();
+    };
+    const doa4::np::handoff::Handoff h = *session_;
     doa4::np::Start(std::move(host));
+    // the session lobby: exactly the hand-off's port, Wi-Fi media streaming on (session processes only)
+    doa4::np::net::Config cfg = NetConfig();
+    cfg.wifi_streaming = true;
+    lobby_ = std::make_unique<doa4::np::online::Lobby>();
+    doa4::np::online::Providers p = LobbyProviders(/*session=*/true);
+    if (!lobby_->StartInSession(std::move(p), cfg, h,
+                                [](int32_t frame, doa4::np::wire::LeaveReason reason) { doa4::np::PeerLeft(frame, reason); },
+                                &error)) {
+      doa4::np::LogLine("WARN session: could not open UDP port " + std::to_string(h.local_port) + " (" + error + ")");
+      REXLOG_WARN("[doa4][NET] banner: could not open UDP port {}", h.local_port);
+      doa4::np::Abort("could not open UDP port " + std::to_string(h.local_port));
+    }
+  }
+
+  // InputSystem::GetState(0): what XamInputGetState returns for user 0 (the session's local pad without a test script).
+  bool ReadLocalPad(doa4::np::Pad* pad) {
+    if (menu_open_.load(std::memory_order_acquire) || setup_open_.load(std::memory_order_acquire)) return false;
+    rex::Runtime* rt = runtime();
+    auto* input = rt ? dynamic_cast<rex::input::InputSystem*>(rt->input_system()) : nullptr;
+    if (!input) return false;
+    rex::input::X_INPUT_STATE state{};
+    if (input->GetState(0, &state) != 0) return false;
+    *pad = doa4::np::PadFromGuest(reinterpret_cast<const uint8_t*>(&state.gamepad));
+    return true;
+  }
+
+  void RelaunchOffline() {
+    app_context().CallInUIThreadDeferred([this] {
+      std::string e;
+      if (!doa4::np::restart::Relaunch(nullptr, true, &e)) REXLOG_ERROR("[doa4][NET] relaunch failed: {}", e);
+      app_context().QuitFromUIThread();
+    });
+  }
+
+  // net::Config from the settings cvars and, with a test dir only, the harness switches (R11).
+  doa4::np::net::Config NetConfig() const {
+    namespace net = doa4::np::net;
+    net::Config cfg;
+    cfg.port = uint16_t(rex::cvar::Query<uint32_t>("netplay_port"));
+    cfg.upnp = rex::cvar::Query<bool>("netplay_upnp");
+    if (!test_dir_.empty()) {
+      auto env = [](const char* n) {
+        const char* v = std::getenv(n);
+        return std::string(v ? v : "");
+      };
+      if (env("DOA4_NP_BIND") == "loopback") {
+        cfg.loopback = true;
+        cfg.lan_broadcast = false;
+      }
+      if (env("DOA4_NP_STUN") == "off") cfg.stun = false;
+      if (env("DOA4_NP_UPNP") == "off") cfg.upnp = false;
+      cfg.sim = env("DOA4_NP_SIM");
+      if (const std::string d = env("DOA4_NP_SIM_DROP"); !d.empty()) {
+        if (!net::sim::ParseDrop(d, &cfg.sim_drop)) REXLOG_WARN("[doa4][NET] DOA4_NP_SIM_DROP '{}' ignored", d);
+      }
+    }
+    if (cfg.loopback) cfg.upnp = false;  // carry 2g: no router mapping for a loopback socket
+    return cfg;
+  }
+
+  // The lobby's providers (Task 9's interface). In a session process the lobby and transport log into np_log (a
+  // transport WARN line fails the run).
+  doa4::np::online::Providers LobbyProviders(bool session) {
+    namespace online = doa4::np::online;
+    namespace restart = doa4::np::restart;
+    online::Providers p;
+    p.build = [] { return doa4::np::BuildIdValue(); };
+    p.release = DOA4_RELEASE_TAG;
+    const std::filesystem::path files_dir = game_files_;
+    p.files = [files_dir] { return doa4::np::files::Text(doa4::np::files::Fingerprint(files_dir)); };
+    p.guest_settings = [] {
+      return doa4::np::handoff::CaptureGuestSettings(
+          [](const std::string& name) { return rex::cvar::Query<std::string>(name); });
+    };
+    const std::filesystem::path real = user_data_;
+    p.save_files = [real](std::string* error) { return SaveFilesOf(real, error); };
+    p.handoff_path = restart::HandoffPath(user_data_);
+    p.restart_into_session = [this] {
+      app_context().CallInUIThreadDeferred([this] {
+        std::string e;
+        const std::filesystem::path h = doa4::np::restart::HandoffPath(user_data_);
+        if (!doa4::np::restart::Relaunch(&h, false, &e)) REXLOG_ERROR("[doa4][NET] relaunch into the session failed: {}", e);
+        app_context().QuitFromUIThread();
+      });
+    };
+    p.events_path = user_data_ / "netplay" / "events.txt";
+    p.test_dir = test_dir_;
+    if (!test_dir_.empty()) {
+      for (const char* n : {"DOA4_NP_SEED", "DOA4_NP_DELAY", "DOA4_NP_TEST_BUILD_SALT", "DOA4_NP_TEST_FILES_SALT"}) {
+        if (const char* v = std::getenv(n); v && *v) p.test[n] = v;
+      }
+    }
+    if (session) {
+      p.log = [](const std::string& line) { doa4::np::LogLine(line); };
+    } else {
+      p.log = [](const std::string& line) { REXLOG_INFO("{}", line); };
+    }
+    return p;
+  }
+
+  // The host's save: every file below <U>/B13EBABEBABEBABE/544307D1/, named from <U> with '/' separators.
+  static std::vector<doa4::np::handoff::File> SaveFilesOf(const std::filesystem::path& real, std::string* error) {
+    std::vector<doa4::np::handoff::File> out;
+    const std::filesystem::path root = real / "B13EBABEBABEBABE" / "544307D1";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) {
+      *error = "no save folder " + doa4::Utf8Generic(root);
+      return out;
+    }
+    for (auto it = std::filesystem::recursive_directory_iterator(root, ec); !ec && it != std::filesystem::recursive_directory_iterator();
+         it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      doa4::np::handoff::File f;
+      f.name = std::string(doa4::np::handoff::kSavePrefix) +
+               doa4::Utf8Generic(std::filesystem::relative(it->path(), root, ec));
+      std::ifstream in(it->path(), std::ios::binary);
+      f.data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+      out.push_back(std::move(f));
+    }
+    if (ec) *error = "cannot list " + doa4::Utf8Generic(root);
+    return out;
+  }
+
+  // With a test dir (DOA4_NP_TEST_DIR), in a process that is not a session: the harness drives the lobby through
+  // np_ctl.on. status.txt says "offline" at once (np_pair waits for it); the lobby is created when the first request
+  // file arrives (spec 4: no socket before that), and its own I/O thread polls from then on.
+  void StartTestLobbyWatch() {
+    if (test_dir_.empty() || session_) return;
+    {
+      const std::string text = "state=offline\nport=0\npeer_port=0\nping=0.0\ndelay=" +
+                               std::to_string(rex::cvar::Query<int32_t>("netplay_delay")) +
+                               "\ncan_start=0\nevent=\nrefusal=none\n";
+      const std::filesystem::path tmp = test_dir_ / "status.tmp", dst = test_dir_ / "status.txt";
+      {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << text;
+      }
+      MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+    lobby_watch_ = std::thread([this] {
+      using namespace std::chrono_literals;
+      while (!lobby_watch_stop_.load(std::memory_order_acquire)) {
+        std::error_code ec;
+        if (std::filesystem::exists(test_dir_ / "np_ctl.on", ec)) {
+          app_context().CallInUIThreadDeferred([this] { EnsureLobby(); });
+          return;
+        }
+        std::this_thread::sleep_for(100ms);
+      }
+    });
+  }
+
+  // The Online tab (Task 14) or the first np_ctl.on: the lobby, created once.
+  void EnsureLobby() {
+    if (lobby_ || session_) return;
+    lobby_ = std::make_unique<doa4::np::online::Lobby>();
+    std::string error;
+    if (!lobby_->Start(LobbyProviders(false), NetConfig(), &error)) {
+      REXLOG_WARN("[doa4][NET] the lobby could not start: {}", error);
+    } else {
+      REXLOG_INFO("[doa4][NET] lobby started on port {}", lobby_->status().port);
+    }
   }
   void OnPreLaunchModule() override {
     REXLOG_INFO("[doa4][LIFE] OnPreLaunchModule: about to spawn main guest thread");
@@ -294,7 +648,18 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
-    doa4::np::Shutdown();  // first: the session's writer captures frames through the presenter
+    if (session_) CheckConfigUnchanged();  // carry 2b, while np_log is still open
+    // first: the session's writer captures frames through the presenter; np::Shutdown stops the session's transport
+    // before anything else (Stop is bounded by 200 ms, Task 7)
+    doa4::np::Shutdown();
+    // np::Shutdown returns at once without a session (a lobby process): the lobby is stopped here, whenever one exists.
+    // Budget under the 5 s watchdog (#0321): shot drain (1.9 s for 36 shots) + transport 200 ms + lobby 200 ms + UPnP 2 s.
+    lobby_watch_stop_.store(true, std::memory_order_release);
+    if (lobby_watch_.joinable()) lobby_watch_.join();
+    if (lobby_) {
+      lobby_->Stop();  // idempotent: in a session process its transport is already stopped
+      if (NetConfig().upnp) doa4::np::upnp::Shutdown(2000);  // Task 7's contract: the router mapping is removed
+    }
     rex::ui::UnregisterBind("bind_doa4_menu");
     rex::ui::UnregisterBind("bind_doa4_photo");
     photo_closing_.store(true, std::memory_order_release);
@@ -605,7 +970,42 @@ class DeadOrAlive4App : public rex::ReXApp {
     }
   }
 
+  // Carry 2b: a session applies the host's guest settings to the cvars; nothing may save them into the player's config
+  // (the settings overlay's "Save to config", a menu save). The file must be byte-identical after the session: if it is
+  // not, the snapshot taken at OnPostInitLogging is written back and a WARN line goes to np_log (the harness fails it).
+  void CheckConfigUnchanged() {
+    std::error_code ec;
+    std::string now;
+    bool has = false;
+    {
+      std::ifstream f(ConfigPath(), std::ios::binary);
+      if (f) {
+        has = true;
+        now.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+      }
+    }
+    if (has == toml_had_ && now == toml_snapshot_) return;
+    if (toml_had_) {
+      std::ofstream out(ConfigPath(), std::ios::binary | std::ios::trunc);
+      out << toml_snapshot_;
+    } else {
+      std::filesystem::remove(ConfigPath(), ec);
+    }
+    doa4::np::LogLine("WARN session: the config file " + doa4::Utf8Generic(ConfigPath()) +
+                      " changed during the session (host-imposed settings must never be saved): restored");
+  }
+
  private:
+  // Netplay (Task 12)
+  std::filesystem::path test_dir_;                                // DOA4_NP_TEST_DIR, or empty
+  std::optional<doa4::np::handoff::Handoff> session_;             // this process was started for a session
+  std::filesystem::path session_user_data_;                       // <U>/netplay/session once the runtime is redirected
+  std::unique_ptr<doa4::np::online::Lobby> lobby_;                // the lobby, or the session lobby
+  std::thread lobby_watch_;                                       // test dir: waits for the first np_ctl.on
+  std::atomic<bool> lobby_watch_stop_{false};
+  std::string toml_snapshot_;
+  bool toml_had_ = false;
+
   // First-run setup (doa4_setup_dialog.h): the screen while it is open, and
   // the folder the game started from.
   std::unique_ptr<doa4::SetupDialog> setup_;

@@ -257,13 +257,13 @@ void ThreadCreated(uint32_t start, uint32_t tid) {
   MiddlewareThreadCreated(start);
 }
 
-std::string FixSetName() { return FixSetText(ParseFixSet(std::getenv("DOA4_NP_FIX"))); }
+std::string FixSetName() { return FixSetText(ParseFixSet(TestSwitch("DOA4_NP_FIX"))); }
 
 void Start(uint64_t seed, const std::filesystem::path& dir) {
   g_seed = seed;
   g_seeds.Reset();  // the series counts the seedings of this session
   TraceStart(dir);
-  const uint32_t fixes = ParseFixSet(std::getenv("DOA4_NP_FIX"));
+  const uint32_t fixes = ParseFixSet(TestSwitch("DOA4_NP_FIX"));
   g_fixes.store(fixes, std::memory_order_release);
   LogLine("determinism fixes: " + FixSetName());
   if (fixes & kSdkClock) rex::chrono::Clock::set_guest_time_override(&GuestTime);

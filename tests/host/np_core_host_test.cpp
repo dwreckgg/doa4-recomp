@@ -815,7 +815,26 @@ static void TestStashMask() {
   CHECK(po == pm);
 }
 
+// Task 12: the MXCSR control bits (R10: only the control bits 6..15 count; the status flags 0..5 are sticky
+// exception flags the guest's own arithmetic sets) and the R22 gate for the phase-0 test switches.
+static void TestMxcsrAndSwitches() {
+  // 0x1F80 = the default (all masked, round to nearest); 0x1FBF = the same + all six status flags (#0291 fixture)
+  CHECK(!MxcsrControlDiffers(0x1F80, 0x1FBF));
+  CHECK(!MxcsrControlDiffers(0x1FBF, 0x1F80));
+  CHECK(MxcsrControlDiffers(0x1F80, 0x9F80));   // flush-to-zero (bit 15)
+  CHECK(MxcsrControlDiffers(0x1F80, 0x1FC0));   // denormals-are-zero (bit 6): the lowest control bit
+  CHECK(MxcsrControlDiffers(0x1F80, 0x3F80));   // rounding control (bit 13)
+  CHECK(!MxcsrControlDiffers(0x1F80, 0x1F80 | 0x10000));  // above bit 15: not an MXCSR bit
+  CHECK(!MxcsrControlDiffers(0x1F80, 0x1F80));
+  // R22: the switches are read offline (phase 0 record/replay) and, in a session, only with a test dir
+  CHECK(SwitchesAllowed(false, false));
+  CHECK(SwitchesAllowed(false, true));
+  CHECK(!SwitchesAllowed(true, false));
+  CHECK(SwitchesAllowed(true, true));
+}
+
 int main() {
+  TestMxcsrAndSwitches();
   TestPadBytes();
   TestScript();
   TestRandom();

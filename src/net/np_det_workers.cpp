@@ -80,7 +80,7 @@ uint32_t g_unranked_logs = 0;
 int Mode() {
   int v = g_mode.load(std::memory_order_relaxed);
   if (v < 0) {
-    const char* e = std::getenv("DOA4_NP_SERIAL");
+    const char* e = TestSwitch("DOA4_NP_SERIAL");
     v = e && *e ? std::atoi(e) : (On(kWorkers) ? 3 : 0);
     g_mode.store(v);
     LogLine(std::string("job workers: ") +
@@ -108,7 +108,7 @@ double g_join_us = 0, g_join_max_us = 0;            // the frame's join on the w
 // control for the gate: 0 makes every wait that is not already over a counted fallback).
 std::chrono::milliseconds MainWaitTimeout() {
   static const std::chrono::milliseconds ms([] {
-    const char* e = std::getenv("DOA4_NP_MAIN_WAIT_MS");
+    const char* e = TestSwitch("DOA4_NP_MAIN_WAIT_MS");
     return e && *e ? std::atoi(e) : 2000;
   }());
   return ms;

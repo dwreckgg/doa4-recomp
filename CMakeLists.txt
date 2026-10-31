@@ -52,6 +52,8 @@ set(DEADORALIVE4_SOURCES
     src/net/np_upnp.cpp
     src/net/np_files.cpp
     src/net/np_online.cpp
+    src/net/np_live.cpp
+    src/net/np_restart.cpp
 )
 
 if(WIN32)

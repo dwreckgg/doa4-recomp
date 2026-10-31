@@ -843,6 +843,16 @@ void Lobby::Impl::HandleHello(const rules::Endpoint& from, const wire::Packet& p
     if (hosting) Drop(wire::Drop::kBody);
     return;
   }
+  if (is_host && has_peer && from == peer && hl.session_token != 0 && hl.session_token == boot.session_token &&
+      pk.token == boot.session_token && (state == State::kStarting || (state == State::kConnected && boot_late))) {
+    // Task 12 carry 2h (the Task 9 suggestion): a session Hello carrying the CURRENT boot's token from our peer proves
+    // the joiner took the hand-off and restarted (its BootReply was lost): a late yes. Restart into the session with
+    // the same hand-off instead of answering kSession. Any other token keeps the kSession answer below.
+    Log("[doa4][NET] the other player's game is already in the session (its session Hello carries this boot's token): "
+        "taken as a late yes, restarting");
+    HostRestart();
+    return;
+  }
   if (pk.token != 0 || hl.session_token != 0) {
     // I-1a: a session process's Hello (the other game restarted into a session this one never started): say so, so it
     // gives up at once instead of waiting for np_live's frame-0 limit. A stranger reply like any other (size, budget).
@@ -968,7 +978,9 @@ void Lobby::Impl::HandleSessionHello(const rules::Endpoint& from, const wire::Pa
   if (state != State::kInSession) {
     state = State::kInSession;
     t.SetPeer(sh.peer, sh.session_token);
-    Log("[doa4][NET] the other player's game is back: in session");
+    // carry 2g: the source of the first session Hello next to the hand-off's peer (NAT rebinding evidence, plan 1b)
+    Log("[doa4][NET] the other player's game is back: in session (first session Hello from " + rules::EndpointText(from) +
+        ", hand-off peer " + rules::EndpointText(sh.peer) + ")");
     SetEvent("The other player's game is back: the session runs.");
   }
   if (!session_reply_ever || now - session_reply_sent >= 100) {  // so it knows we are here too

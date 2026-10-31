@@ -208,7 +208,7 @@ struct Watch {
   std::vector<uint8_t> copy;
   uint32_t logged = 0;
   void Init() {
-    const char* e = std::getenv("DOA4_NP_WATCH");
+    const char* e = TestSwitch("DOA4_NP_WATCH");
     if (!e) return;
     lo = uint32_t(std::strtoul(e, nullptr, 16));
     const char* comma = std::strchr(e, ',');

@@ -617,4 +617,8 @@ ReaderWait ReaderOutcome(int32_t ret, bool found, bool ended) {
   return found && ended ? ReaderWait::kEnded : ReaderWait::kFallback;
 }
 
+bool MxcsrControlDiffers(uint32_t a, uint32_t b) { return ((a ^ b) & 0xFFC0) != 0; }
+
+bool SwitchesAllowed(bool online, bool test_dir) { return !online || test_dir; }
+
 }  // namespace doa4::np

@@ -1597,6 +1597,62 @@ static void TestLateBootReply() {
   CHECK(WaitFor([&] { return bs.restarts.load() == 1; }, 1000));
 }
 
+// Task 12 carry 2h: every BootReply is lost, but the joiner restarted: its session Hello (packet token and body token =
+// the boot's hand-off token) reaches the host's lobby. That is a late yes: the host restarts with the same hand-off.
+// A session Hello with another token, or with the right token from another address, keeps the kSession answer.
+static void TestLateYesBySessionHello() {
+  if (!Group("carry 2h: a session Hello with the current boot's token from the peer restarts the host (a late yes)")) return;
+  Side as("lyh_a");
+  online::Lobby a;
+  if (!StartLobby(a, as)) return;
+  a.Host(0);
+  CHECK(WaitState(a, State::kHosting, 1000));
+  FakePeer fa;
+  const uint32_t Ta = FakeJoin(fa, a, as.build);
+  CHECK(Ta != 0 && WaitCanStart(a));
+  const uint16_t ap = a.status().port;
+  a.StartSession();
+  handoff::Handoff ha;
+  CHECK(BootFrom(fa, Ta, &ha, 1000, ap));  // the transfer completes; no BootReply is ever sent
+  SleepMs(300);
+  CHECKF(a.status().state == State::kStarting && as.restarts == 0, "after the acks: %s, restarts %d",
+         online::StateName(a.status().state), as.restarts.load());
+  // (1) another token (the boot's ^ 1) from the peer: answered kSession, no restart
+  fa.Clear();
+  const uint32_t wrong = ha.session_token ^ 1u;
+  fa.Send(ap, wire::Type::kHello, wrong, HelloBody(as.build, "dev", "", 1, 2, wrong));
+  Rx w;
+  CHECK(fa.Wait(wire::Type::kWelcome, 1000, &w));
+  wire::Welcome m;
+  CHECK(wire::DecodeWelcome(w.body, &m) && m.refusal == wire::Refusal::kSession);
+  // (2) the right token from another address: answered kSession, no restart
+  FakePeer other;
+  other.Send(ap, wire::Type::kHello, ha.session_token, HelloBody(as.build, "dev", "", 1, 2, ha.session_token));
+  Rx w2;
+  CHECK(other.Wait(wire::Type::kWelcome, 1000, &w2));
+  wire::Welcome m2;
+  CHECK(wire::DecodeWelcome(w2.body, &m2) && m2.refusal == wire::Refusal::kSession);
+  SleepMs(200);
+  CHECKF(a.status().state == State::kStarting && as.restarts == 0 && !fs::exists(as.HandoffPath()),
+         "a wrong session Hello moved the host: %s, restarts %d", online::StateName(a.status().state), as.restarts.load());
+  // (3) the boot's token from the peer: the late yes
+  fa.Clear();
+  fa.Send(ap, wire::Type::kHello, ha.session_token, HelloBody(as.build, "dev", "", 1, 2, ha.session_token));
+  CHECKF(WaitFor([&] { return as.restarts.load() == 1; }, 1000), "the session Hello did not restart the host (state %s)",
+         online::StateName(a.status().state));
+  Bytes written;
+  handoff::Handoff hw;
+  CHECK(ReadFile(as.HandoffPath(), &written) && handoff::Unpack(written, &hw).empty());
+  CHECK(hw.session_token == ha.session_token && hw.seed == ha.seed && hw.role == handoff::Role::kHost);
+  // the late yes is not answered kSession (the joiner would give up)
+  Rx w3;
+  CHECK(!fa.Wait(wire::Type::kWelcome, 300, &w3));
+  // a second session Hello does not restart it twice
+  fa.Send(ap, wire::Type::kHello, ha.session_token, HelloBody(as.build, "dev", "", 1, 2, ha.session_token));
+  SleepMs(300);
+  CHECK(as.restarts.load() == 1);
+}
+
 static handoff::Handoff SessionHandoff(uint16_t peer_port, uint32_t token) {
   handoff::Handoff h;
   h.build = 0x0DA4000000000001ull;
@@ -1908,6 +1964,7 @@ int main(int argc, char** argv) {
   TestReplyBounds();
   TestProto();
   TestLateBootReply();
+  TestLateYesBySessionHello();
   TestSessionRefused();
   TestStrangerEvents();
   TestJoinerCancel();

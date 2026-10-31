@@ -65,7 +65,7 @@ void LogThreads(uint32_t frame) {
 }  // namespace
 
 void TraceStart(const std::filesystem::path& dir) {
-  const char* t = std::getenv("DOA4_NP_TRACE");
+  const char* t = TestSwitch("DOA4_NP_TRACE");
   if (t && std::string_view(t).find("clock") != std::string_view::npos) {
     g_trace = _wfopen((dir / "clock_trace.txt").wstring().c_str(), L"w");
   }
