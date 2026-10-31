@@ -686,8 +686,10 @@ class DeadOrAlive4App : public rex::ReXApp {
   // ---- the Online tab, the banner and the F9 box (Task 14) ----
   // This process runs an online session: the one predicate behind the menu locks, their refusals and the tab.
   bool InOnlineSession() const { return session_.has_value() && !launch_refused_; }
+  // The menu's locks and their refusals: in a session, or the lobby is starting one (online_view::SessionLocks).
+  bool SessionLocked() { return doa4::online_view::SessionLocks(OnlineViewIn(false)); }
 
-  doa4::online_view::In OnlineViewIn() {
+  doa4::online_view::In OnlineViewIn(bool tab_shown) {
     doa4::online_view::In in;
     if (lobby_) {
       in.lobby = lobby_->status();
@@ -702,7 +704,12 @@ class DeadOrAlive4App : public rex::ReXApp {
       in.frames_ahead = t.frames_ahead;
     }
     in.release = DOA4_RELEASE_TAG;
-    if (net_build_id_ == 0) net_build_id_ = doa4::np::BuildIdValue();  // hashed once (UI thread)
+    // Only when the Online tab draws or a lobby / session exists (spec 4: an offline game that never opened the tab
+    // hashes nothing); once, on the UI thread. net_build_hashes_ counts the computations (the log line below).
+    if (net_build_id_ == 0 && doa4::online_view::NeedsBuildId(tab_shown, lobby_ != nullptr, in.in_session)) {
+      net_build_id_ = doa4::np::BuildIdValue();
+      REXLOG_INFO("[doa4][NET] build id hashed for the Online tab/lobby (computation {})", ++net_build_hashes_);
+    }
     in.build = net_build_id_;
     in.show_stats = rex::cvar::Query<bool>("netplay_show_stats");
     return in;
@@ -710,7 +717,7 @@ class DeadOrAlive4App : public rex::ReXApp {
 
   doa4::NetOverlay::Content NetOverlayContent() {
     namespace ov = doa4::online_view;
-    const ov::In in = OnlineViewIn();
+    const ov::In in = OnlineViewIn(false);
     ov::Ending ending = ov::Ending::kNone;
     if (in.in_session) {
       switch (doa4::np::LastResult().end) {
@@ -733,7 +740,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   // while any ImGui dialog exists the presenter paints from the UI thread. UI thread only.
   void UpdateNetOverlay() {
     if (net_closing_.load(std::memory_order_acquire) || !drawer_) return;
-    const doa4::online_view::In in = OnlineViewIn();
+    const doa4::online_view::In in = OnlineViewIn(false);
     bool want = in.show_stats && (in.in_session || in.lobby_open);
     if (!want && in.in_session) {
       want = !NetOverlayContent().banner.empty();
@@ -751,6 +758,17 @@ class DeadOrAlive4App : public rex::ReXApp {
       net_overlay_.reset();
       REXLOG_INFO("[doa4][NET] overlay: hidden");
     }
+  }
+
+  // The F9 box's lines, logged once per change as "[doa4][NET] stats: Ping 17 ms | Delay 2 frames (33 ms)" (the test
+  // hook behind the harness's check that the in-session ping is real; UI thread).
+  void LogNetStatsLine() {
+    const doa4::online_view::View v = doa4::online_view::Describe(OnlineViewIn(false));
+    std::string line;
+    for (const std::string& s : v.stats_lines) line += (line.empty() ? "" : " | ") + s;
+    if (line == net_logged_stats_) return;
+    net_logged_stats_ = line;
+    if (!line.empty()) REXLOG_INFO("[doa4][NET] stats: {}", line);
   }
 
   // F9: the ping and input-delay box (in memory only; the Online tab checkbox saves the setting).
@@ -778,6 +796,10 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
+    // first of all (fix round M5): the menu timer posts to the UI thread and reads the lobby; <= 25 ms to join, before
+    // the lobby stop and the UPnP removal spend the 5 s watchdog's budget
+    menu_tick_stop_.store(true, std::memory_order_release);
+    if (menu_tick_.joinable()) menu_tick_.join();
     if (session_ || guest_touched_) CheckConfigUnchanged();  // carry 2b, while np_log is still open
     // first: the session's writer captures frames through the presenter; np::Shutdown stops the session's transport
     // before anything else (Stop is bounded by 200 ms, Task 7)
@@ -794,8 +816,6 @@ class DeadOrAlive4App : public rex::ReXApp {
     rex::ui::UnregisterBind("bind_doa4_photo");
     rex::ui::UnregisterBind("bind_doa4_netstats");
     net_closing_.store(true, std::memory_order_release);
-    menu_tick_stop_.store(true, std::memory_order_release);
-    if (menu_tick_.joinable()) menu_tick_.join();
     photo_closing_.store(true, std::memory_order_release);
     doa4::photo::InstallSnapshotWatcher(nullptr);  // the watcher itself lives until exit
     photo_stop_.store(true, std::memory_order_release);
@@ -866,8 +886,12 @@ class DeadOrAlive4App : public rex::ReXApp {
         while (!menu_tick_stop_.load(std::memory_order_acquire)) {
           app_context().CallInUIThreadDeferred([this] {
             if (menu_) menu_->PollNetState();
+            LogNetStatsLine();
           });
-          std::this_thread::sleep_for(250ms);
+          // 250 ms in 25 ms slices: OnShutdown joins this thread first and must not wait a whole period (M5)
+          for (int i = 0; i < 10 && !menu_tick_stop_.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(25ms);
+          }
         }
       });
     }
@@ -1088,11 +1112,11 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.extras = &extras_;
     host.refuse = [this](std::string_view action, std::string* status) {
       // the same predicate as the Extras controls' disabled state (online_view::LockedInSession)
-      return doa4::online_view::Refuse(doa4::online_view::Control::kExtras, InOnlineSession(), action, status,
+      return doa4::online_view::Refuse(doa4::online_view::Control::kExtras, SessionLocked(), action, status,
                                        [](const std::string& line) { REXLOG_INFO("{}", line); });
     };
-    host.in_session = [this] { return InOnlineSession(); };
-    host.online.state = [this] { return OnlineViewIn(); };
+    host.session_locked = [this] { return SessionLocked(); };
+    host.online.state = [this](bool tab_shown) { return OnlineViewIn(tab_shown); };
     host.online.host = [this] {
       EnsureLobby();
       if (lobby_) lobby_->Host(0);
@@ -1202,6 +1226,8 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::unique_ptr<doa4::NetOverlay> net_overlay_;  // the banner / F9 box; exists only while one is shown
   std::atomic<bool> net_closing_{false};           // set at shutdown: no new overlay
   std::string net_logged_banner_;                  // the last banner text logged (UI thread)
+  std::string net_logged_stats_;                   // the last "stats:" line logged (UI thread)
+  uint32_t net_build_hashes_ = 0;                  // how many times the build id was hashed (UI thread)
   std::thread menu_tick_;                          // DOA4_MENU_OPEN=1 only: polls the menu's net state
   std::atomic<bool> menu_tick_stop_{false};
   uint64_t net_build_id_ = 0;                      // np::BuildIdValue(), hashed on first use (UI thread)

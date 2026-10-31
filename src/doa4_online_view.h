@@ -35,9 +35,18 @@ struct View {
   std::vector<std::string> stats_lines;                // F9 box; empty when not connected or show_stats is off
   std::string diagnostics_line;                        // "Dropped packets: N" (spec 7); empty when Offline
   std::string display_note;                            // "The host's display settings are used during the session" or empty
+  std::string session_note;                            // "Settings changed during a session are restored when it ends." in a session
 };
 
 View Describe(const In& in);
+
+// The one notion of "locked": this process is in a session, or its lobby is Starting / Restarting into one (the
+// host pressed Start, the joiner accepted: the games are about to restart). The four controls below and the input delay
+// all read it (fix round M2).
+bool SessionLocks(const In& in);
+// Whether the build id (a hash of the exe and rexruntime.dll, seconds of disk reads) is needed: the Online tab draws,
+// or a lobby / a session exists. An offline game that never opened the tab never computes it (spec 4, fix round I2).
+bool NeedsBuildId(bool tab_shown, bool lobby_open, bool in_session);
 
 // The four game-state controls a session locks (spec 6): every one of them reads its disabled state from here, and the
 // refusal behind them (Refuse) reads the same answer, so the UI and the refusal cannot disagree.

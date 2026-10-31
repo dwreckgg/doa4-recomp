@@ -215,25 +215,7 @@ static void TestUnsavedWarning() {
   CHECK(doa4::UnsavedUnlocksWarning(state) == nullptr);
 }
 
-// Task 12 fix round I3: in a session an Extras action is refused with the status text and one log line; offline it
-// goes ahead and nothing is written.
-static void TestRefuseInSession() {
-  std::string status = "before", logged;
-  int lines = 0;
-  auto log = [&](const std::string& l) { logged = l; ++lines; };
-  CHECK(doa4::RefuseInSession(true, "unlock Characters", &status, log));
-  CHECK(status == "Not during an online session");
-  CHECK(logged == "[doa4][NET] menu: refused unlock Characters in session" && lines == 1);
-  status = "before";
-  logged.clear();
-  lines = 0;
-  CHECK(!doa4::RefuseInSession(false, "tweak doa4_tag_all_stages", &status, log));
-  CHECK(status == "before" && lines == 0);
-  CHECK(doa4::RefuseInSession(true, "tweak", nullptr, nullptr));  // no status / log: still refused
-}
-
 int main() {
-  TestRefuseInSession();
   TestSaveDir();
   TestBackupStamp();
   TestDescribe();

@@ -13,6 +13,7 @@ using np::online::State;
 
 constexpr const char* kSessionRefusedText = "The other player's game did not start the session.";
 constexpr const char* kDisplayNote = "The host's display settings are used during the session";
+constexpr const char* kSessionNote = "Settings changed during a session are restored when it ends.";
 constexpr const char* kJoinerHint = "The host starts the online session; both games then restart.";
 
 // The names status.txt uses (np_online StateName); the pure view cannot link the lobby.
@@ -66,25 +67,22 @@ View Describe(const In& in) {
     v.status_line = std::string("In an online session as the ") + (st.is_host ? "host" : "joiner") + " - delay " +
                     DelayText(in.delay) + ", ping " + PingText(in.ping_ms);
     v.show_leave = true;
-    v.delay_enabled = false;
     v.display_note = kDisplayNote;
+    v.session_note = kSessionNote;
   } else {
     switch (state) {
       case State::kOffline:
         v.status_line = "Not connected";
         v.show_join = v.show_host = true;
-        v.delay_enabled = true;
         break;
       case State::kHosting:
         v.status_line = "Waiting for the other player to join";
         v.show_disconnect = true;
         v.show_reach_out = true;
-        v.delay_enabled = true;
         break;
       case State::kConnecting:
         v.status_line = "Connecting...";
         v.show_disconnect = true;
-        v.delay_enabled = true;
         break;
       case State::kConnected:
         v.status_line = "Connected to the other player (" +
@@ -93,7 +91,6 @@ View Describe(const In& in) {
         v.show_disconnect = true;
         v.show_start = st.is_host;
         v.start_enabled = st.is_host && st.can_start;
-        v.delay_enabled = true;
         break;
       case State::kStarting:
         v.status_line = "Starting the online session...";
@@ -111,6 +108,8 @@ View Describe(const In& in) {
       if (!st.is_host) v.display_note = kDisplayNote;
     }
   }
+
+  v.delay_enabled = !SessionLocks(in);  // locked while starting and in a session (one notion, fix round M2)
 
   // the code: shown while hosting or connected as the host, when the lobby has one
   if (!session && (state == State::kHosting || (state == State::kConnected && st.is_host)) && !st.my_code.empty()) {
@@ -141,6 +140,15 @@ View Describe(const In& in) {
   }
   return v;
 }
+
+bool SessionLocks(const In& in) {
+  if (in.in_session) return true;
+  if (!in.lobby_open) return false;
+  const State s = in.lobby.state;
+  return s == State::kStarting || s == State::kRestarting || s == State::kInSession;
+}
+
+bool NeedsBuildId(bool tab_shown, bool lobby_open, bool in_session) { return tab_shown || lobby_open || in_session; }
 
 bool LockedInSession(Control, bool in_session) { return in_session; }
 

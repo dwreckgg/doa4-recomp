@@ -74,6 +74,8 @@ struct Hooks {
   // Empty: gekko->FramesAhead(). Tests inject a value (ruling F5): GekkoNet's figure is already averaged over 26
   // frames and halved (backend.cpp:1545-1559), and is used as given.
   std::function<float()> frames_ahead;
+  // Empty: gekko->Stats().ping_ms (GekkoNet's averaged round trip to the peer, ms). Tests inject a value.
+  std::function<float()> ping_ms;
 };
 
 class Session {
@@ -96,6 +98,7 @@ class Session {
   void PeerLeft(int32_t at_frame, wire::LeaveReason why);
   bool banner_waiting() const;          // a hold has lasted >= banner_ms (any thread)
   float frames_ahead() const;
+  float ping_ms() const;                // the round trip to the peer, refreshed after every advanced frame (any thread)
   // Frames of the peer's input this side holds beyond the frame it is about to advance (carry 2b), >= 0; updated
   // after every Update. Read from np_gekko's peek at the Inputs payloads (gekko::Session::last_remote_input_frame),
   // which is UNAUTHENTICATED (a well-formed payload with any magic moves it): display and diagnostics only - Task 12
@@ -121,6 +124,7 @@ class Session {
   std::atomic<uint64_t> peer_left_{kNoPeerLeft};
   std::atomic<bool> banner_{false};
   std::atomic<float> frames_ahead_{0.f};
+  std::atomic<float> ping_ms_{0.f};
   std::atomic<int32_t> remote_slack_{0};
 
   // Game thread only (Frame and Close). A Frame call from another thread reads only thread_ and returns.
