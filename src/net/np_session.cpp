@@ -412,6 +412,61 @@ void Enqueue(Job job) {
   s.job_cv.notify_one();
 }
 
+// DOA4_NP_POKE=<frame>:<addr>:set:<hex bytes>|add:<n>[;...] (a debug test switch, online, test dir only): at the
+// frame boundary of <frame>, after hashing, write the bytes at the guest address, or add n to the big-endian u32 there.
+// A perturbation probe: one side's guest memory is changed where the peers are known to differ; if guest code that
+// feeds game state reads it, the digests or sweeps part later in the session.
+void PokeAt(uint8_t* base, uint32_t f) {
+  struct Poke {
+    uint32_t frame, addr;
+    bool add;
+    uint32_t n;
+    std::vector<uint8_t> bytes;
+  };
+  static const std::vector<Poke> pokes = [] {
+    std::vector<Poke> out;
+    std::stringstream ss(TestDirEnv("DOA4_NP_POKE"));
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+      std::stringstream is(item);
+      std::string fr, ad, op, val;
+      if (!std::getline(is, fr, ':') || !std::getline(is, ad, ':') || !std::getline(is, op, ':') ||
+          !std::getline(is, val)) {
+        continue;
+      }
+      Poke p{uint32_t(std::strtoul(fr.c_str(), nullptr, 10)), uint32_t(std::strtoul(ad.c_str(), nullptr, 16)),
+             op == "add", 0, {}};
+      if (p.add) {
+        p.n = uint32_t(std::strtoul(val.c_str(), nullptr, 10));
+      } else {
+        for (size_t i = 0; i + 1 < val.size(); i += 2) {
+          p.bytes.push_back(uint8_t(std::strtoul(val.substr(i, 2).c_str(), nullptr, 16)));
+        }
+      }
+      out.push_back(std::move(p));
+    }
+    return out;
+  }();
+  for (const Poke& p : pokes) {
+    if (p.frame != f) continue;
+    uint8_t* q = base + p.addr;
+    if (p.add) {
+      uint32_t v = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
+      const uint32_t old = v;
+      v += p.n;
+      q[0] = uint8_t(v >> 24), q[1] = uint8_t(v >> 16), q[2] = uint8_t(v >> 8), q[3] = uint8_t(v);
+      char line[96];
+      std::snprintf(line, sizeof(line), "poke at frame %u: %08X %08X -> %08X", f, p.addr, old, v);
+      Log(line);
+    } else {
+      std::memcpy(q, p.bytes.data(), p.bytes.size());
+      char line[96];
+      std::snprintf(line, sizeof(line), "poke at frame %u: %08X set %zu bytes", f, p.addr, p.bytes.size());
+      Log(line);
+    }
+  }
+}
+
 // DOA4_NP_HEAPDUMP=1 (a debug test switch): with each .data dump, a copy of every committed, readable page of
 // the guest's two virtual heaps (00000000 4 KB pages, 40000000 64 KB pages: the game's allocations, its
 // dispatcher objects and the thread stacks), taken on the game thread at the same point as the .data copy.
@@ -1100,6 +1155,7 @@ void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
     base[kMtState + 100] ^= 0x01;
     Log("forced desync: one byte of the MT state 0x833F7600 flipped at frame " + std::to_string(f));
   }
+  PokeAt(base, f);
 
   // (3) the unlock
   UnlockStep(s, f);
