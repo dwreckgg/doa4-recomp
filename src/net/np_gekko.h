@@ -32,8 +32,18 @@ class Session {
   uint32_t local_inputs_added() const;             // calls of AddLocalInput so far (Task 11's once-per-frame check)
   // Incoming GekkoNet SyncResponses dropped by the guard (after kStarted, at most one per 200 ms is passed: np_gekko.cpp).
   uint32_t sync_responses_dropped() const;
+  // The newest frame of the peer's input carried by any Inputs payload passed to GekkoNet so far (start_frame +
+  // input_count - 1, read from the payload: np_gekko.cpp kGekkoInputs), -1 before the first. Task 11's remote slack.
+  // An upper bound on what GekkoNet has filed: it files received inputs in order (game_session.cpp:711-735), so on a
+  // link that loses a payload this runs ahead of GekkoNet until the gap is resent.
+  int32_t last_remote_input_frame() const;
   std::vector<exec::Event> Update();               // one gekko_update_session, converted
   std::vector<SessionEvent> TakeSessionEvents();   // since the last call
+  // One gekko_network_poll: receives, and sends what GekkoNet has queued, without advancing (no game event). GekkoNet
+  // queues a frame's SessionHealth inside an update and sends it at the start of the NEXT one (game_session.cpp:
+  // 203 and 365-390 queue it, Poll's SendPendingOutput at :690 sends it); Task 11 calls this once when it ends a
+  // session on a desync, so the peer still gets this side's checksum for the frame and ends on the desync too.
+  void Poll();
   float FramesAhead();
   NetStats Stats();
   void Destroy();
