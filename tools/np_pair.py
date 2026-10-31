@@ -7,7 +7,7 @@ what each copy wrote.
       [--env-host K=V ...] [--env-joiner K=V ...] [--arg-host=ARG ...] [--arg-joiner=ARG ...]
       [--kill-joiner-at-frame N] [--third-joiner] [--host-only SECONDS]
       [--expect ok|desync|lost|refused-build|refused-files|refused-busy|lobby] [--timeout S]
-      [--game DIR] [--end-grace S] [--step-timeout S] [--settle S]
+      [--game DIR] [--end-grace S] [--step-timeout S] [--settle S] [--orphan-watch S]
 
 Run folders <runs>/NAME_host and <runs>/NAME_joiner (and NAME_third), each: ud/ (a copy of the pristine save), ctl/ (the
 test switches' folder DOA4_NP_TEST_DIR: np_ctl.on, status.txt, pids.txt, session/), game.log, command.txt, stdout.txt,
@@ -24,6 +24,12 @@ Process safety: this script ends only the processes it started (their Popen hand
 list (and only while the process's creation time matches the line's time: a reused pid is not ours): `taskkill /PID <pid>` (a
 close request), `/F` after --end-grace seconds (15). Never by image name. Every process it starts is hidden: the game with
 STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE, helpers with CREATE_NO_WINDOW.
+A refusal is judged from the lobby's status.txt key `refusal=<none|build|files|busy|proto|session|other>` (a missing key fails
+with a clear message); the event text is only printed, and for files must name the salted group. A refused copy must also not be
+starting / restarting / in_session, have no ctl/session folder and no file under ud/netplay (a hand-off), watched for --settle
+seconds (8: longer than a real game's OnPostInitLogging).
+After the last close request end_all keeps watching every copy's pids.txt until it has not grown for --orphan-watch seconds (10),
+ending any new owned pid: a game that relaunches itself after a close request leaves nothing behind.
 Verdict rules that hold for every --expect: the real save (every file under ud/B13EBABEBABEBABE) is hashed before the launch and
 after the offline relaunch has ended, a difference fails the pair; each copy's game.log holds the dot-product self-test line.
 """
@@ -197,6 +203,18 @@ def taskkill(pid, force):
     subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW)
 
 
+def owned_alive(pid, ms):
+    """The pid is alive and its creation time matches the pids.txt line's time (a reused pid is another process)."""
+    if not pid_alive(pid):
+        return False
+    created = proc_start(pid)
+    return created is not None and ms / 1000.0 - 600 <= created <= ms / 1000.0 + 5
+
+
+class StepError(Exception):
+    """A harness step that cannot be done (reported as a problem of the pair, never skipped)."""
+
+
 class Side:
     """One game copy: its run folder, process handle (and affinity job) and log paths."""
 
@@ -251,6 +269,8 @@ class Side:
         end = time.time() + timeout
         while os.path.exists(path) and time.time() < end:
             time.sleep(0.05)
+        if os.path.exists(path):  # replacing it would lose the earlier command
+            raise StepError(f"the {self.name} copy did not take the previous np_ctl.on within {timeout} s; {text.strip()!r} not sent")
         tmp = os.path.join(self.ctl, "np_ctl.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
@@ -258,6 +278,11 @@ class Side:
 
     def session_pids(self):
         return [p for p in read_pids(self.ctl) if p[1] == "session"]
+
+    def session_alive(self):
+        """The last session process is alive AND is the process pids.txt named (creation time matches the line)."""
+        rows = self.session_pids()
+        return bool(rows) and owned_alive(rows[-1][0], rows[-1][2])
 
 
 # --- the pair ----------------------------------------------------------------------------------------------------
@@ -270,8 +295,10 @@ class Pair:
         self.notes = []
         self.deadline = None
         self.lobby_status = {}
+        self.snap = {}  # the refused / answering copy's status.txt when its answer came (later processes rewrite the file)
+        self.ended = False
         self.joiner_event = ""
-        self.delay_seen = 0
+        self.delay_host = 0
 
     # ------------------------------------------------------------------ setup
     def game_env(self, side, host):
@@ -356,20 +383,27 @@ class Pair:
             if side.popen is not None and side.popen.poll() is None:
                 mine[side.popen.pid] = f"{side.name} launch"
             for pid, kind, ms in read_pids(side.ctl):
-                if not pid_alive(pid):
-                    continue
-                created = proc_start(pid)
-                if created is not None and ms / 1000.0 - 600 <= created <= ms / 1000.0 + 5:
+                if owned_alive(pid, ms):
                     mine[pid] = f"{side.name} {kind}"
         return mine
 
     def end_all(self):
         """Ends every owned process: a close request, /F after --end-grace seconds. Returns the labels that needed /F."""
         forced = []
-        for _ in range(6):  # a process that was ending may have started the next one
+        self.ended = True
+        quiet_from = time.time()
+        seen = -1
+        while True:
             mine = self.owned_pids()
+            lines = sum(len(read_pids(s.ctl)) for s in self.sides)
+            if lines != seen:  # a new pids.txt line (a relaunch) restarts the watch
+                seen, quiet_from = lines, time.time()
             if not mine:
-                return forced
+                if time.time() - quiet_from >= self.a.orphan_watch:
+                    return forced
+                time.sleep(0.2)
+                continue
+            quiet_from = time.time()
             for pid in mine:
                 taskkill(pid, False)
             end = time.time() + self.a.end_grace
@@ -380,7 +414,6 @@ class Pair:
                     taskkill(pid, True)
                     forced.append(label)
             time.sleep(0.2)
-        return forced
 
     # ------------------------------------------------------------------ the flow
     def run(self):
@@ -409,16 +442,18 @@ class Pair:
             st = joiner.status()
             if st.get("state") == "connected" and host.status().get("state") == "connected" and host.status().get("can_start") == "1":
                 return True
-            return st.get("state") == "offline" and st.get("event", "") not in ("", before)  # refused
+            refused_now = st.get("refusal", "none") not in ("none", "")
+            return st.get("state") == "offline" and (refused_now or st.get("event", "") not in ("", before))  # refused
         if not self.wait(settled, a.step_timeout, "both copies connected (host can_start=1) or the joiner's refusal"):
             return
+        self.snap["joiner"] = joiner.status()
         self.joiner_event = joiner.status().get("event", "")
         refused = joiner.status().get("state") == "offline"
         if refused:
             self.notes.append(f"joiner refused: {self.joiner_event}")
             time.sleep(a.settle)  # a refusal that did not hold shows as a session process in this time
             return
-        self.delay_seen = max(int(s.status().get("delay", "0") or 0) for s in (host, joiner))
+        self.delay_host = int(host.status().get("delay", "0") or 0)  # the session's delay is the host's
         if a.third_joiner:
             third = self.make_side("third")
             self.launch(third, a.joiner_exe or a.exe, self.game_env(third, False), a.arg_joiner)
@@ -426,7 +461,9 @@ class Pair:
             t_before = third.status().get("event", "")
             third.send(f"join 127.0.0.1:{port}")
             if self.wait(lambda: third.status().get("state") in ("offline", "connected") and
-                         third.status().get("event", "") not in ("", t_before), a.step_timeout, "the third copy's answer"):
+                         (third.status().get("event", "") not in ("", t_before) or
+                          third.status().get("refusal", "none") not in ("none", "")), a.step_timeout, "the third copy's answer"):
+                self.snap["third"] = third.status()
                 self.notes.append(f"third joiner: state {third.status().get('state')}, event {third.status().get('event', '')}")
         if a.expect == "refused-busy":
             time.sleep(a.settle)
@@ -445,7 +482,7 @@ class Pair:
             if side.terminal() and side.checksums() is not None:
                 return True
             pids = side.session_pids()
-            return bool(pids) and not pid_alive(pids[-1][0])  # the session process is gone: nothing more will be written
+            return bool(pids) and not side.session_alive()  # the session process is gone: nothing more will be written
 
         while time.time() < self.deadline:
             if a.joiner_affinity and not read_back and joiner.session_pids():
@@ -462,13 +499,14 @@ class Pair:
                     and joiner.session_pids():
                 killed = True
                 pid = joiner.session_pids()[-1][0]
-                self.notes.append(f"joiner session pid {pid} ended at frame {joiner.passed_frame()}")
-                taskkill(pid, False)
-                end = time.time() + a.end_grace
-                while time.time() < end and pid_alive(pid):
-                    time.sleep(0.1)
-                if pid_alive(pid):
-                    taskkill(pid, True)
+                if joiner.session_alive():  # ours: the creation time matches the pids.txt line
+                    self.notes.append(f"joiner session pid {pid} ended at frame {joiner.passed_frame()}")
+                    taskkill(pid, False)
+                    end = time.time() + a.end_grace
+                    while time.time() < end and joiner.session_alive():
+                        time.sleep(0.1)
+                    if joiner.session_alive():
+                        taskkill(pid, True)
             for s in (host, joiner):
                 finished[s.name] = side_done(s)
             if all(finished.values()):
@@ -513,25 +551,34 @@ class Pair:
         if copy is None:
             self.problems.append(f"no {who} copy ran")
             return
-        st = copy.status()
+        st = self.snap.get(who) or copy.status()
         event = st.get("event", "")
         lines.append(f"{who} status.txt: state={st.get('state')} event={event}")
         if st.get("state") != "offline":
             self.problems.append(f"the {who} copy is {st.get('state')!r}, expected offline (refused)")
-        low = event.lower()
-        if kind == "build":
-            right = ("different build" in low or "mismatchadvice" in low or "build" in low) and "file" not in low
-        elif kind == "files":
+        if "refusal" not in st:
+            self.problems.append(f"the {who} copy's status.txt has no refusal= key (contract: refusal=<none|build|files|busy|proto|session|other>): "
+                                 f"the kind of the refusal cannot be judged")
+        elif st["refusal"] != kind:
+            self.problems.append(f"the {who} copy's refusal is {st['refusal']!r}, not a {kind} refusal (event {event!r})")
+        if kind == "files":  # the group name is in the event text
             salts = [kv.partition("=")[2] for kv in a.env_host + a.env_joiner if kv.startswith("DOA4_NP_TEST_FILES_SALT=")]
-            right = "file" in low and all(s.lower() in low for s in salts if s) and "build" not in low
-        else:
-            right = "busy" in low
-        if not right:
-            self.problems.append(f"the {who} copy's event {event!r} is not a {kind} refusal")
+            for salt in salts:
+                if salt and salt.lower() not in event.lower():
+                    self.problems.append(f"the files refusal's event {event!r} does not name the salted group {salt!r}")
         for s in self.sides:  # whatever else happened, a session must not have started
             sess = [p for p in read_pids(s.ctl) if p[1] == "session"]
             if sess:
                 self.problems.append(f"a session started on the {s.name} copy (pids.txt: {sess[0][0]}) in a refused run")
+        for s in ([copy] if copy else []):
+            state = s.status().get("state")
+            if state in ("starting", "restarting", "in_session"):
+                self.problems.append(f"the refused {s.name} copy is {state!r}: its session started in spite of the refusal")
+            if os.path.isdir(s.session_dir()):
+                self.problems.append(f"the refused {s.name} copy has a ctl/session folder")
+            netplay = os.path.join(s.ud, "netplay")
+            if os.path.isdir(netplay) and any(files or dirs for _, dirs, files in os.walk(netplay)):
+                self.problems.append(f"the refused {s.name} copy wrote files under ud/netplay (a hand-off)")
 
     def compare(self, host, joiner):
         """(exit code, output lines, first differing digest frame or None) of np_compare.py on the two session folders."""
@@ -594,8 +641,7 @@ class Pair:
             if warn:
                 self.problems.append(f"the {s.name} np_log holds a WARN line: {warn}")
             n = s.checksums()
-            delay = max(getattr(self, "delay_seen", 0), a.delay or 0)
-            need_n = (s.terminal()[0] if s.terminal() else 0) - delay - 1
+            need_n = (s.terminal()[0] if s.terminal() else 0) - self.delay_host - 1  # both copies run the host's delay
             if n is None:
                 self.problems.append(f"the {s.name} np_log has no 'checksums handed to GekkoNet' line (the desync detector was not fed)")
             elif n < need_n:
@@ -685,7 +731,8 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=600, help="seconds the sessions may take")
     ap.add_argument("--end-grace", type=float, default=15, help="seconds a close request gets before /F")
     ap.add_argument("--step-timeout", type=float, default=60, help="seconds each lobby step may take")
-    ap.add_argument("--settle", type=float, default=1.5, help="seconds a refused run is watched for a session that starts anyway")
+    ap.add_argument("--settle", type=float, default=8, help="seconds a refused run is watched for a session that starts anyway")
+    ap.add_argument("--orphan-watch", type=float, default=10, help="seconds pids.txt must stay unchanged after the last kill")
     a = ap.parse_args(argv)
     if a.host_only is not None and a.expect != "lobby":
         sys.exit("--host-only goes with --expect lobby")
@@ -700,13 +747,17 @@ def main(argv=None):
     pair = Pair(a)
     ok = False
     try:
-        pair.run()
+        try:
+            pair.run()
+        except StepError as e:
+            pair.problems.append(str(e))
         forced = pair.end_all()
         if forced:
             pair.notes.append(f"needed /F after {a.end_grace} s: {', '.join(sorted(forced))}")
         ok = pair.verdict()
     finally:
-        pair.end_all()
+        if not pair.ended:
+            pair.end_all()
         for s in pair.sides:
             if s.stdout:
                 s.stdout.close()

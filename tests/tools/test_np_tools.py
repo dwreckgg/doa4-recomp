@@ -2328,12 +2328,12 @@ def pair_script(root, quit_at=10):
     return path
 
 
-def np_pair(root, name, *args, quit_at=10, tools=None, **env):
+def np_pair(root, name, *args, quit_at=10, tools=None, settle="1.5", **env):
     """np_pair.py end to end on the online stand-in; (exit code, output, runs folder)."""
     runs = os.path.join(root, "pruns")
     cmd = [sys.executable, "-I", os.path.join(tools or TOOLS, "np_pair.py"), name, "--script", pair_script(root, quit_at),
            "--userdata", make_pair_userdata(root), "--runs", runs, "--exe", FAKE_EXE, "--end-grace", "1",
-           "--step-timeout", "30", "--timeout", "60", *args]
+           "--step-timeout", "30", "--timeout", "60", "--orphan-watch", "0.5", *(["--settle", settle] if settle else []), *args]
     p = subprocess.run(cmd, capture_output=True, text=True, env=stand_in_env(**env), timeout=240)
     return p.returncode, p.stdout + p.stderr, runs
 
@@ -2454,7 +2454,7 @@ def test_pair_refusals(root):
     check("data" in pair_verdict(runs, "r_files"), f"np_pair, files refusal: the salted group's name is in the event\n{pair_verdict(runs, 'r_files')}")
     # a real host-side refusal: the build id salted on the joiner only, the host decides
     code, out, runs = np_pair(root, "r_hb", "--expect", "refused-build", "--env-joiner", "DOA4_NP_TEST_BUILD_SALT=1")
-    check(code == 0 and "different build" in out, f"np_pair, host refuses a salted build: exit {code}\n{out}")
+    check(code == 0 and "self-built exe" in out, f"np_pair, host refuses a salted build: exit {code}\n{out}")
     code, out, runs = np_pair(root, "r_hf", "--expect", "refused-files", "--env-joiner", "DOA4_NP_TEST_FILES_SALT=audio")
     check(code == 0 and "audio" in out, f"np_pair, host refuses a salted file group (named): exit {code}\n{out}")
     # busy: a third copy joins a host that has its peer
@@ -2470,8 +2470,9 @@ def test_pair_refusals(root):
     check(code == 1 and "not a busy refusal" in out, f"np_pair, expect refused-busy but build refused: exit {code}\n{out}")
     # a refusal that did not hold: the refused copy reports it and a session starts anyway
     code, out, runs = np_pair(root, "r_leak", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build",
-                              "--env-joiner", "FAKE_ONLINE_LEAKY=1")
+                              "--env-joiner", "FAKE_ONLINE_LEAKY=1", "--env-joiner", "FAKE_ONLINE_FRAME_MS=3000")
     check(any(r[2] == "session" for r in pair_pids(runs, "r_leak", "joiner")), "np_pair, leaky refusal: the joiner's pids.txt has the session line (fixture precondition)")
+    check("'in_session'" in out and "has a ctl/session folder" in out, f"np_pair, refused but the copy's state and folder show a session\n{out}")
     check(code == 1 and "a session started on the joiner copy" in out, f"np_pair, refused but a session line exists: exit {code}\n{out}")
     # the control: no refusal where one was expected
     code, out, runs = np_pair(root, "r_none", "--expect", "refused-build")
@@ -2532,7 +2533,7 @@ def test_pair_pid_reuse(root):
         os.makedirs(ctl)
         with open(os.path.join(ctl, "pids.txt"), "w") as f:
             f.write(f"pid {other.pid} session {int((time.time() - 86400) * 1000)}\n")
-        pair = mod.Pair(type("A", (), {"end_grace": 0.5})())
+        pair = mod.Pair(type("A", (), {"end_grace": 0.5, "orphan_watch": 0.2})())
         pair.sides.append(mod.Side("host", os.path.join(root, "reuse_host")))
         check(other.pid not in pair.owned_pids(), "np_pair: a pid whose creation time does not match its pids.txt line is not owned")
         with open(os.path.join(ctl, "pids.txt"), "w") as f:
@@ -2613,6 +2614,184 @@ def test_pair_lost(root):
     check(code == 1 and "the banner came" in out, f"np_pair, lost with a late banner: exit {code}\n{out}")
     code, out, runs = np_pair(root, "lw", "--expect", "lost", "--env-host", "FAKE_ONLINE_END=lost", *slow)
     check(code == 1 and "needs --kill-joiner-at-frame" in out, f"np_pair, lost without --kill-joiner-at-frame: exit {code}\n{out}")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Task 10 fix round 1 (review I1-I4, M1-M5)
+# ---------------------------------------------------------------------------------------------------------------------
+def test_pair_refusal_key(root):
+    # I1: the kind of a refusal is read from status.txt `refusal=`; the event text is the lobby's REAL one (np_rules.cpp), which
+    # holds no keyword the earlier matcher looked for ("busy" is "already in an online session", the build text is "self-built").
+    code, out, runs = np_pair(root, "k_busy", "--expect", "refused-busy", "--third-joiner")
+    check(code == 0 and "verdict refused-busy" in out, f"np_pair, the real busy text carries no keyword and the key decides: exit {code}\n{out}")
+    third = open(os.path.join(runs, "k_busy_third", "ctl", "status.txt")).read()
+    check("refusal=busy" in third and "event=The host is already in an online session." in third, f"np_pair, busy: the third copy's status.txt\n{third}")
+    code, out, runs = np_pair(root, "k_build", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build")
+    check(code == 0 and "self-built exe" in out, f"np_pair, the real build text ('self-built exe'): exit {code}\n{out}")
+    code, out, runs = np_pair(root, "k_files", "--expect", "refused-files", "--env-joiner", "FAKE_ONLINE_REFUSE=files",
+                              "--env-joiner", "DOA4_NP_TEST_FILES_SALT=audio")
+    check(code == 0 and "The game files differ (audio)" in out, f"np_pair, the real files text names the group: exit {code}\n{out}")
+    # the salted group must be in the files event
+    code, out, runs = np_pair(root, "k_files2", "--expect", "refused-files", "--env-joiner", "FAKE_ONLINE_REFUSE=files",
+                              "--env-host", "DOA4_NP_TEST_FILES_SALT=movies")
+    check(code == 1 and "does not name the salted group 'movies'" in out, f"np_pair, the files event lacks the salted group: exit {code}\n{out}")
+    # a status.txt without the key cannot be judged, and the message says so
+    code, out, runs = np_pair(root, "k_nokey", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build",
+                              "--env-joiner", "FAKE_ONLINE_NO_REFUSAL_KEY=1")
+    check(code == 1 and "has no refusal= key" in out, f"np_pair, status.txt without refusal=: exit {code}\n{out}")
+
+
+def test_pair_refusal_leak(root):
+    # I2: a session that starts 2 s after the refusal is seen with the default settle (8 s), and the refused copy fails on its
+    # own state, session folder and hand-off too
+    code, out, runs = np_pair(root, "lk", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build",
+                              "--env-joiner", "FAKE_ONLINE_LEAKY=1", "--env-joiner", "FAKE_ONLINE_LEAK_S=2", "--env-joiner", "FAKE_ONLINE_FRAME_MS=3000", settle=None)
+    check(any(r[2] == "session" for r in pair_pids(runs, "lk", "joiner")), "np_pair, leak after 2 s: the joiner's pids.txt has the session line (fixture precondition)")
+    check(code == 1 and "a session started on the joiner copy" in out, f"np_pair, a session 2 s after the refusal: exit {code}\n{out}")
+    check("'in_session'" in out and "has a ctl/session folder" in out, f"np_pair, the refused copy's own state and session folder are named\n{out}")
+    check(re.search(r'"--settle", type=float, default=8,', open(os.path.join(TOOLS, "np_pair.py")).read()), "np_pair: --settle defaults to 8 s")
+    # a hand-off written by the refused copy
+    code, out, runs = np_pair(root, "ho2", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build",
+                              "--env-joiner", "FAKE_ONLINE_HANDOFF=1")
+    check(code == 1 and "wrote files under ud/netplay" in out, f"np_pair, a hand-off file in the refused copy: exit {code}\n{out}")
+    check(not any(r[2] == "session" for r in pair_pids(runs, "ho2", "joiner")), "np_pair, hand-off: no session line (the hand-off check is the only one that sees it)")
+
+
+def test_pair_orphans(root):
+    # I3: a game that relaunches itself after a close request (the stand-in starts another offline process 1 s after the first was
+    # ended) leaves nothing behind: end_all watches pids.txt until it stops growing
+    env = dict(FAKE_ONLINE_RELAUNCH="1", FAKE_ONLINE_LINGER="25")
+    code, out, runs = np_pair(root, "orph", "--orphan-watch", "4", **env)
+    try:
+        check(code == 0, f"np_pair orphans: exit {code}\n{out}")
+        rows = [r for s in ("host", "joiner") for r in pair_pids(runs, "orph", s) if r[2] == "offline"]
+        check(len(rows) == 4, f"np_pair orphans: each copy has its offline process and the relaunched one (fixture precondition): {len(rows)} offline lines")
+        left = leftover_pids(runs, "orph")
+        check(left == [], f"np_pair orphans: nothing the stand-in started is alive afterwards: {left}")
+    finally:
+        for s in ("host", "joiner"):
+            for r in pair_pids(runs, "orph", s):
+                subprocess.run(["taskkill", "/F", "/PID", r[1]], capture_output=True)
+
+
+def test_pair_delay(root):
+    # M2: the checksum floor uses the HOST's delay (the session's), not the larger of both copies' or --delay
+    code, out, runs = np_pair(root, "dl", "--env-joiner", "DOA4_NP_DELAY=6", "--env-joiner", "FAKE_ONLINE_CHECKSUMS=4")
+    check(code == 1 and "handed 4 checksums" in out and "fewer than end frame - delay - 1 = 7" in out,
+          f"np_pair, joiner status delay 6 but the host's 2 rules (10 - 2 - 1 = 7): exit {code}\n{out}")
+    check(open(os.path.join(runs, "dl_joiner", "ctl", "session", "np_log.txt")).read().count("delay 2") == 1,
+          "np_pair delay: the joiner's session ran the host's delay 2 (fixture precondition)")
+    code, out, runs = np_pair(root, "dl2", "--delay", "3", "--env-joiner", "FAKE_ONLINE_CHECKSUMS=6")
+    check(code == 0, f"np_pair, --delay 3 on the host (10 - 3 - 1 = 6 is enough): exit {code}\n{out}")
+
+
+def test_pair_pid_checks(root):
+    # M1: a session pid counts as alive only while its creation time matches the pids.txt line; M3: send() never replaces an
+    # unread np_ctl.on
+    mod = load("np_pair")
+    other = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+    try:
+        side = mod.Side("joiner", os.path.join(root, "m1_joiner"))
+        os.makedirs(side.ctl)
+        with open(os.path.join(side.ctl, "pids.txt"), "w") as f:
+            f.write(f"pid {other.pid} session {int((time.time() - 86400) * 1000)}\n")
+        check(mod.pid_alive(other.pid) and not side.session_alive(), "np_pair: a live pid with a stale pids.txt time is not the session")
+        with open(os.path.join(side.ctl, "pids.txt"), "w") as f:
+            f.write(f"pid {other.pid} session {int(time.time() * 1000)}\n")
+        check(side.session_alive(), "np_pair: the same pid with a matching time is the session (control)")
+    finally:
+        other.kill()
+    side = mod.Side("host", os.path.join(root, "m3_host"))
+    os.makedirs(side.ctl)
+    path = os.path.join(side.ctl, "np_ctl.on")
+    with open(path, "w") as f:
+        f.write("old\n")
+    try:
+        side.send("new", timeout=0.3)
+        raised = False
+    except mod.StepError as e:
+        raised = "did not take the previous np_ctl.on" in str(e)
+    check(raised, "np_pair: send() raises a StepError when the previous np_ctl.on is unread")
+    check(open(path).read() == "old\n" and not os.path.exists(os.path.join(side.ctl, "np_ctl.tmp")), "np_pair: the unread np_ctl.on is not replaced")
+
+
+def test_helper_consoles_hidden(root):
+    # M5: the helper consoles np_gate.py and np_crosscheck.py start get CREATE_NO_WINDOW; np_gate --show-window reaches np_run
+    class Shim:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def __getattr__(self, name):
+            return getattr(subprocess, name)
+
+        def Popen(self, cmd, **kw):  # noqa: N802
+            self.calls.append((cmd, kw))
+            return subprocess.Popen([sys.executable, "-I", "-c", "pass"], creationflags=kw.get("creationflags", 0))
+
+        def run(self, cmd, **kw):
+            self.calls.append((cmd, kw))
+            return subprocess.run(cmd, **kw)
+
+    NO_WINDOW = 0x08000000
+    mod = load("np_gate")
+    calls = []
+    mod.subprocess = Shim(calls)
+    ns = type("A", (), dict(userdata="u", runs="r", timeout=5, exe=None, cache=None, env=[], arg=[], affinity=None, show_window=False))()
+    mod.run("record", "n", ns, [])
+    ns.show_window = True
+    mod.run("record", "n2", ns, [])
+    mod.compare("a", "b", root, False)
+    popens = [c for c in calls if "np_run.py" in " ".join(c[0])]
+    check(len(popens) == 2 and all(c[1].get("creationflags", 0) & NO_WINDOW for c in popens), f"np_gate: the np_run helpers get CREATE_NO_WINDOW: {[c[1].get('creationflags') for c in popens]}")
+    check("--show-window" not in popens[0][0] and "--show-window" in popens[1][0], "np_gate: --show-window is passed to np_run only when asked")
+    comp = [c for c in calls if "np_compare.py" in " ".join(c[0])]
+    check(len(comp) == 1 and comp[0][1].get("creationflags", 0) & NO_WINDOW, "np_gate: the np_compare helper gets CREATE_NO_WINDOW")
+    # end to end: the gate's runs start hidden by default and shown with --show-window
+    code, out, runs = gate(root, "gh", "--script", SCRIPT, "--replays", "1", FAKE_STARTUP_NOTE="1")
+    got = startup_note(runs, "gh_rec")
+    check(code == 0 and got is not None and got[0] == SW_SHOWMINNOACTIVE and got[1] & STARTF_USESHOWWINDOW, f"np_gate: a gate run starts hidden: exit {code} {got}")
+    code, out, runs = gate(root, "gs", "--script", SCRIPT, "--replays", "1", "--show-window", FAKE_STARTUP_NOTE="1")
+    got = startup_note(runs, "gs_rec")
+    check(code == 0 and got is not None and not got[1] & STARTF_USESHOWWINDOW, f"np_gate --show-window: the run is not hidden: exit {code} {got}")
+    # np_crosscheck: its np_compare helper
+    good = fixture_text("dpps_canon_sample.txt")
+    res, local = make_results(os.path.join(root, "cc"), dpps=good)
+    cc = load("np_crosscheck")
+    calls = []
+    cc.subprocess = Shim(calls)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            cc.main([res, "--local", local])
+        except SystemExit:
+            pass
+    comp = [c for c in calls if "np_compare.py" in " ".join(c[0])]
+    check(len(comp) >= 1 and all(c[1].get("creationflags", 0) & NO_WINDOW for c in comp), f"np_crosscheck: np_compare helpers get CREATE_NO_WINDOW ({len(comp)} calls)")
+
+
+def test_np_offline_check_hidden(root):
+    # I4: np_offline_check.py starts the game minimized without activation, like np_run.py
+    mod = load("np_offline_check")
+    ud = make_userdata(root)
+    runs = os.path.join(root, "oruns")
+    os.makedirs(runs)
+    fake_exe = os.path.join(HERE, "fake_offline_game.cmd")
+    saved = {k: os.environ.get(k) for k in ("FAKE_GAME_PYTHON", "FAKE_STARTUP_NOTE")}
+    old = (mod.RUNS, mod.PRISTINE, mod.CACHE, mod.GAME, mod.RUN_SECONDS)
+    try:
+        os.environ["FAKE_GAME_PYTHON"] = sys.executable
+        os.environ["FAKE_STARTUP_NOTE"] = "1"
+        mod.RUNS, mod.PRISTINE, mod.CACHE, mod.GAME, mod.RUN_SECONDS = runs, ud, os.path.join(root, "cache"), root, 2
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.main(["np_offline_check.py", fake_exe, "oh"])
+    finally:
+        (mod.RUNS, mod.PRISTINE, mod.CACHE, mod.GAME, mod.RUN_SECONDS) = old
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    got = startup_note(runs, "oh")
+    check(got is not None and got[0] == SW_SHOWMINNOACTIVE and got[1] & STARTF_USESHOWWINDOW, f"np_offline_check starts the game hidden: {got}")
 
 
 def main():

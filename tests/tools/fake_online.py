@@ -28,8 +28,12 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
                     `banner waiting`, and 10.0 s after the hold began ends with `lost`
   NO_SESSION=1      the session process starts (pids.txt line) but writes no session folder
   REFUSE=build|files|busy   this copy's join is refused with that reason (the host is not asked)
-  LEAKY=1           with REFUSE: the refusal is reported, and 0.5 s later a session process starts anyway (a refusal that
-                    did not hold)
+  LEAKY=1           with REFUSE: the refusal is reported, and LEAK_S (default 0.5) seconds later a session process starts
+                    anyway (a refusal that did not hold)
+  HANDOFF=1         with REFUSE: the refused copy writes ud/netplay/handoff.bin at once (a hand-off, no session)
+  NO_REFUSAL_KEY=1  status.txt carries no `refusal=` line
+  RELAUNCH=1        the offline relaunch is relaunched once more, 1 s after it was ended (a game that relaunches itself after a
+                    close request); LINGER bounds the life of the relaunched process
   BANNER_S=<s>      lost: the banner comes this long after the hold began (default 1.0)
   WRITE_SAVE=1      the session appends one byte to a file under <user_data_root>/B13EBABEBABEBABE
   FALLBACK=1 / WARN=1   fb_main_wait is 1 from frame 4 on / np_log holds a WARN line
@@ -38,6 +42,8 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
   FRAME_MS=<n>      n ms of wall clock per frame (default 0): a session others can watch and end while it runs
   LINGER=<s>        the offline relaunch lives this long (default 60)
   ROLE=decoy        (the tests) only logs its pid into its ctl/pids.txt and sleeps 120 s: a stand-in the harness does not own
+status.txt carries `refusal=<none|build|files|busy|proto|session|other>` (Task 9's contract): the kind of the join's refusal.
+The event texts are the REAL ones (np_rules.cpp of wt-np1 66ba37d), so a harness judging by keywords fails here as on the game.
 A host refuses a join with `refuse build` (build ids differ: BUILD_ID, +1 with DOA4_NP_TEST_BUILD_SALT=1), `refuse files <group>`
 (DOA4_NP_TEST_FILES_SALT differs) or `refuse busy` (it already has a peer).
 """
@@ -184,8 +190,13 @@ def my_build_id():
 
 
 def refusal_text(kind, group=""):
-    return {"build": "different build: this game and the host's differ, update both to the same release",
-            "files": f"game files differ: {group or 'xex'}", "busy": "host is busy with another player"}[kind]
+    """The lobby's real texts. build: MismatchAdvice, np_rules.cpp:551-566 (the "self-built exe" variant; the others: "...they need
+    the newest netplay release...", "...the other player runs a self-built exe...", "You have an older release (...)", "The other
+    player has an older release (...)", "Both games say the same version (...) but the builds differ: ..."); files: Judge,
+    np_rules.cpp:612-617; busy: Judge, np_rules.cpp:591."""
+    return {"build": "You run a self-built exe: both of you should use the latest netplay release (press Check for Updates).",
+            "files": f"The game files differ ({group or 'disc'}): both players need the same game files.",
+            "busy": "The host is already in an online session."}[kind]
 
 
 class State:
@@ -197,6 +208,7 @@ class State:
         self.delay = int(os.environ.get("DOA4_NP_DELAY", "") or 2)
         self.can_start = 0
         self.event = ""
+        self.refusal = "none"
         self.peer_ctl = None
         self.leak_at = None
         self.runs = os.path.dirname(os.path.dirname(os.path.normpath(ctl)))
@@ -204,7 +216,8 @@ class State:
     def write(self):
         atomic_write(os.path.join(self.ctl, "status.txt"),
                      f"state={self.state}\nport={self.port}\npeer_port={self.peer_port}\nping=1\ndelay={self.delay}\n"
-                     f"can_start={self.can_start}\nevent={self.event}\n")
+                     f"can_start={self.can_start}\nevent={self.event}\n"
+                     + ("" if os.environ.get("FAKE_ONLINE_NO_REFUSAL_KEY") == "1" else f"refusal={self.refusal}\n"))
 
     def ctls(self):
         found = []
@@ -242,9 +255,14 @@ def command(st, line):
         refuse = os.environ.get("FAKE_ONLINE_REFUSE")
         host = None if refuse else st.find_host(port)
         if refuse:
-            st.state, st.event = "offline", refusal_text(refuse, my_files_salt())
+            st.state, st.event, st.refusal = "offline", refusal_text(refuse, my_files_salt()), refuse
             if os.environ.get("FAKE_ONLINE_LEAKY") == "1":
-                st.leak_at = time.time() + 0.5
+                st.leak_at = time.time() + float(os.environ.get("FAKE_ONLINE_LEAK_S", "0.5"))
+            if os.environ.get("FAKE_ONLINE_HANDOFF") == "1":
+                ud = fake_game.arg_value("--user_data_root=")
+                os.makedirs(os.path.join(ud, "netplay"), exist_ok=True)
+                with open(os.path.join(ud, "netplay", "handoff.bin"), "wb") as f:
+                    f.write(b"handoff")
         elif host is None:
             st.state, st.event = "offline", f"no host at port {port}"
         else:
@@ -252,7 +270,7 @@ def command(st, line):
                          f"build={my_build_id()}\nfiles={my_files_salt()}\nctl={st.ctl}\nport={st.port}\n")
             st.state, st.event, st.peer_ctl, st.peer_port = "connecting", "joining", host, port
     elif cmd == "disconnect":
-        st.state, st.can_start, st.peer_port, st.peer_ctl, st.event = "offline", 0, 0, None, "disconnected"
+        st.state, st.can_start, st.peer_port, st.peer_ctl, st.event, st.refusal = "offline", 0, 0, None, "disconnected", "none"
     elif cmd == "delay" and len(words) > 1 and words[1].isdigit():
         st.delay = int(words[1])
     elif cmd == "start" and st.state == "connected" and st.can_start:
@@ -289,6 +307,7 @@ def joiner_poll(st):
     else:
         kind = words[1] if len(words) > 1 else "build"
         st.state, st.event, st.peer_ctl, st.peer_port = "offline", refusal_text(kind, " ".join(words[2:])), None, 0
+        st.refusal = kind
 
 
 def lobby(ctl):
@@ -307,13 +326,18 @@ def lobby(ctl):
             host_poll(st)
         if st.state == "connecting":
             joiner_poll(st)
-        if st.state == "connected" and take(os.path.join(ctl, "start.now")) is not None:
-            go = True
+        if st.state == "connected":
+            note = take(os.path.join(ctl, "start.now"))
+            if note is not None:
+                go = True
+                kv = dict(l.partition("=")[::2] for l in note.splitlines())
+                if kv.get("delay", "").isdigit():
+                    st.delay = int(kv["delay"])  # both copies run the host's delay
         if st.leak_at is not None and time.time() >= st.leak_at:
             go = True
         if go:
             if st.peer_ctl and st.can_start:  # the host tells its peer
-                atomic_write(os.path.join(st.peer_ctl, "start.now"), "go\n")
+                atomic_write(os.path.join(st.peer_ctl, "start.now"), f"go\ndelay={st.delay}\n")
             st.state, st.event = "starting", "starting"
             st.write()
             spawn_next("session", {"FAKE_ONLINE_PEER": st.peer_ctl or "", "FAKE_ONLINE_DELAY": str(st.delay)})
@@ -411,8 +435,19 @@ def session(ctl):
     return 0
 
 
+def guard(parent_pid, left):
+    """RELAUNCH: waits for the offline process to be ended, then starts another one (a game that relaunches itself)."""
+    while pid_alive(parent_pid):
+        time.sleep(0.05)
+    time.sleep(1.0)
+    spawn_next("offline", {"FAKE_ONLINE_RELAUNCH_LEFT": str(left - 1)})
+
+
 def offline(ctl):
     note_pid(ctl, "offline")
+    left = int(os.environ.get("FAKE_ONLINE_RELAUNCH_LEFT", "1" if os.environ.get("FAKE_ONLINE_RELAUNCH") == "1" else "0"))
+    if left > 0:
+        spawn_next("guard", {"FAKE_ONLINE_PARENT": str(os.getpid()), "FAKE_ONLINE_RELAUNCH_LEFT": str(left)})
     atomic_write(os.path.join(ctl, "status.txt"),
                  "state=offline\nport=0\npeer_port=0\nping=0\ndelay=0\ncan_start=0\nevent=back offline\n")
     deadline = time.time() + float(os.environ.get("FAKE_ONLINE_LINGER", "60"))
@@ -433,6 +468,8 @@ def online_main():
         time.sleep(120)
         return 0
     try:
+        if role == "guard":
+            return guard(int(os.environ["FAKE_ONLINE_PARENT"]), int(os.environ["FAKE_ONLINE_RELAUNCH_LEFT"]))
         return {"lobby": lobby, "session": session, "offline": offline}[role](ctl)
     except BaseException:  # a stand-in that dies leaves its traceback beside its pids.txt (its output is discarded)
         import traceback

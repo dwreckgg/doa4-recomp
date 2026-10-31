@@ -17,6 +17,11 @@ import subprocess
 import sys
 import time
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # py -3 -I does not put the script's folder on the path
+sys.dont_write_bytecode = True
+import np_run  # noqa: E402  (hidden_startupinfo)
+
 RUNS = r"C:/Users/fsop1/doa4/np_runs"
 PRISTINE = r"C:/Users/fsop1/doa4/np_phase0/ud_pristine"
 CACHE = r"C:/Users/fsop1/doa4/np_runs/cache_shared"
@@ -51,7 +56,8 @@ def main(argv):
     args = [exe, f"--game_data_root={GAME}", f"--user_data_root={ud}",
             f"--cache_path={CACHE}", f"--log_file={os.path.join(run, 'game.log')}",
             f"--doa4_photo_dir={photos}", "--doa4_photo_format=png_full"]
-    p = subprocess.Popen(args, env=env, cwd=os.path.dirname(exe), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(args, env=env, cwd=os.path.dirname(exe), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         startupinfo=np_run.hidden_startupinfo())  # minimized, no activation (as np_run.py)
     print("pid", p.pid, flush=True)
     time.sleep(RUN_SECONDS)
     p.terminate()

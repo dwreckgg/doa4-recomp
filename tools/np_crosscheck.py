@@ -105,7 +105,8 @@ def main(argv=None):
                 print("  friend:", line)
             ok = False
             continue
-        p = subprocess.run([sys.executable, "-I", os.path.join(HERE, "np_compare.py"), local, friend], capture_output=True, text=True)
+        p = subprocess.run([sys.executable, "-I", os.path.join(HERE, "np_compare.py"), local, friend], capture_output=True, text=True,
+                           creationflags=0x08000000)  # CREATE_NO_WINDOW
         if "Traceback" in p.stderr:  # a file np_compare cannot read: its last line says which; the traceback is not the answer
             print(f"== {name}: DIFFERS")
             print("  np_compare could not read the runs: " + [l for l in p.stderr.splitlines() if l.strip()][-1])
