@@ -816,12 +816,32 @@ class Pair:
                 self.problems.append(f"the checksums do not cross-match: host this {mh} other {oh}, joiner this {mj} other {oj}")
         elif (mh is not None and mh == oh) or (mj is not None and mj == oj):
             self.problems.append(f"the detecting copy's checksums do not differ: host this {mh} other {oh}, joiner this {mj} other {oj}")
-        code, out, first = self.compare(host, joiner)  # (3)
+        code, out, first = self.compare(host, joiner)  # (3): np_compare's lines are information; the rule is rows 0..F
         lines += [f"np_compare: {l.strip()}" for l in out if l.startswith(("digest", "sweep"))]
-        sweep_equal = any(re.match(r"sweep: .*; 0 blocks ever differ", l) for l in out)
-        if first is not None or not sweep_equal:
-            self.problems.append(f"the copies differ on the common frames (digest first difference: "
-                                 f"{'none' if first is None else 'frame %d' % first}; sweep equal: {sweep_equal}): "
+        upto = min(fh, fj)  # rows after F differ by design (the flip at F); both copies may write some before they end
+        bad, compared = [], 0
+        try:
+            paths = [os.path.join(s.session_dir(), n) for s in (host, joiner) for n in ("digest.d4d", "sweep.d4s")]
+            _, dh = np_compare.read_digest(paths[0])
+            _, dj = np_compare.read_digest(paths[2])
+            _, sh = np_compare.read_sweep(paths[1])
+            _, sj = np_compare.read_sweep(paths[3])
+            for f in sorted(set(dh) & set(dj)):
+                if f <= upto:
+                    compared += 1
+                    if dh[f] != dj[f]:
+                        bad.append(("digest", f))
+            for f in sorted(set(sh) & set(sj)):
+                if f <= upto and sh[f] != sj[f]:
+                    bad.append(("sweep", f))
+        except (OSError, SystemExit) as e:
+            self.problems.append(f"the digest or sweep files cannot be read: {e}")
+        lines.append(f"rows 0..{upto} compared on both copies: {compared} digest rows; first difference "
+                     f"{'none' if not bad else '%s frame %d' % min(bad, key=lambda b: b[1])}")
+        if bad or compared == 0:
+            first_bad = min(bad, key=lambda b: b[1]) if bad else None
+            self.problems.append(f"the copies differ on the common frames 0..{upto} ("
+                                 f"{'no row compared' if not bad else '%s first differs at frame %d' % first_bad}): "
                                  f"a desync before the forced one")
         dumps = {}  # (4)
         for s in (host, joiner):

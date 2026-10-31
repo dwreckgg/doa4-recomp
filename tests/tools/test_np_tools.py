@@ -2429,6 +2429,11 @@ def test_pair_desync(root):
     code, out, runs = np_pair(root, "de", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
                               "--env-joiner", "FAKE_ONLINE_DIVERGE=5")
     check(code == 1 and "common frames" in out and "frame 5" in out, f"np_pair, desync with an earlier common-row difference: exit {code}\n{out}")
+    # (3) covers rows 0..F only: both copies may advance past F before they end (p1h_s7a: host to 3003, joiner to 3002),
+    # and rows after F differ by design (the forced flip at F)
+    code, out, runs = np_pair(root, "dp", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-host", "FAKE_ONLINE_QUIT_AT=10")
+    check(code == 0 and "verdict desync" in out, f"np_pair, desync with common rows past F that differ: exit {code}\n{out}")
     # (1) the sides name different frames
     code, out, runs = np_pair(root, "df", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=6",
                               "--env-joiner", "FAKE_ONLINE_DIVERGE=8")
