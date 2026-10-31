@@ -348,7 +348,7 @@ static void TestBanner() {
   CHECK_EQ(BannerText(false, Ending::kDesync), "The games went out of sync. The session ended; both games restart.");
   CHECK_EQ(BannerText(false, Ending::kLost),
            "The other player stopped responding. The session ended; both games restart.");
-  CHECK_EQ(BannerText(false, Ending::kPeerLeft), "The other player left the session.");
+  CHECK_EQ(BannerText(false, Ending::kPeerLeft), "The other player quit the session.");  // Task 15 G2
   CHECK_EQ(BannerText(false, Ending::kFrame0Timeout), "The other player's game did not come back.");
   CHECK_EQ(BannerText(false, Ending::kLeft), "You left the session.");
   CHECK_EQ(BannerText(false, Ending::kInternal), "The session ended unexpectedly; both games restart.");

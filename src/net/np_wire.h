@@ -71,6 +71,8 @@ struct Chunk {  // wire: u32 msg_id, u8 msg_type, u8 count, u8 index, u8 0, u16 
   std::span<const uint8_t> payload;   // at most kChunkBytes; its length travels in the body, so a cut body is refused
 };
 struct Ack { uint32_t msg_id = 0; std::array<uint64_t, 4> have{}; };
+// frame: the frame the sender's session ended at; for kDesync the frame the desync was found at (Task 15 G1: the
+// receiver ends as a desync naming it). Same bytes as before: no protocol change.
 struct Leave { LeaveReason reason = LeaveReason::kLeft; int32_t frame = 0; };
 struct BootReply { uint32_t session_token = 0; uint8_t ok = 0; std::string text; };
 

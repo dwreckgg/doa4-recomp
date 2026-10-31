@@ -518,6 +518,8 @@ def session(ctl):
         mine, theirs = ("64FF99A4", "25C3DF78") if os.environ.get("FAKE_ONLINE_HOST") == "1" else ("25C3DF78", "64FF99A4")
         theirs = os.environ.get("FAKE_ONLINE_DESYNC_OTHER", theirs)
         reason = f"desync at frame {first} (this side {mine}, other side {theirs})"
+        if os.environ.get("FAKE_ONLINE_DESYNC_REPORTED") == "1":  # the end on the other side's Leave (Task 15 G1)
+            reason = f"desync at frame {first} (reported by the other player)"
         dump = bytearray(4096)
         if diverge is not None:
             dump[100] = 1

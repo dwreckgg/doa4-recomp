@@ -172,7 +172,7 @@ std::string BannerText(bool waiting, Ending ending) {
   switch (ending) {
     case Ending::kDesync: return "The games went out of sync. The session ended; both games restart.";
     case Ending::kLost: return "The other player stopped responding. The session ended; both games restart.";
-    case Ending::kPeerLeft: return "The other player left the session.";
+    case Ending::kPeerLeft: return "The other player quit the session.";
     case Ending::kFrame0Timeout: return "The other player's game did not come back.";
     case Ending::kLeft: return "You left the session.";
     case Ending::kInternal: return "The session ended unexpectedly; both games restart.";

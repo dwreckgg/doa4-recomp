@@ -52,6 +52,9 @@ struct FrameResult {
   // The frame of the end: the Leave / PeerLeft frame for kLeft / kPeerLeft (the same number on both sides), else the
   // frame of the Frame call that returned it. A desync names GekkoNet's frame in `why`.
   int32_t end_frame = 0;
+  // kDesync: the frame the desync was found at (GekkoNet's own detection, or the frame the other side reported in its
+  // Leave with reason desync, Task 15 G1); -1 otherwise.
+  int32_t desync_frame = -1;
   std::string why;      // e.g. "desync at frame 3000 (this side 1A2B3C4D, other side 5E6F7081)"
   Timing timing;
   uint32_t holds = 0;   // holds reported since the session began (this frame's included)

@@ -763,13 +763,16 @@ class Pair:
         parsed = {}
         for s, t in ((host, th), (joiner, tj)):
             m = re.match(r"^desync at frame (\d+) \(this side ([0-9A-Fa-f]+), other side ([0-9A-Fa-f]+)\)", t[1])
-            if not m:
+            r = re.match(r"^desync at frame (\d+) \(reported by the other player\)", t[1])  # Task 15 G1: the end on a Leave
+            if m:
+                parsed[s.name] = (int(m.group(1)), m.group(2).upper(), m.group(3).upper())
+            elif r:
+                parsed[s.name] = (int(r.group(1)), None, None)
+            else:
                 self.problems.append(f"the {s.name} copy ended {t[1]!r}, expected a desync")
-                continue
-            parsed[s.name] = (int(m.group(1)), m.group(2).upper(), m.group(3).upper())
         if len(parsed) < 2:
             return
-        (fh, mh, oh), (fj, mj, oj) = parsed["host"], parsed["joiner"]
+        (fh, mh, oh), (fj, mj, oj) = parsed["host"], parsed["joiner"]  # mh/oh None: that side ended on a reported desync
         lines.append(f"desync: host frame {fh} this {mh} other {oh}; joiner frame {fj} this {mj} other {oj}")
         if fh != fj:  # (1)
             self.problems.append(f"the copies name different frames: host desync at frame {fh}, joiner at frame {fj}")
@@ -777,8 +780,14 @@ class Pair:
         for v in forced:
             if v.isdigit() and (fh != int(v) or fj != int(v)):
                 self.problems.append(f"the desync is named at frame {fh}/{fj}, but it was forced at frame {v}")
-        if not (oh == mj and oj == mh and mh != mj):  # (2)
-            self.problems.append(f"the checksums do not cross-match: host this {mh} other {oh}, joiner this {mj} other {oj}")
+        # (2) only the values each side logged: a side that ended on the other's report knows no checksum (Task 15 G1)
+        if mh is None and mj is None:
+            self.problems.append("neither copy found the desync itself: both ended on a reported desync")
+        elif mh is not None and mj is not None:
+            if not (oh == mj and oj == mh and mh != mj):
+                self.problems.append(f"the checksums do not cross-match: host this {mh} other {oh}, joiner this {mj} other {oj}")
+        elif (mh is not None and mh == oh) or (mj is not None and mj == oj):
+            self.problems.append(f"the detecting copy's checksums do not differ: host this {mh} other {oh}, joiner this {mj} other {oj}")
         code, out, first = self.compare(host, joiner)  # (3)
         lines += [f"np_compare: {l.strip()}" for l in out if l.startswith(("digest", "sweep"))]
         sweep_equal = any(re.match(r"sweep: .*; 0 blocks ever differ", l) for l in out)

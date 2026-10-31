@@ -736,9 +736,9 @@ static void TestLeave() {
       if (f == 150) me.live->Leave(200);
       if (f == 152) me.live->Leave(205);
     };
-    // The reason travels with the frame (one atomic): kDesync, not the default kLeft.
+    // The reason travels with the frame (one atomic). (A kDesync reason is TestReportedDesync's: it ends as a desync.)
     w.a[1].before_frame = [](Actor& me, int32_t f) {
-      if (f == 150) me.live->PeerLeft(200, wire::LeaveReason::kDesync);
+      if (f == 150) me.live->PeerLeft(200, wire::LeaveReason::kLeft);
     };
     Setup(w);
     Run(w);
@@ -753,7 +753,7 @@ static void TestLeave() {
            "B: end %s at %d in Frame(%d), %d ok", rb ? EndName(rb->end) : "-", rb ? rb->end_frame : -1,
            B.results.empty() ? -1 : B.results.back().first, OkCount(B));
     CHECKF(B.gk.local_inputs_added() == 200, "B: %u adds", B.gk.local_inputs_added());
-    CHECKF(rb && rb->why == "the other player left at frame 200 (desync)", "B's why \"%s\"", rb ? rb->why.c_str() : "");
+    CHECKF(rb && rb->why == "the other player left at frame 200 (left)", "B's why \"%s\"", rb ? rb->why.c_str() : "");
   }
   {
     // M1 (fix round 1): a Leave for a frame already past ends the next call, and end_frame is the Leave frame.
@@ -773,6 +773,46 @@ static void TestLeave() {
            A.results.empty() ? -1 : A.results.back().first, OkCount(A), ra ? ra->why.c_str() : "");
     const EvRec* e = FindEv(A, live::Event::kEnd);
     CHECKF(e && e->frame == 195, "A: kEnd event frame %d", e ? e->frame : -1);
+  }
+}
+
+// Task 15 G1: the other side's Leave with reason desync ends this side as a DESYNC (not as peer left), at once, naming
+// the frame the other side reported: "desync at frame D (reported by the other player)", desync_frame D, end_frame the
+// frame of the call. GekkoNet's own detection is unchanged (TestDesync) and also sets desync_frame.
+static void TestReportedDesync() {
+  Group("reported desync (Leave with reason desync)");
+  World w;
+  w.label = "reported desync";
+  w.a[0].frames = w.a[1].frames = 260;
+  w.a[1].before_frame = [](Actor& me, int32_t f) {
+    if (f == 150) me.live->PeerLeft(148, wire::LeaveReason::kDesync);
+  };
+  w.a[0].before_frame = [](Actor& me, int32_t f) {
+    if (f == 152) me.live->Leave(152);
+  };
+  Setup(w);
+  Run(w);
+  const Actor& B = w.a[1];
+  const live::FrameResult* rb = Last(B);
+  CHECKF(rb && !rb->ok && rb->end == live::End::kDesync, "B: end %s (want desync)", rb ? EndName(rb->end) : "-");
+  CHECKF(rb && rb->why == "desync at frame 148 (reported by the other player)", "B's why \"%s\"", rb ? rb->why.c_str() : "");
+  CHECKF(rb && rb->desync_frame == 148, "B: desync_frame %d", rb ? rb->desync_frame : -1);
+  CHECKF(rb && rb->end_frame == 150 && B.results.back().first == 150 && OkCount(B) == 150, "B: ended in Frame(%d) at %d, %d ok",
+         B.results.empty() ? -1 : B.results.back().first, rb ? rb->end_frame : -1, OkCount(B));
+  CHECKF(CountEv(B, live::Event::kEnd) == 1, "B: %d kEnd events", CountEv(B, live::Event::kEnd));
+}
+
+static void TestDesyncFrameOwn() {
+  Group("own desync names desync_frame");
+  World w;
+  w.label = "desync frame";
+  w.a[0].frames = w.a[1].frames = 200;
+  w.a[1].bad_frame = 150;
+  Setup(w);
+  Run(w);
+  for (int s = 0; s < 2; ++s) {
+    const live::FrameResult* r = Last(w.a[s]);
+    CHECKF(r && r->end == live::End::kDesync && r->desync_frame == 150, "side %d: desync_frame %d", s, r ? r->desync_frame : -1);
   }
 }
 
@@ -1111,6 +1151,8 @@ int main(int argc, char** argv) {
   TestFrame0();
   TestDesync();
   TestLeave();
+  TestReportedDesync();
+  TestDesyncFrameOwn();
   TestLoad();
   TestPacer();
   TestPing();

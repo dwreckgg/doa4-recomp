@@ -80,6 +80,7 @@ struct Host {
   std::string release;                               // DOA4_RELEASE_TAG (np_log's first line)
   std::function<bool()> session_refused;             // the session lobby's Status::session_refused (carry 2g)
   std::function<void()> stop_transport;              // Shutdown's first step: the session lobby's transport Stop
+  std::function<bool(int32_t frame)> quit_session;   // Task 15 G2: Shutdown of a running session: Leave, flush (<= 150 ms), Stop
 };
 
 // Reads the configuration; called once before any guest code runs.

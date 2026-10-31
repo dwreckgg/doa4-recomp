@@ -694,7 +694,7 @@ const char* EndText(live::End e) {
 std::string TerminalReason(const live::FrameResult& r, bool refused) {
   if (refused) return "internal: the other player's game did not start the session";
   switch (r.end) {
-    case live::End::kDesync: return r.why;  // "desync at frame N (this side X, other side Y)"
+    case live::End::kDesync: return r.why;  // "desync at frame N (this side X, other side Y)" or "... (reported by the other player)"
     case live::End::kInternal: return "internal: " + r.why;
     default: return EndText(r.end);
   }
@@ -816,7 +816,10 @@ void EndOnline(State& s, const live::FrameResult& r, bool at_hook) {
   if (r.end == live::End::kDesync) Log("desync: " + r.why + " (a dump of .data was queued)");
   // the Leave to the peer (lobby channel, sent 3 times by the lobby); on a desync too (carry 2i: a lossy link can drop
   // GekkoNet's one checksum message)
-  if (s.host.send_leave && r.end != live::End::kPeerLeft) s.host.send_leave(f, LeaveReasonFor(r.end));
+  // Task 15 G1: a desync's Leave carries the DESYNC frame (wire.h Leave: for kDesync the frame is the desync frame), so
+  // the other side, which ends on it as a desync too, names the same frame
+  if (s.host.send_leave && r.end != live::End::kPeerLeft)
+    s.host.send_leave(r.end == live::End::kDesync && r.desync_frame >= 0 ? r.desync_frame : f, LeaveReasonFor(r.end));
   {
     std::lock_guard lk(s.result_mu);
     s.last_result = r;
@@ -1647,13 +1650,23 @@ void LogLine(const std::string& line) { Log(line); }
 // by 3 s: joined 0/3 leaked, detached 3/3 leaked (the capture ran after Shutdown had returned).
 // The host's shutdown watchdog (5 s, armed in OnShutdown just before this) ends the process if the drain
 // is slower: 36 queued shots took 1.9 s.
-// Online: the session's transport stops first (bounded by 200 ms, Task 7); a session still running (the game was
-// closed) ends as a leave without the offline relaunch; the watch and restart threads stop.
+// Online: the session's transport stops first (bounded by 200 ms, Task 7), after the quit Leave when the session still
+// runs (Task 15 G2); a session still running (the game was closed) ends as a leave without the offline relaunch; the
+// watch and restart threads stop.
 void Shutdown() {
   State& s = S();
   if (s.mode == Mode::kOff) return;
   if (s.mode == Mode::kOnline) {
-    if (s.host.stop_transport) s.host.stop_transport();
+    // Task 15 G2: a session still running when the game is closed is a quit: the Leave goes to the other player BEFORE
+    // the transport stops (Lobby::QuitSession: 3 sends, at most 150 ms), so the other side ends at once with `peer left`
+    // instead of waiting for its 10 s limit. An ended session (or none) only stops the transport.
+    if (!s.ended && s.host.quit_session) {
+      const int32_t qf = s.session_frame.load() < 0 ? 0 : s.session_frame.load();
+      const bool sent = s.host.quit_session(qf);
+      Log(std::string("quit: Leave to the other player at frame ") + std::to_string(qf) + (sent ? " sent" : " not confirmed within 150 ms"));
+    } else if (s.host.stop_transport) {
+      s.host.stop_transport();
+    }
     {
       std::lock_guard lk(s.watch_mu);
       s.watch_stop = true;

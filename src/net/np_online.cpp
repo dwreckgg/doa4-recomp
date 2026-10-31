@@ -323,6 +323,7 @@ struct Lobby::Impl {
   std::function<void(int32_t, wire::LeaveReason)> on_left;
   bool left_called = false;
   int leave_repeat = 0;
+  uint64_t leave_sends = 0;  // Leaves sent so far (QuitSession waits on it; under mu)
   wire::Leave leave_out;
   uint32_t session_reply_sent = 0;
   bool session_reply_ever = false, wrong_source_logged = false;
@@ -1317,6 +1318,7 @@ void Lobby::Impl::Tick(uint32_t now) {
     if (leave_repeat > 0) {
       --leave_repeat;
       SendPeer(wire::Type::kLeave, wire::EncodeLeave(leave_out));
+      ++leave_sends;
     }
     return;
   }
@@ -1522,6 +1524,28 @@ void Lobby::SendLeave(int32_t frame, wire::LeaveReason reason) {
   c.leave.reason = reason;
   Push(*impl_, c);
 }
+
+bool Lobby::QuitSession(int32_t frame, uint32_t max_wait_ms) {
+  uint64_t target = 0;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    target = impl_->leave_sends + 3;  // the Tick sends the Leave 3 times (leave_repeat)
+  }
+  SendLeave(frame, wire::LeaveReason::kLeft);
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_wait_ms);
+  bool sent = false;
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(impl_->mu);
+      sent = impl_->leave_sends >= target;
+    }
+    if (sent || std::chrono::steady_clock::now() >= end) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  impl_->t.Stop();  // only now: the Leave had its chance to go out (Task 15 G2)
+  return sent;
+}
+
 
 Status Lobby::status() const {
   std::lock_guard<std::mutex> lock(impl_->mu);

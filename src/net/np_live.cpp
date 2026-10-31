@@ -97,6 +97,15 @@ FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& loc
     }
     const uint64_t packed = peer_left_.load();
     const int32_t peer = int32_t(uint32_t(packed));
+    if (packed != kNoPeerLeft && wire::LeaveReason(uint8_t(packed >> 32)) == wire::LeaveReason::kDesync) {
+      // Task 15 G1: the other side found a desync and left: this side ends as a desync too, at once (its own GekkoNet
+      // may not have seen the mismatch yet), naming the frame the other side reported, so both sides keep a dump.
+      char why[96];
+      std::snprintf(why, sizeof why, "desync at frame %d (reported by the other player)", int(peer));
+      r.desync_frame = peer;
+      *out = Finish(r, End::kDesync, f, why, at);
+      return true;
+    }
     if (f >= peer) {
       char why[96];
       std::snprintf(why, sizeof why, "the other player left at frame %d (%s)", int(peer),
@@ -133,6 +142,7 @@ FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& loc
       // detects first) and GekkoNet sends it only at the next one: one poll sends it without advancing, so the peer
       // ends on the desync too instead of waiting end_ms for input (np_gekko.h, Poll).
       gekko_->Poll();
+      r.desync_frame = int32_t(e.frame);
       return Finish(r, End::kDesync, f, why, t1);
     }
     if (step.end != exec::End::kNone) return Finish(r, End::kInternal, f, step.why, t1);

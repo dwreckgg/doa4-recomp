@@ -2410,6 +2410,17 @@ def test_pair_desync(root):
                               "--env-joiner", "FAKE_ONLINE_DIVERGE=8")
     check(code == 0 and "verdict desync" in out, f"np_pair, desync expected and seen (the game's shape): exit {code}\n{out}")
     check("frames on one side only" in out and "8..9" in out, f"np_pair, desync: np_compare names the frames on one side only\n{out}")
+    # Task 15 G1: the other side ended on the reported desync ("desync at frame F (reported by the other player)"): it
+    # logged no checksums, so (2) checks only the values logged; (4) still needs its dump
+    code, out, runs = np_pair(root, "dr", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "FAKE_ONLINE_DESYNC_REPORTED=1")
+    check(code == 0 and "verdict desync" in out and "reported by the other player" in out,
+          f"np_pair, desync with the joiner ending on the host's report: exit {code}\n{out}")
+    # both sides "reported": nobody found the desync itself
+    code, out, runs = np_pair(root, "drr", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
+                              "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "FAKE_ONLINE_DESYNC_REPORTED=1",
+                              "--env-host", "FAKE_ONLINE_DESYNC_REPORTED=1")
+    check(code == 1 and "neither copy found the desync itself" in out, f"np_pair, desync reported by both: exit {code}\n{out}")
     # (2) checksums that do not cross-match
     code, out, runs = np_pair(root, "dx", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DESYNC_AT=7",
                               "--env-joiner", "FAKE_ONLINE_DIVERGE=8", "--env-joiner", "FAKE_ONLINE_DESYNC_OTHER=DEADBEEF")

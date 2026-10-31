@@ -1170,6 +1170,41 @@ static void TestSession() {
   joiner.Stop();
 }
 
+// Task 15 G2: a session closed by the player (np::Shutdown) quits through Lobby::QuitSession: the Leave (kLeft) goes out
+// BEFORE the transport stops, repeated, within a bounded wait (<= 150 ms), so the other side ends at once instead of after
+// its 10 s limit.
+static void TestSessionQuit() {
+  if (!Group("session quit: the Leave reaches the other side before the transport stops, within 150 ms")) return;
+  handoff::Handoff H, J;
+  CHECK(!g_handoffs.host.empty() && handoff::Unpack(g_handoffs.host, &H).empty() && handoff::Unpack(g_handoffs.joiner, &J).empty());
+  if (g_handoffs.host.empty()) return;
+  Side hs("quit_host"), js("quit_join");
+  std::mutex mu;
+  std::vector<std::pair<int32_t, wire::LeaveReason>> left_h;
+  online::Lobby host, joiner;
+  std::string e;
+  CHECKF(host.StartInSession(hs.P(), LoopCfg(), H, [&](int32_t f, wire::LeaveReason r) {
+    std::lock_guard<std::mutex> lock(mu);
+    left_h.emplace_back(f, r);
+  }, &e), "host StartInSession: %s", e.c_str());
+  CHECKF(joiner.StartInSession(js.P(), LoopCfg(), J, [](int32_t, wire::LeaveReason) {}, &e), "joiner StartInSession: %s", e.c_str());
+  CHECK(WaitFor([&] { return host.status().state == State::kInSession && joiner.status().state == State::kInSession; }, 7000));
+  const int64_t t0 = NowUs();
+  const bool flushed = joiner.QuitSession(4500, 150);
+  const int64_t took_ms = (NowUs() - t0) / 1000;
+  std::printf("info: session quit: QuitSession returned %d after %lld ms\n", int(flushed), (long long)took_ms);
+  CHECKF(flushed, "QuitSession reports the Leave sent (%lld ms)", (long long)took_ms);
+  CHECKF(took_ms <= 200, "QuitSession took %lld ms (bound 150 ms + scheduling)", (long long)took_ms);
+  CHECK(WaitFor([&] { std::lock_guard<std::mutex> lock(mu); return !left_h.empty(); }, 1000));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    CHECKF(left_h.size() == 1, "on_peer_left ran %zu times on the host", left_h.size());
+    if (!left_h.empty()) CHECK(left_h[0].first == 4500 && left_h[0].second == wire::LeaveReason::kLeft);
+  }
+  host.Stop();
+  joiner.Stop();
+}
+
 static void TestSessionSpoof() {
   if (!Group("session spoofing: Leave/Bye need the peer's address and token; a negative frame is clamped to -1")) return;
   Side ss("sspoof");
@@ -1958,6 +1993,7 @@ int main(int argc, char** argv) {
   TestJoinerSilent();
   TestStartRefusals();
   TestSession();
+  TestSessionQuit();
   TestSessionSpoof();
   TestRequestFiles();
   TestConnectTimeout();

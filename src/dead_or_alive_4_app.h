@@ -505,6 +505,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     };
     host.transport = [this]() -> doa4::np::net::Transport* { return lobby_ ? &lobby_->transport() : nullptr; };
     host.session_refused = [this] { return lobby_ && lobby_->status().session_refused; };
+    host.quit_session = [this](int32_t frame) { return lobby_ ? lobby_->QuitSession(frame, 150) : false; };
     host.stop_transport = [this] {
       if (lobby_) lobby_->transport().Stop();
     };
