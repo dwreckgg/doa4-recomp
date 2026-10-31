@@ -18,7 +18,8 @@ taking the focus: STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE, so a run never pops
 The game's environment gets SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000 (SDL opens no real controller)
 unless the caller set that variable; command.txt lists it with the DOA4_ variables.
 A run whose game.log lacks the dot-product self-test line "[doa4][LIFE] dot products: canonical NaN on" (or reports OFF)
-is never a good run either (selftest_problem()).
+is never a good run either (selftest_problem()), nor one whose game.log holds the SDK's lazy-pool WARN tag "[netplay-lazy-pool]"
+(lazy_pool_problem(); the run's own game.log, in its fresh run folder).
 Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
 A replay the session refuses (another build, fix set, game data or settings than the recording's) or cannot read is
 never a good run: run_result.txt then has "status failed" and "quit refused: ..." / "quit cannot replay ...", or
@@ -75,6 +76,22 @@ def hidden_startupinfo():
     return si
 
 
+# The tag of the SDK's two lazy-pool WARN lines (sdk-np1 ad1b589: object_table.cpp FindFreeSlot "an ordinary object took slot N
+# of the lazy pool", xobject.cpp GetNativeObject "keeps the low handle ... later guest handles are shifted"): either means the
+# run's guest handles may depend on host timing (debug 82B70000). game.log prints them as "[warning] [sys] [tN] <tag> ...", which
+# the np_log WARN_PREFIX rule never sees, so a run's own game.log is searched for the tag (Task 15 carry a).
+LAZY_POOL_TAG = "[netplay-lazy-pool]"
+
+
+def lazy_pool_problem(lines):
+    """None if no line of the game log `lines` carries LAZY_POOL_TAG; else "lazy-pool WARN: <the first such line, from the tag>"."""
+    for l in lines:
+        at = l.find(LAZY_POOL_TAG)
+        if at >= 0:
+            return "lazy-pool WARN: " + l[at:].strip()
+    return None
+
+
 def selftest_problem(lines):
     """None if the game log `lines` hold the dot-product self-test line and every such line says "on"; else why not."""
     found = []
@@ -100,7 +117,8 @@ def judge(mode, code, timed_out, log_lines, out_dir=None, game_lines=None):
     A run whose log holds a line starting with WARN_PREFIX is failed with the reason "<the first WARN line>
     (<the quit line, or 'no quit line'>)".
     game_lines (the game.log lines; None: not checked) must hold the dot-product self-test line saying "on"
-    (selftest_problem): a run that would otherwise be good fails with "<the problem> (<the quit line>)"."""
+    (selftest_problem): a run that would otherwise be good fails with "<the problem> (<the quit line>)"; and must hold no
+    line with the SDK's LAZY_POOL_TAG (lazy_pool_problem): such a run fails with "lazy-pool WARN: <line> (<the quit line>)"."""
     at = next((i for i, l in enumerate(log_lines) if l.startswith(REFUSAL_PREFIXES)), None)
     if at is not None:
         flaws = []
@@ -119,6 +137,9 @@ def judge(mode, code, timed_out, log_lines, out_dir=None, game_lines=None):
     warn = next((l for l in log_lines if l.startswith(WARN_PREFIX)), None)
     if warn is not None:
         return "failed", f"{warn} ({quit_line or 'no quit line'})"
+    lazy = lazy_pool_problem(game_lines) if game_lines is not None else None
+    if lazy is not None:
+        return "failed", f"{lazy} ({quit_line or 'no quit line'})"
     reason = quit_line.split(": ", 1)[1] if quit_line and ": " in quit_line else None
     ok = not timed_out and code == 0 and reason in OK_REASONS[mode]
     problem = selftest_problem(game_lines) if ok and game_lines is not None else None

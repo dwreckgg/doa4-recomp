@@ -49,6 +49,10 @@ bool KnownUnregisteredSetting(std::string_view name) {
   return name == "kernel_pix" || name == "vulkan_readback_resolve" || name == "vulkan_readback_memexport";
 }
 
+bool TestNoRestart(bool test_dir_set, const char* value) {
+  return test_dir_set && value != nullptr && std::string_view(value) == "1";
+}
+
 namespace {
 
 std::string Text(const fs::path& p) {

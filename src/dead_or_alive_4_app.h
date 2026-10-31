@@ -591,6 +591,14 @@ class DeadOrAlive4App : public rex::ReXApp {
       app_context().CallInUIThreadDeferred([this] {
         std::string e;
         const std::filesystem::path h = doa4::np::restart::HandoffPath(user_data_);
+        if (doa4::np::restart::TestNoRestart(!test_dir_.empty(), std::getenv("DOA4_NP_TEST_NO_RESTART"))) {
+          // Task 15 carry f (gate S8d): the harness's lobby-only peer. It said yes but stays a lobby, so the other
+          // game's session Hello reaches a lobby; no hand-off is left behind for a later start.
+          REXLOG_INFO("[doa4][NET] test: DOA4_NP_TEST_NO_RESTART=1: not restarting into the session (staying a lobby)");
+          std::error_code ec;
+          std::filesystem::remove(h, ec);
+          return;
+        }
         if (!doa4::np::restart::Relaunch(&h, false, &e)) {
           REXLOG_ERROR("[doa4][NET] relaunch into the session failed: {}", e);
           std::error_code ec;

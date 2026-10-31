@@ -2828,6 +2828,260 @@ def test_np_offline_check_hidden(root):
     check(got is not None and got[0] == SW_SHOWMINNOACTIVE and got[1] & STARTF_USESHOWWINDOW, f"np_offline_check starts the game hidden: {got}")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Task 15 carries: (a) the SDK's lazy-pool WARN tag fails a run; (b) the frame-0 .data instrument of every pair and the
+# handle-shift detector; (c) no generated code imports ObOpenObjectByPointer; (f) the lobby-only peer (--expect
+# refused-session).
+# ---------------------------------------------------------------------------------------------------------------------
+LAZY_TAG = "[netplay-lazy-pool]"
+
+
+def test_lazy_pool_rule(root):
+    mod = load("np_run")
+    line = fake_game_module().LAZY_POOL_LINE
+    # the SDK's other tagged line (sdk-np1 object_table.cpp FindFreeSlot), as game.log prints it
+    other = ("[2026-10-31 10:40:50.000] [warning] [sys] [t77] [netplay-lazy-pool] ObjectTable: an ordinary object took slot "
+             "9000 of the lazy pool (8192..16383); later lazy objects may move")
+    # healthy game.log lines a needle must not take: other warnings, the GetNativeObject text without the tag, the tag's word
+    healthy = ["[2026-10-31 10:40:48.346] [info] [core] [t1] [doa4][LIFE] dot products: canonical NaN on",
+               "[2026-10-31 10:40:48.400] [warning] [sys] [t2] SDL: gamecontrollerdb.txt not found",
+               "[2026-10-31 10:40:48.500] [warning] [sys] [t3] GetNativeObject: the lazy object for header 1 (type 0)",
+               "[2026-10-31 10:40:48.600] [info] [core] [t4] netplay-lazy-pool mentioned without its brackets"]
+    check(mod.lazy_pool_problem([]) is None and mod.lazy_pool_problem(healthy) is None,
+          f"lazy_pool_problem: nothing on healthy lines: {mod.lazy_pool_problem(healthy)!r}")
+    got = mod.lazy_pool_problem(healthy + [line])
+    check(got is not None and LAZY_TAG in got and "GetNativeObject" in got, f"lazy_pool_problem: the GetNativeObject WARN: {got!r}")
+    got = mod.lazy_pool_problem([other] + healthy)
+    check(got is not None and "ObjectTable" in got, f"lazy_pool_problem: the FindFreeSlot WARN: {got!r}")
+    on = ["x [doa4][LIFE] dot products: canonical NaN on"]
+    log = ["quit at frame 11: quit frame"]
+    status, why = mod.judge("record", 0, False, log, None, on + [line])
+    check(status == "failed" and LAZY_TAG in why and "quit at frame 11" in why, f"judge: a tagged line fails a good run: {status} {why!r}")
+    status, why = mod.judge("replay", 0, False, ["quit at frame 12: end of the recording"], None, on + [other])
+    check(status == "failed" and LAZY_TAG in why, f"judge: a replay with the tag fails too: {status} {why!r}")
+    check(mod.judge("record", 0, False, log, None, on + healthy) == ("ok", "quit at frame 11: quit frame"),
+          "judge: healthy warnings leave a good run good")
+    # end to end through np_run (the run's own game.log) and np_pair (each copy's own game.log)
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+
+    def np_run(name, **env):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60"],
+                           capture_output=True, text=True, env=stand_in_env(**env), timeout=120)
+        return p.returncode, p.stdout + p.stderr
+    code, out = np_run("lz_ok")
+    check(code == 0 and result(runs, "lz_ok") == REC_OK, f"np_run, control without the tag: exit {code} {result(runs, 'lz_ok')!r}")
+    code, out = np_run("lz_bad", FAKE_LAZY_POOL="1")
+    res = result(runs, "lz_bad") or ""
+    check(code == 1 and "status failed" in res and LAZY_TAG in res, f"np_run, the tag in game.log: exit {code} {res!r}")
+    code, out, pruns = np_pair(root, "lzj", "--env-joiner", "FAKE_LAZY_POOL=1")
+    named = [l for l in out.splitlines() if l.startswith("problem: joiner game.log") and LAZY_TAG in l]
+    check(code == 1 and len(named) == 1, f"np_pair, the tag in the joiner's game.log: exit {code}\n{out}")
+    check("host game.log" not in out, f"np_pair, the tag on the joiner only: the host is not named\n{out}")
+    check("verdict FAILED" in pair_verdict(pruns, "lzj"), "np_pair, the tag: the verdict file says FAILED")
+
+
+DUMP_LO = 0x82B70000
+
+
+def dump_bytes(n=0x30000, seed=3):
+    return bytearray((i * 7 + seed) & 0xFF for i in range(n))
+
+
+def put_word(d, addr, value):
+    struct.pack_into(">I", d, addr - DUMP_LO, value)
+
+
+def test_sweep_masks_match_source(root):
+    # np_dumpdiff.SWEEP_MASKS is the in-game sweep's mask list (np_session.cpp kSweepMasks), pinned against the source
+    mod = load("np_dumpdiff")
+    src = open(os.path.join(HERE, "..", "..", "src", "net", "np_session.cpp"), encoding="utf-8").read()
+    table = re.search(r"kSweepMasks\[\]\s*=\s*\{(.*?)\n\};", src, re.S)
+    rows = re.findall(r"\{\s*0x([0-9A-Fa-f]+),\s*(0x[0-9A-Fa-f]+|\d+),", table.group(1)) if table else []
+    masks = [(int(a, 16), int(n, 0)) for a, n in rows]
+    check(len(masks) >= 6, f"np_session.cpp kSweepMasks: expected at least 6 rows, found {masks}")
+    check(sorted(mod.SWEEP_MASKS) == sorted(masks), f"np_dumpdiff.SWEEP_MASKS vs np_session.cpp kSweepMasks:\n{mod.SWEEP_MASKS}\n{masks}")
+
+
+def test_frame0_diff(root):
+    mod = load("np_dumpdiff")
+    a, b = dump_bytes(), dump_bytes()
+    check(mod.frame0_difference(bytes(a), bytes(b)) is None, "frame0_difference: equal dumps: none")
+    # a difference inside a sweep mask (the thread-notify section's wait-list words) is not one
+    b1 = bytearray(b)
+    put_word(b1, 0x82B747D8, 0x52455800)
+    put_word(b1, 0x82B747DC, 0xF8000054)
+    check(mod.frame0_difference(bytes(a), bytes(b1)) is None, "frame0_difference: a stash inside the 82B747D8 mask is not a difference")
+    # a stash word (after "REX\0" in both dumps) holding different handles is not one
+    a2, b2 = bytearray(a), bytearray(b)
+    a2[0x20000:0x20008] = b"REX\x00" + struct.pack(">I", 0xF8000054)
+    b2[0x20000:0x20008] = b"REX\x00" + struct.pack(">I", 0xF800005C)
+    check(mod.frame0_difference(bytes(a2), bytes(b2)) is None, "frame0_difference: stash words with different handles are zeroed")
+    # the stash in ONE dump only (the other never stashed): the signature word itself differs -> a difference
+    got = mod.frame0_difference(bytes(a2), bytes(b))
+    check(got is not None and got[0] == 0x82B90000 and got[1] == 0x82B90000,
+          f"frame0_difference: a stash in one dump only: first address 82B90000 in block 82B90000: {got}")
+    # a byte outside every mask: its address and its 64 KB block
+    b4 = bytearray(b)
+    b4[0x1ABCD] ^= 1
+    got = mod.frame0_difference(bytes(a), bytes(b4))
+    check(got is not None and got[0] == DUMP_LO + 0x1ABCD and got[1] == 0x82B80000, f"frame0_difference: 82B8ABCD in block 82B80000: {got}")
+    # the byte just past the 82B747D8+8 mask is not masked, the mask's last byte is
+    b5 = bytearray(b)
+    b5[0x82B747E0 - DUMP_LO] ^= 1
+    check(mod.frame0_difference(bytes(a), bytes(b5)) is not None, "frame0_difference: 82B747E0 (just past the mask) differs")
+    b6 = bytearray(b)
+    b6[0x82B747DF - DUMP_LO] ^= 1
+    check(mod.frame0_difference(bytes(a), bytes(b6)) is None, "frame0_difference: 82B747DF (the mask's last byte) is masked")
+    b7 = bytearray(b)
+    b7[0x82B747D7 - DUMP_LO] ^= 1
+    check(mod.frame0_difference(bytes(a), bytes(b7)) is not None, "frame0_difference: 82B747D7 (just before the mask) differs")
+    # different lengths are a difference (at the shorter one's end)
+    got = mod.frame0_difference(bytes(a), bytes(a[:-16]))
+    check(got is not None and got[0] == DUMP_LO + len(a) - 16, f"frame0_difference: different lengths: {got}")
+    # every mask row applies on a full-length dump (the last one, 8357D520, lies past a short dump)
+    full_a, full_b = dump_bytes(0x835B0000 - DUMP_LO), dump_bytes(0x835B0000 - DUMP_LO)
+    for addr, length in mod.SWEEP_MASKS:
+        full_b[addr - DUMP_LO + length - 1] ^= 0xFF
+    check(mod.frame0_difference(bytes(full_a), bytes(full_b)) is None, "frame0_difference: every mask's last byte on a full dump")
+
+
+def test_handle_shift(root):
+    mod = load("np_dumpdiff")
+    a, b = dump_bytes(), dump_bytes()
+    for k in range(10):
+        put_word(a, 0x82B80000 + 16 * k, 0xF8000100 + 4 * k)
+        put_word(b, 0x82B80000 + 16 * k, 0xF8000104 + 4 * k)
+    check(mod.handle_shift(bytes(a), bytes(b)) == (4, 10), f"handle_shift: +4 in 10 words: {mod.handle_shift(bytes(a), bytes(b))}")
+    check(mod.handle_shift(bytes(b), bytes(a)) == (-4, 10), "handle_shift: the other order is -4")
+    # the same handle words with varied deltas: no shift
+    c = bytearray(b)
+    for k in range(10):
+        put_word(c, 0x82B80000 + 16 * k, 0xF8000100 + 4 * k + 4 * (k + 1))
+    check(mod.handle_shift(bytes(a), bytes(c)) is None, f"handle_shift: varied deltas are not a shift: {mod.handle_shift(bytes(a), bytes(c))}")
+    # only 3 shifted words: below the floor
+    a3, d = dump_bytes(), dump_bytes()
+    for k in range(3):
+        put_word(a3, 0x82B80000 + 16 * k, 0xF8000100 + 4 * k)
+        put_word(d, 0x82B80000 + 16 * k, 0xF8000104 + 4 * k)
+    check(mod.handle_shift(bytes(a3), bytes(d)) is None, "handle_shift: 3 words are not enough")
+    # words that differ by 4 but are not F80xxxxx on both sides: no shift
+    e, f = dump_bytes(), dump_bytes()
+    for k in range(10):
+        put_word(e, 0x82B80000 + 16 * k, 0x40000100 + 4 * k)
+        put_word(f, 0x82B80000 + 16 * k, 0x40000104 + 4 * k)
+    check(mod.handle_shift(bytes(e), bytes(f)) is None, "handle_shift: non-handle words differing by 4 are not a shift")
+    # a shift plus one other differing handle word: still named (the constant is the majority)
+    g, ga = bytearray(b), bytearray(a)
+    put_word(g, 0x82B88000, 0xF8001000)
+    put_word(ga, 0x82B88000, 0xF8002000)
+    check(mod.handle_shift(bytes(ga), bytes(g)) == (4, 10), f"handle_shift: 10 of 11 words: {mod.handle_shift(bytes(ga), bytes(g))}")
+    # 4 words shifted by +4 among 8 differing handle words (the other 4 with distinct deltas): half is not a shift
+    h, ha = dump_bytes(), dump_bytes()
+    for k in range(4):
+        put_word(ha, 0x82B80000 + 16 * k, 0xF8000100 + 4 * k)
+        put_word(h, 0x82B80000 + 16 * k, 0xF8000104 + 4 * k)
+        put_word(ha, 0x82B88000 + 16 * k, 0xF8002000)
+        put_word(h, 0x82B88000 + 16 * k, 0xF8002000 + 8 * (k + 1))
+    check(mod.handle_shift(bytes(ha), bytes(h)) is None, f"handle_shift: 4 of 8 words is below the share: {mod.handle_shift(bytes(ha), bytes(h))}")
+    # through the program: the one line
+    pa, pb = os.path.join(root, "hs_a.bin"), os.path.join(root, "hs_b.bin")
+    open(pa, "wb").write(bytes(a))
+    open(pb, "wb").write(bytes(b))
+    p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_dumpdiff.py"), pa, pb], capture_output=True, text=True, timeout=60)
+    check("handle shift +4 in 10 words" in p.stdout, f"np_dumpdiff prints the shift line:\n{p.stdout}{p.stderr}")
+    open(pb, "wb").write(bytes(a))
+    p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_dumpdiff.py"), pa, pb], capture_output=True, text=True, timeout=60)
+    check(p.returncode == 0 and "handle shift" not in p.stdout and "0 differing ranges" in p.stdout,
+          f"np_dumpdiff: equal dumps, no shift line:\n{p.stdout}{p.stderr}")
+
+
+def test_pair_frame0(root):
+    # every pair passes DOA4_NP_DUMP=0 to both copies and compares the frame-0 dumps (masks + stash words applied)
+    code, out, runs = np_pair(root, "f0ok")
+    check(code == 0 and "frame-0 .data dumps equal" in out, f"np_pair, frame-0 dumps equal: exit {code}\n{out}")
+    for side in ("host", "joiner"):
+        text = open(os.path.join(runs, f"f0ok_{side}", "command.txt")).read()
+        check("DOA4_NP_DUMP=0\n" in text, f"np_pair: the {side} gets DOA4_NP_DUMP=0\n{text}")
+        check(os.path.exists(os.path.join(runs, f"f0ok_{side}", "ctl", "session", "dumps", "data_000000.bin")),
+              f"np_pair: the {side} stand-in wrote its frame-0 dump")
+    code, out, runs = np_pair(root, "f0d", "--env-joiner", "FAKE_ONLINE_DUMP0_DIFF=82B8ABCD")
+    check(code == 1 and "frame-0 .data dumps differ at 82B8ABCD (block 82B80000)" in out, f"np_pair, a frame-0 difference: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "f0m", "--env-joiner", "FAKE_ONLINE_DUMP0_DIFF=82B747DA")
+    check(code == 0, f"np_pair, a frame-0 difference inside a sweep mask is not one: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "f0s", "--env-joiner", "FAKE_ONLINE_STASH=F800FFF0")
+    check(code == 0, f"np_pair, frame-0 stash words with different handles: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "f0h", "--env-host", "FAKE_ONLINE_HANDLE_SHIFT=4")
+    check(code == 1 and "handle shift -4 in 12 words" in out, f"np_pair, a handle shift is named (joiner - host): exit {code}\n{out}")
+    # a caller's own dump list replaces the default; without frame 0 on both sides the check is not made (said so)
+    code, out, runs = np_pair(root, "f0n", "--env-host", "DOA4_NP_DUMP=", "--env-joiner", "DOA4_NP_DUMP=",
+                              "--env-joiner", "FAKE_ONLINE_DUMP0_DIFF=82B8ABCD")
+    check(code == 0 and "frame-0 dump check not made" in out, f"np_pair, dumps turned off by the caller: exit {code}\n{out}")
+    # frame 0 asked for on the host only... no: the joiner's list lacks 0 -> the check is not made either (said so)
+    # frame 0 asked for on both sides but one copy wrote no dump: a problem (the instrument did not run)
+    code, out, runs = np_pair(root, "f0x", "--env-joiner", "FAKE_ONLINE_NO_DUMP=1")
+    check(code == 1 and "joiner wrote no frame-0 dump" in out, f"np_pair, the joiner without a frame-0 dump: exit {code}\n{out}")
+    # the frame-0 difference fails --expect ok only: a desync pair reports it and keeps its verdict
+    both = ("--env-host", "FAKE_ONLINE_END=desync", "--env-joiner", "FAKE_ONLINE_END=desync")
+    code, out, runs = np_pair(root, "f0ds", "--expect", "desync", *both, "--env-joiner", "FAKE_ONLINE_DIVERGE=7",
+                              "--env-joiner", "FAKE_ONLINE_DUMP0_DIFF=82B8ABCD")
+    check(code == 0 and "frame-0 .data dumps differ at 82B8ABCD" in out, f"np_pair, desync expected, the frame-0 line printed: exit {code}\n{out}")
+
+
+def generated_sources(gen):
+    """The files generated/default/sources.cmake lists (GENERATED_SOURCES: what the build compiles)."""
+    text = open(os.path.join(gen, "sources.cmake"), encoding="utf-8").read()
+    return [os.path.join(gen, n) for n in re.findall(r"\$\{CMAKE_CURRENT_LIST_DIR\}/([\w.]+\.cpp)", text)]
+
+
+def import_users(gen, name):
+    """The generated sources the build compiles that mention `name` (an import thunk symbol)."""
+    return [p for p in generated_sources(gen) if name in open(p, encoding="utf-8", errors="replace").read()]
+
+
+def test_no_lazy_handle_export(root):
+    # carry c (re-review I4): the "no lazily created handle reaches the guest" argument rests on the game never importing
+    # ObOpenObjectByPointer (sdk xboxkrnl_ob.cpp:59-69 writes a GetNativeObject result's handle to the guest). A
+    # regeneration that adds the import fails here.
+    gen = os.path.join(HERE, "..", "..", "generated", "default")
+    files = generated_sources(gen)
+    check(len(files) >= 80 and all(os.path.exists(p) for p in files), f"generated sources: {len(files)} listed, all present")
+    check(len(import_users(gen, "__imp__ObReferenceObjectByHandle")) >= 1, "generated sources: control, a known Ob import is found")
+    users = import_users(gen, "__imp__ObOpenObjectByPointer")
+    check(users == [], f"generated sources: no code imports ObOpenObjectByPointer: {users}")
+    # the check itself on a fabricated tree: one listed file that calls it, one unlisted file that does too
+    fake = os.path.join(root, "gen")
+    os.makedirs(fake)
+    with open(os.path.join(fake, "sources.cmake"), "w") as f:
+        f.write("set(GENERATED_SOURCES\n    ${CMAKE_CURRENT_LIST_DIR}/x_recomp.0.cpp\n    ${CMAKE_CURRENT_LIST_DIR}/x_recomp.1.cpp\n)\n")
+    open(os.path.join(fake, "x_recomp.0.cpp"), "w").write("// nothing\n")
+    open(os.path.join(fake, "x_recomp.1.cpp"), "w").write("  __imp__ObOpenObjectByPointer(ctx, base);\n")
+    check(import_users(fake, "__imp__ObOpenObjectByPointer") == [os.path.join(fake, "x_recomp.1.cpp")],
+          "generated sources: a fabricated call is found")
+
+
+def test_pair_session_refused(root):
+    # carry f (S8d): the joiner says yes but stays a lobby (DOA4_NP_TEST_NO_RESTART=1): the host's session ends at frame 0
+    # with the "did not start the session" reason and relaunches offline; the joiner never has a session
+    code, out, runs = np_pair(root, "rs", "--expect", "refused-session", "--env-joiner", "DOA4_NP_TEST_NO_RESTART=1")
+    check(code == 0 and "verdict refused-session" in out, f"np_pair, lobby-only joiner: exit {code}\n{out}")
+    check([r[2] for r in pair_pids(runs, "rs", "host")] == ["lobby", "session", "offline"], f"np_pair, refused-session: host pids {pair_pids(runs, 'rs', 'host')}")
+    check([r[2] for r in pair_pids(runs, "rs", "joiner")] == ["lobby"], f"np_pair, refused-session: joiner pids {pair_pids(runs, 'rs', 'joiner')}")
+    check(leftover_pids(runs, "rs") == [], "np_pair, refused-session: nothing left")
+    # the joiner restarts as usual: the session runs and ends with a leave, not the expected end
+    code, out, runs = np_pair(root, "rsn", "--expect", "refused-session")
+    check(code == 1 and "expected 'internal: the other player's game did not start the session'" in out,
+          f"np_pair, refused-session expected but the joiner restarted: exit {code}\n{out}")
+    # the joiner stays a lobby but the host's session never notices (it runs its frames and leaves): not the expected end
+    code, out, runs = np_pair(root, "rsi", "--expect", "refused-session", "--env-joiner", "DOA4_NP_TEST_NO_RESTART=1",
+                              "--env-host", "FAKE_ONLINE_SKIP_PEER_CHECK=1")
+    check(code == 1 and "the host copy ended 'left'" in out, f"np_pair, refused-session, the host never saw the refusal: exit {code}\n{out}")
+    # the host ends as expected but never relaunches offline
+    code, out, runs = np_pair(root, "rso", "--expect", "refused-session", "--env-joiner", "DOA4_NP_TEST_NO_RESTART=1",
+                              "--env-host", "FAKE_ONLINE_NO_OFFLINE=1")
+    check(code == 1 and "offline relaunch" in out, f"np_pair, refused-session without the host's offline relaunch: exit {code}\n{out}")
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     only = os.environ.get("NP_TOOLS_ONLY")  # a probe's fast route: run the tests whose name contains this text (the full run is the default)

@@ -42,6 +42,13 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
   FRAME_MS=<n>      n ms of wall clock per frame (default 0): a session others can watch and end while it runs
   LINGER=<s>        the offline relaunch lives this long (default 60)
   ROLE=decoy        (the tests) only logs its pid into its ctl/pids.txt and sleeps 120 s: a stand-in the harness does not own
+  DUMP0_DIFF / HANDLE_SHIFT / STASH   the frame-0 dump this copy writes when DOA4_NP_DUMP lists 0 (write_dump0, Task 15 carry b)
+  NO_DUMP=1         no frame-0 dump even when DOA4_NP_DUMP lists 0
+  SKIP_PEER_CHECK=1 the session does not look for a lobby-only peer (plays its frames)   NO_OFFLINE=1  after the lobby-only
+                    peer's end, no offline relaunch
+The game's own test switch DOA4_NP_TEST_NO_RESTART=1 (Task 15 carry f) is honoured as the game does: the joiner says yes and
+stays a lobby (state=restarting, refusal=session); the host's session then ends at frame 0 with `internal: the other player's
+game did not start the session` and relaunches offline.
 status.txt carries `refusal=<none|build|files|busy|proto|session|other>` (Task 9's contract): the kind of the join's refusal.
 The event texts are the REAL ones (np_rules.cpp of wt-np1 66ba37d), so a harness judging by keywords fails here as on the game.
 A host refuses a join with `refuse build` (build ids differ: BUILD_ID, +1 with DOA4_NP_TEST_BUILD_SALT=1), `refuse files <group>`
@@ -337,6 +344,12 @@ def lobby(ctl):
                     st.delay = int(kv["delay"])  # both copies run the host's delay
         if st.leak_at is not None and time.time() >= st.leak_at:
             go = True
+        if go and os.environ.get("DOA4_NP_TEST_NO_RESTART") == "1" and not st.can_start:
+            # the game's lobby-only peer (Task 15 carry f): the joiner said yes but stays a lobby (state restarting); the
+            # host's session Hello then reaches a lobby, which answers "not in the session" (refusal=session)
+            st.state, st.event, st.refusal = "restarting", "The host started the online session: restarting...", "session"
+            st.write()
+            go = False
         if go:
             if st.peer_ctl and st.can_start:  # the host tells its peer
                 atomic_write(os.path.join(st.peer_ctl, "start.now"), f"go\ndelay={st.delay}\n")
@@ -358,6 +371,45 @@ def write_digest(path, rows, diverge):
         for i in range(rows):
             bad = 7 if diverge is not None and i >= diverge else 0
             f.write(struct.pack("<II", i, 0) + struct.pack(f"<{len(fake_game.REGIONS)}Q", 1000 + i + bad, 2000 + i))
+
+
+DUMP_LO = 0x82B70000
+DUMP_BYTES = 0x30000  # three 64 KB sweep blocks (the game's dump is 0x82B70000..0x835B0000; the tools take any length)
+SHIFT_AT = 0x82B80000  # FAKE_ONLINE_HANDLE_SHIFT: the guest handles stored here (one per 16 bytes, 12 of them)
+STASH_AT = 0x82B90000  # a "REX\0" + host handle stash pair present in both dumps (FAKE_ONLINE_STASH: another handle)
+
+
+def write_dump0(path):
+    """The frame-0 .data dump (dumps/data_000000.bin, guest DUMP_LO..), the same bytes on every copy unless:
+    FAKE_ONLINE_DUMP0_DIFF=<hex guest address>  that byte is flipped;
+    FAKE_ONLINE_HANDLE_SHIFT=<n>                the 12 handles F80000xx at SHIFT_AT are n higher (the debug-82B70000 shape);
+    FAKE_ONLINE_STASH=<hex handle>              the stash word after the signature at STASH_AT holds that handle."""
+    data = bytearray((i * 7 + 3) & 0xFF for i in range(DUMP_BYTES))
+    shift = int(os.environ.get("FAKE_ONLINE_HANDLE_SHIFT", "0") or 0)
+    for k in range(12):
+        struct.pack_into(">I", data, SHIFT_AT - DUMP_LO + 16 * k, 0xF8000100 + 4 * k + shift)
+    stash = int(os.environ.get("FAKE_ONLINE_STASH", "F8000054"), 16)
+    data[STASH_AT - DUMP_LO:STASH_AT - DUMP_LO + 8] = b"REX\x00" + struct.pack(">I", stash)
+    flip = os.environ.get("FAKE_ONLINE_DUMP0_DIFF")
+    if flip:
+        data[int(flip, 16) - DUMP_LO] ^= 0x5A
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def peer_stayed_lobby(peer, limit=3.0):
+    """True when the peer copy answered as a lobby (its status.txt refusal=session) and has no session process; False as soon
+    as the peer is starting / in a session (or after `limit` seconds)."""
+    end = time.time() + limit
+    while time.time() < end:
+        kv = read_kv(os.path.join(peer, "status.txt"))
+        if last_session_pid(peer) is not None or kv.get("state") in ("starting", "in_session"):
+            return False
+        if kv.get("refusal") == "session":
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def session(ctl):
@@ -394,6 +446,19 @@ def session(ctl):
     log.write(f"session on: online stand-in, {rows} frames, delay {delay}\n")
     if os.environ.get("FAKE_ONLINE_WARN") == "1":
         log.write(fake_game.KEEPALIVE_WARN + "\n")
+    if peer and os.environ.get("FAKE_ONLINE_SKIP_PEER_CHECK") != "1" and peer_stayed_lobby(peer):
+        # the real session's session_refused poll (np_session.cpp)
+        log.write("the other player's game answered as a lobby: it did not start the session (ending at once)\n")
+        reason = "internal: the other player's game did not start the session"
+        event(f"session ended at frame 0: {reason}")
+        log.write(f"session ended at frame 0: {reason}\nchecksums handed to GekkoNet: 0\n")
+        log.close()
+        events.close()
+        if os.environ.get("FAKE_ONLINE_NO_OFFLINE") != "1":
+            spawn_next("offline", {})
+        return 0
+    if "0" in os.environ.get("DOA4_NP_DUMP", "").split(",") and os.environ.get("FAKE_ONLINE_NO_DUMP") != "1":
+        write_dump0(os.path.join(sess, "dumps", "data_000000.bin"))
     frame, lost, peer_seen = 0, False, False
     while frame < rows:
         if end == "lost" and peer:

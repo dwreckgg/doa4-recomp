@@ -6,8 +6,14 @@ Ranges closer than --gap bytes are merged. Each range is printed with its guest 
 length, the known region it falls in (or "SDK handle stash" when every differing word in it is the word after a
 "REX\\0" header signature in both dumps: stash_words), and (with --words) the big-endian u32 values on both
 sides for its first words.
+When many differing words are SDK handles (F80xxxxx) on both sides and differ by one constant, one more line names it:
+"handle shift +N in K words" (B - A; handle_shift(): a lazily created host object took a low slot in one run and every
+later guest handle moved, debug 82B70000).
+Library use (np_pair.py, Task 15 carry b): frame0_difference(a, b) compares two frame-0 dumps over the whole .data with the
+in-game sweep's masks (SWEEP_MASKS = np_session.cpp kSweepMasks) and every SDK handle stash word zeroed.
 """
 import argparse
+import collections
 import struct
 
 LO = 0x82B70000
@@ -58,6 +64,81 @@ def stash_words(data, before=None):
     return out
 
 
+# The in-game sweep's masks (src/net/np_session.cpp kSweepMasks: guest address, length), pinned against the source by the
+# tool test test_sweep_masks_match_source.
+SWEEP_MASKS = [
+    (0x82B747D8, 8),     # wait-list words of the CRT thread-notify critical section 0x82B747D0
+    (0x82F6C9D0, 8),     # CRI server threads B and A: loop-pass counters
+    (0x830ADBCC, 0x1C),  # critical section of the 16-slot request table 0x830ADB08
+    (0x831A7AC0, 4),     # vblank count stored by the D3D vblank callback
+    (0x8357A560, 0x400),  # GPU timestamp ring 2 of the graphics object
+    (0x8357D520, 4),     # D3D resource id counter
+]
+BLOCK = 0x10000  # the sweep's block size (np_core.h: 64 KB blocks from LO)
+
+
+def masked(data):
+    """A copy of a .data dump (guest LO..) as the sweep hashes it: every SDK handle stash word zeroed (decided on the dump's
+    own bytes as they are, stash_words) and every SWEEP_MASKS range zeroed (the parts of a range inside the dump)."""
+    d = bytearray(data)
+    for w in stash_words(data):
+        d[w:w + 4] = bytes(4)
+    for addr, length in SWEEP_MASKS:
+        s, e = max(0, addr - LO), min(len(d), addr - LO + length)
+        if s < e:
+            d[s:e] = bytes(e - s)
+    return d
+
+
+def first_difference(a, b):
+    """The offset of the first byte where a and b differ (the shorter one's length when one is a prefix of the other), or None."""
+    n = min(len(a), len(b))
+    step = 1 << 16
+    for s in range(0, n, step):
+        e = min(n, s + step)
+        if a[s:e] != b[s:e]:
+            return next(i for i in range(s, e) if a[i] != b[i])
+    return None if len(a) == len(b) else n
+
+
+def frame0_difference(a, b):
+    """(first differing guest address, its 64 KB sweep block's address) of two frame-0 dumps after masked(); None if equal."""
+    at = first_difference(masked(a), masked(b))
+    if at is None:
+        return None
+    return LO + at, LO + (at // BLOCK) * BLOCK
+
+
+HANDLE_SHIFT_MIN = 4  # at least this many shifted handle words ...
+HANDLE_SHIFT_SHARE = 0.75  # ... and at least this share of the differing handle words
+
+
+def handle_shift(a, b):
+    """(N, K) when K >= HANDLE_SHIFT_MIN 4-aligned words differ between the dumps, are SDK handles (F80xxxxx) on both sides and
+    all differ by N = b - a (signed), and K is at least HANDLE_SHIFT_SHARE of the differing handle words; else None."""
+    deltas = collections.Counter()
+    n = min(len(a), len(b)) & ~3
+    step = 1 << 16
+    for s in range(0, n, step):
+        e = min(n, s + step)
+        if a[s:e] == b[s:e]:
+            continue
+        for w in range(s, e, 4):
+            wa, wb = struct.unpack_from(">I", a, w)[0], struct.unpack_from(">I", b, w)[0]
+            if wa != wb and wa >> 20 == 0xF80 and wb >> 20 == 0xF80:
+                deltas[wb - wa] += 1
+    if not deltas:
+        return None
+    delta, count = deltas.most_common(1)[0]
+    if count < HANDLE_SHIFT_MIN or count < HANDLE_SHIFT_SHARE * sum(deltas.values()):
+        return None
+    return delta, count
+
+
+def shift_text(shift):
+    return f"handle shift {shift[0]:+d} in {shift[1]} words"
+
+
 def region(addr):
     for start, length, name in KNOWN:
         if start <= addr < start + length:
@@ -91,6 +172,9 @@ def main():
             i += 1
     total = sum(e - s for s, e in ranges)
     print(f"{len(ranges)} differing ranges, {total} bytes in ranges (dump sizes {len(a)}, {len(b)})")
+    shift = handle_shift(a, b)
+    if shift:
+        print(shift_text(shift) + " (B - A)")
     stash = stash_words(a) & stash_words(b)
     for s, e in ranges[:args.max]:
         addr = LO + s

@@ -37,6 +37,12 @@ bool RedirectHolds(const std::filesystem::path& runtime_user_data, const std::fi
 // other unknown name fails the session start.
 bool KnownUnregisteredSetting(std::string_view name);
 
+// The harness's lobby-only peer (Task 15 carry f, gate S8d): true only when the game runs with a test dir
+// (DOA4_NP_TEST_DIR set) and DOA4_NP_TEST_NO_RESTART is exactly "1" (`value`: the variable's text, nullptr when unset).
+// The lobby then answers the host's start with a yes but does not restart into the session: it stays a lobby, so the
+// host's session Hello reaches a lobby (the "did not start the session" end). A player's environment cannot turn it on.
+bool TestNoRestart(bool test_dir_set, const char* value);
+
 // Makes `dir` an existing, empty folder. Refuses (false, *error) when `dir` itself is a reparse point (a junction or a
 // symbolic link): the session folder must be a real folder. Inside it, a reparse point is removed as a LINK (the
 // link itself, never what it points to: nothing is followed or deleted through it); real folders are emptied and

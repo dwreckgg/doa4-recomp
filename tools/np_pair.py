@@ -6,7 +6,7 @@ what each copy wrote.
       [--joiner-exe EXE] [--cache DIR] [--joiner-affinity MASK] [--sim D,J,L] [--delay N] [--seed N]
       [--env-host K=V ...] [--env-joiner K=V ...] [--arg-host=ARG ...] [--arg-joiner=ARG ...]
       [--kill-joiner-at-frame N] [--third-joiner] [--host-only SECONDS]
-      [--expect ok|desync|lost|refused-build|refused-files|refused-busy|lobby] [--timeout S]
+      [--expect ok|desync|lost|refused-build|refused-files|refused-busy|refused-session|lobby] [--timeout S]
       [--game DIR] [--end-grace S] [--step-timeout S] [--settle S] [--orphan-watch S]
 
 Run folders <runs>/NAME_host and <runs>/NAME_joiner (and NAME_third), each: ud/ (a copy of the pristine save), ctl/ (the
@@ -31,7 +31,15 @@ seconds (8: longer than a real game's OnPostInitLogging).
 After the last close request end_all keeps watching every copy's pids.txt until it has not grown for --orphan-watch seconds (10),
 ending any new owned pid: a game that relaunches itself after a close request leaves nothing behind.
 Verdict rules that hold for every --expect: the real save (every file under ud/B13EBABEBABEBABE) is hashed before the launch and
-after the offline relaunch has ended, a difference fails the pair; each copy's game.log holds the dot-product self-test line.
+after the offline relaunch has ended, a difference fails the pair; each copy's game.log holds the dot-product self-test line and
+no line with the SDK's lazy-pool WARN tag "[netplay-lazy-pool]" (Task 15 carry a).
+Frame-0 instrument (Task 15 carry b): both copies get DOA4_NP_DUMP=0 unless --env-host/--env-joiner set it; when both lists hold
+frame 0, the two dumps (ctl/session/dumps/data_000000.bin) are compared over the whole .data with the sweep's masks and the SDK
+handle stash words zeroed (np_dumpdiff.frame0_difference): a difference, or a missing dump, fails an --expect ok pair with the
+first differing address and its 64 KB block (and "handle shift N in K words" when the handles moved); other expects print it.
+--expect refused-session (gate S8d): the joiner is started with DOA4_NP_TEST_NO_RESTART=1 by the caller (--env-joiner): it says
+yes but stays a lobby. Only the host's session is waited for; judge_session_refused() wants the host ended at frame 0 with
+REFUSED_SESSION_REASON and relaunched offline, the joiner with refusal=session in status.txt and no session.
 """
 import argparse
 import hashlib
@@ -46,12 +54,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # py -3 -I does not put the script's folder on the path
 sys.dont_write_bytecode = True
 import np_compare  # noqa: E402
+import np_dumpdiff  # noqa: E402
 import np_run  # noqa: E402
 
 CREATE_NO_WINDOW = 0x08000000
 CREATE_SUSPENDED = 0x00000004
 SAVE_DIR = "B13EBABEBABEBABE"
-EXPECTS = ("ok", "desync", "lost", "refused-build", "refused-files", "refused-busy", "lobby")
+EXPECTS = ("ok", "desync", "lost", "refused-build", "refused-files", "refused-busy", "refused-session", "lobby")
+# --expect refused-session (Task 15 carry f, gate S8d): the joiner said yes but stayed a lobby (DOA4_NP_TEST_NO_RESTART=1), so
+# the host's session Hello reached a lobby; np_session.cpp ends the host's session with this reason at frame 0.
+REFUSED_SESSION_REASON = "internal: the other player's game did not start the session"
+DUMP0 = os.path.join("dumps", "data_000000.bin")  # the frame-0 .data dump in a session folder (DOA4_NP_DUMP=0)
 TERMINAL = re.compile(r"^session ended at frame (\d+): (.*)$")
 CHECKSUMS = re.compile(r"^checksums handed to GekkoNet: (\d+)\s*$")
 FRAME_LINE = re.compile(r"^frame (\d+)\b")
@@ -228,6 +241,7 @@ class Side:
         self.job = None
         self.stdout = None
         self.saves_before = {}
+        self.dump0 = False  # the copy's DOA4_NP_DUMP lists frame 0 (game_env)
 
     def status(self):
         return read_kv(os.path.join(self.ctl, "status.txt"))
@@ -317,9 +331,11 @@ class Pair:
             env["DOA4_NP_SEED"] = str(a.seed)
         if host and a.delay is not None:
             env["DOA4_NP_DELAY"] = str(a.delay)
+        env["DOA4_NP_DUMP"] = "0"  # the frame-0 .data instrument (Task 15 carry b); a caller's --env-* replaces it
         for kv in (a.env_host if host else a.env_joiner if side.name == "joiner" else []):
             k, _, v = kv.partition("=")
             env[k] = v
+        side.dump0 = "0" in [x.strip() for x in env.get("DOA4_NP_DUMP", "").split(",")]
         return env
 
     def make_side(self, name):
@@ -519,11 +535,15 @@ class Pair:
                         taskkill(pid, True)
             for s in (host, joiner):
                 finished[s.name] = side_done(s)
+            if a.expect == "refused-session":  # the joiner stays a lobby: only the host's session is waited for
+                finished["joiner"] = True
             if all(finished.values()):
                 break
             time.sleep(POLL)
         else:
             self.problems.append(f"timeout after {a.timeout} s waiting for the sessions to end")
+        if a.expect == "refused-session":
+            self.snap["joiner_end"] = joiner.status()  # read before end_all ends the lobby that answered
         for s in (host, joiner):  # the offline relaunch of every copy whose session ended
             if s.terminal():
                 self.wait(lambda s=s: any(p[1] == "offline" for p in read_pids(s.ctl)), a.step_timeout,
@@ -537,15 +557,70 @@ class Pair:
         lines = []
         if a.expect == "lobby":
             self.judge_lobby(lines)
+        elif a.expect == "refused-session":
+            if host and joiner:
+                self.judge_session_refused(lines, host, joiner)
+            else:
+                self.problems.append("refused-session needs a host and a joiner copy")
         elif a.expect.startswith("refused-"):
             self.judge_refusal(lines, by_name)
         elif host and joiner:
             self.judge_session(lines, host, joiner)
-        for s in self.sides:
-            problem = np_run.selftest_problem(read_lines(os.path.join(s.run, "game.log")))
-            if problem:
-                self.problems.append(f"{s.name} game.log: {problem}")
+        for s in self.sides:  # each copy's own game.log (its fresh run folder; lobby, session and offline processes append)
+            game_lines = read_lines(os.path.join(s.run, "game.log"))
+            for problem in (np_run.selftest_problem(game_lines), np_run.lazy_pool_problem(game_lines)):
+                if problem:
+                    self.problems.append(f"{s.name} game.log: {problem}")
         return lines
+
+    def judge_session_refused(self, lines, host, joiner):
+        """S8d: the host's session ended at frame 0 with REFUSED_SESSION_REASON and relaunched offline; the joiner answered as a
+        lobby (status.txt refusal=session) and never had a session process or session folder."""
+        t = host.terminal()
+        lines.append(f"host: terminal {t} checksums {host.checksums()}")
+        if t is None or t[1] != REFUSED_SESSION_REASON or t[0] != 0:
+            self.problems.append(f"the host copy ended {t[1] if t else None!r}{'' if t is None else f' at frame {t[0]}'}, "
+                                 f"expected '{REFUSED_SESSION_REASON}' at frame 0")
+        kinds = [p[1] for p in read_pids(host.ctl)]
+        lines.append(f"host pids.txt: {' '.join(kinds)}")
+        if "session" not in kinds or "offline" not in kinds[kinds.index("session"):]:
+            self.problems.append(f"the host has no offline relaunch after its session (pids.txt: {' '.join(kinds) or 'empty'})")
+        jk = [p[1] for p in read_pids(joiner.ctl)]
+        st = self.snap.get("joiner_end") or joiner.status()
+        lines.append(f"joiner pids.txt: {' '.join(jk)}; status.txt: state={st.get('state')} refusal={st.get('refusal')}")
+        if "session" in jk:
+            self.problems.append("the joiner started a session process (pids.txt has a session line)")
+        if os.path.isdir(joiner.session_dir()):
+            self.problems.append("the joiner has a ctl/session folder")
+        if st.get("refusal") != "session":
+            self.problems.append(f"the joiner's status.txt says refusal={st.get('refusal')!r}, expected 'session' "
+                                 f"(the lobby answered the host's session Hello)")
+
+    def frame0_check(self, lines, host, joiner, fail):
+        """Task 15 carry b: the two frame-0 .data dumps compared over the whole .data with the sweep's masks and the stash words
+        zeroed (np_dumpdiff.frame0_difference), plus the handle-shift line. With fail, a difference or a missing dump is a
+        problem; otherwise only printed."""
+        if not (host.dump0 and joiner.dump0):
+            lines.append("frame-0 dump check not made (DOA4_NP_DUMP lacks frame 0 on: "
+                         + ", ".join(s.name for s in (host, joiner) if not s.dump0) + ")")
+            return
+        data = {}
+        for s in (host, joiner):
+            path = os.path.join(s.session_dir(), DUMP0)
+            if not os.path.exists(path):
+                msg = f"the {s.name} wrote no frame-0 dump ({path})"
+                (self.problems if fail else lines).append(msg)
+                return
+            with open(path, "rb") as f:
+                data[s.name] = f.read()
+        diff = np_dumpdiff.frame0_difference(data["host"], data["joiner"])
+        if diff is None:
+            lines.append(f"frame-0 .data dumps equal ({len(data['host'])} bytes; sweep masks and stash words applied)")
+            return
+        shift = np_dumpdiff.handle_shift(data["host"], data["joiner"])
+        msg = f"frame-0 .data dumps differ at {diff[0]:08X} (block {diff[1]:08X})" + \
+              (f"; {np_dumpdiff.shift_text(shift)} (joiner - host)" if shift else "")
+        (self.problems if fail else lines).append(msg)
 
     def judge_lobby(self, lines):
         st = getattr(self, "lobby_status", None) or {}
@@ -616,6 +691,7 @@ class Pair:
                 self.problems.append(f"the {s.name} copy did not run (no session folder with an np_log.txt: {s.session_dir()})")
                 return
             lines.append(f"{s.name}: terminal {s.terminal()} checksums {s.checksums()} missing {missing}")
+        self.frame0_check(lines, host, joiner, fail=expect == "ok")
         th, tj = host.terminal(), joiner.terminal()
         if expect == "lost":
             self.judge_lost(lines, host, joiner, th, tj)

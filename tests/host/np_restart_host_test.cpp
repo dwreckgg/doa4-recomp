@@ -233,6 +233,17 @@ static void TestRedirectAndNames() {
   CHECK(!restart::KnownUnregisteredSetting(""));
 }
 
+// Task 15 carry f: the lobby-only test switch, only with a test dir and only for exactly "1".
+static void TestNoRestartSwitch() {
+  CHECK(restart::TestNoRestart(true, "1"));
+  CHECK(!restart::TestNoRestart(false, "1"));  // no test dir: a player's environment cannot turn it on
+  CHECK(!restart::TestNoRestart(true, nullptr));
+  CHECK(!restart::TestNoRestart(true, ""));
+  CHECK(!restart::TestNoRestart(true, "0"));
+  CHECK(!restart::TestNoRestart(true, "11") && !restart::TestNoRestart(true, "1 ") && !restart::TestNoRestart(true, "yes"));
+  CHECK(!restart::TestNoRestart(false, nullptr));
+}
+
 int main() {
   wchar_t tmp[MAX_PATH];
   GetTempPathW(MAX_PATH, tmp);
@@ -244,6 +255,7 @@ int main() {
   TestWriteSaveFiles();
   TestRelaunchPlan();
   TestRedirectAndNames();
+  TestNoRestartSwitch();
   // clean up only what this run made: remove junctions as links first (never through them)
   std::string error;
   restart::ClearFolder(g_root, &error);

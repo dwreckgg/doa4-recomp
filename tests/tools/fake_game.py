@@ -42,6 +42,7 @@ Test-only environment (the stand-in's own, not the game's):
 Self-test line (Task 10): every run with a --log_file writes the line the real game logs at start-up
 ("[doa4][LIFE] dot products: canonical NaN on") into that file, as np_run.py and np_pair.py require of a good run:
   FAKE_NO_SELFTEST=1  the line is left out; FAKE_SELFTEST_OFF=1  the line says OFF (<lane bits>) instead of on.
+  FAKE_LAZY_POOL=1  one more line, the SDK's lazy-pool WARN with its tag "[netplay-lazy-pool]" (LAZY_POOL_LINE; Task 15 carry a).
 Hidden launch (Task 10): with FAKE_STARTUP_NOTE=1 the first process of a run writes "show_window=<n> flags=<hex>" (its own
 STARTUPINFO as read from the process the tool started: wShowWindow and dwFlags) into startup.txt next to its --user_data_root folder, so the tests see how the
 tool started it (np_run.py and np_pair.py: 7 and flag 0x1, SW_SHOWMINNOACTIVE + STARTF_USESHOWWINDOW).
@@ -215,8 +216,17 @@ def write_game_log_line():
         text = "[info] [core] [doa4][LIFE] dot products: canonical NaN OFF (7FC00000 00000000 00000000 00000000)"
     else:
         text = "[info] [core] [doa4][LIFE] dot products: canonical NaN on"
+    if os.environ.get("FAKE_LAZY_POOL") == "1":
+        text += "\n" + LAZY_POOL_LINE
     with open(path, "a", encoding="utf-8") as f:
         f.write(text + "\n")
+
+
+# The SDK's failed-move WARN as game.log shows it (sdk-np1 ad1b589, xobject.cpp GetNativeObject; REXSYS_WARN prints
+# "[warning] [sys]"). Every SDK line of this kind starts with the tag "[netplay-lazy-pool]" (Task 15 carry a).
+LAZY_POOL_LINE = ("[2026-10-31 10:40:49.001] [warning] [sys] [t4242] [netplay-lazy-pool] GetNativeObject: the lazy object for "
+                  "header 82B747D0 (type 3) keeps the low handle F8000054 (MoveToHighSlot status C0000001): later guest "
+                  "handles are shifted in this run")
 
 
 def write_startup_note():
