@@ -453,6 +453,20 @@ struct SweepMask {
   const char* why;
 };
 constexpr SweepMask kSweepMasks[] = {
+    // debug 82B70000 (notes/plans/2026-10-30-doa4-netplay-phase1/debug-82b70000-report.md): online pair p1t14b desynced
+    // at frame 10 from this block at frame 0. The host had stashed the SDK handle in this critical section's header
+    // (wait-list words "REX\0" + handle), the joiner had not: the CRT thread-start/exit notifier sub_827939E0 (called
+    // by every new thread's start trampoline sub_82797768 and by ExitThread's sub_82791288) holds the section while it
+    // walks the notify list, so two of the ~30 threads starting at boot meet in it only by host timing, and the waiter
+    // (RtlEnterCriticalSection -> KeWaitForSingleObject) makes the SDK stash. Census over 1849 kept .data dumps: the
+    // words held their static self-pointer 82B747D8 82B747D8 in 1848 and the stash in 1 (p1t14b host); the lock count,
+    // recursion count and owner were at rest (-1, 0, 0) in all 1849. Readers: np_xref over 82B747C0..82B74800 lists
+    // sub_827939E0 and sub_82793A40, which pass 0x82B747D0 only to RtlEnter/LeaveCriticalSection (SDK imports), and
+    // sub_827930E0, which reads the table 82B747C0..82B747CF; a second search of the generated code for offsets
+    // 18384..18407 from a 0x82B7 base found no other use, and no .data word holds a pointer into the header. So no
+    // guest code reads these 8 bytes; only the SDK writes and reads them.
+    {0x82B747D8, 8, "wait-list words of the CRT thread-notify critical section 0x82B747D0 (sub_827939E0, "
+                    "sub_82793A40): the SDK's handle stash appears there only when two starting threads meet in it"},
     {0x82F6C9D0, 8, "CRI server threads B and A: loop-pass counters (sub_829BC8F8, sub_829BC458; zeroed by "
                     "sub_829BCAC8), counted by their host-timed idle loops"},
     {0x830ADBCC, 0x1C, "critical section of the 16-slot request table 0x830ADB08 (initialised in sub_824F4560, "
@@ -954,6 +968,29 @@ bool CreateLive(State& s) {
   return true;
 }
 
+// Test switch DOA4_NP_FORCE_STASH=<hex address>[,<hex address>...] (debug 82B70000): at frame 0, before the state
+// entering it is hashed, the SDK makes its host object for each guest dispatcher header named, through
+// KeResetEvent on that header (the event is unsignalled, so the only guest-memory change is the SDK's handle stash
+// over the header's wait-list words). It stands in for a boot-time contention on a critical section, whose waiter
+// stashes the same way (RtlEnterCriticalSection -> KeWaitForSingleObject -> XObject::GetNativeObject).
+void ForceStash(PPCContext& ctx, uint8_t* base) {
+  std::stringstream in(TestDirEnv("DOA4_NP_FORCE_STASH"));
+  std::string item;
+  while (std::getline(in, item, ',')) {
+    const uint32_t a = uint32_t(std::strtoul(item.c_str(), nullptr, 16));
+    if (a == 0) continue;
+    const uint64_t r3 = ctx.r3.u64;
+    ctx.r3.u64 = a;
+    __imp__KeResetEvent(ctx, base);
+    ctx.r3.u64 = r3;
+    const uint8_t* w = base + a + 8;
+    char line[128];
+    std::snprintf(line, sizeof line, "forced stash: header %08X wait-list words now %02X%02X%02X%02X %02X%02X%02X%02X",
+                  a, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    Log(line);
+  }
+}
+
 void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
   State& s = S();
   const double t0 = Now(s);
@@ -982,6 +1019,8 @@ void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
       return;
     }
   }
+
+  if (f == 0) ForceStash(ctx, base);
 
   // (1) the state entering f, and its checksum
   const double h0 = Now(s);

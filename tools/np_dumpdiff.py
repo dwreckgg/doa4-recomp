@@ -31,6 +31,7 @@ KNOWN = [  # (start, length, name): phase0_facts.md 10, rollback_doa4_fit.md
     (0x831011D8, 4, "scheduler time"),
     (0x83579C28, 0x4000, "graphics object (GPU)"),
     (0x8341FAA0, 0x100, "job pool"),
+    (0x82B747D0, 0x1C, "CRT thread-notify critical section (wait-list words swept as zero)"),
 ]
 
 
