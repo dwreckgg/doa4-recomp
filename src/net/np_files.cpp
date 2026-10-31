@@ -88,8 +88,10 @@ bool FullHash(HANDLE h, uint64_t len, unsigned char* buf, uint64_t* hash) {
 // Folds one file (path lower case with '/', size, content) into `hash`. False when it cannot be read.
 bool FoldFile(const std::filesystem::path& full, const std::string& rel, bool whole, unsigned char* buf,
               uint64_t* hash) {
-  HANDLE h = CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                         FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+  // Every share mode: a file someone else holds for writing, or with delete access (an installer, a launcher), is still
+  // read, and while it is open here nobody is stopped from renaming it (the game folder is never locked).
+  HANDLE h = CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (h == INVALID_HANDLE_VALUE) return false;
   LARGE_INTEGER sz;
   uint64_t content = kFnvInit;
@@ -151,15 +153,36 @@ bool Walk(const std::filesystem::path& dir, const std::string& rel, unsigned cha
 
 }  // namespace
 
-std::vector<Group> Fingerprint(const std::filesystem::path& dir) {
+namespace {
+// The disc's own top-level entries (planning notes section 6), lower case.
+const char* const kKnown[] = {"anm.afs", "avt.afs", "chrone.afs", "chrthree.afs", "chrtwo.afs", "cmn.afs", "default.xex",
+                              "dic",     "mot.afs", "snd.afs",    "sound",        "spr.afs",    "stg.afs"};
+}  // namespace
+
+std::vector<Group> Fingerprint(const std::filesystem::path& dir, uint32_t* ignored) {
   std::vector<Group> groups;
   std::vector<Entry> top;
+  if (ignored) *ignored = 0;
   if (!List(dir, &top)) return groups;
   std::unique_ptr<unsigned char[]> buf(new unsigned char[kSample]);
   for (const Entry& e : top) {
     if (e.lower == "movie") continue;
+    bool known = false;
+    for (const char* k : kKnown) known = known || e.lower == k;
+    if (!known && ignored) ++*ignored;
+  }
+  for (const char* name : kKnown) {
+    const Entry* found = nullptr;
+    for (const Entry& e : top)
+      if (e.lower == name) found = &e;
     Group g;
-    g.name = e.lower;
+    g.name = name;
+    if (!found) {
+      g.missing = true;
+      groups.push_back(std::move(g));
+      continue;
+    }
+    const Entry& e = *found;
     uint64_t hash = kFnvInit;
     bool ok;
     if (e.dir) {
@@ -190,6 +213,8 @@ std::string Text(const std::vector<Group>& groups) {
     t += '=';
     if (g->unreadable) {
       t += "unreadable";
+    } else if (g->missing) {
+      t += "missing";
     } else {
       char b[24];
       std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(g->hash));

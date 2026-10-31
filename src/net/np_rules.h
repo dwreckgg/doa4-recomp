@@ -100,7 +100,7 @@ struct Verdict { wire::Refusal refusal = wire::Refusal::kNone; std::string text;
 // (host.release, joiner.release). The release tags are advice only: the same build and files under another tag agree.
 Verdict Judge(const Identity& host, const Identity& joiner, bool host_busy);
 // Names, sorted: a group whose value differs or is missing on one side, and every group whose value is "unreadable"
-// on either side (np_files: an unreadable group agrees with nothing). A text is "name=value" lines: the name ends at
+// or "missing" on either side (np_files: an unreadable or missing group agrees with nothing, itself included). A text is "name=value" lines: the name ends at
 // the first '=', blank lines are skipped, a line without '=' is a group with an empty value. A name that appears
 // twice in one text is not valid (np_files writes each group once); which value counts is unspecified.
 std::vector<std::string> DifferingGroups(std::string_view files_a, std::string_view files_b);

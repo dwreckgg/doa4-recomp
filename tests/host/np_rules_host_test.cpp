@@ -1393,6 +1393,12 @@ static void TestDifferingGroups() {
   CHECK(rules::DifferingGroups("a=unreadable\nb=unreadable\nc=1\n", "a=unreadable\nb=2\nc=1\n") == V({"a", "b"}));
   CHECK(rules::DifferingGroups("a=unreadable2\n", "a=unreadable2\n").empty());      // only the exact word
   CHECK(rules::DifferingGroups("a=Unreadable\n", "a=Unreadable\n").empty());
+  // np_files: "missing" (a known entry absent from the folder) is the same: it agrees with nothing, itself included
+  CHECK(rules::DifferingGroups("a=missing\n", "a=missing\n") == V({"a"}));
+  CHECK(rules::DifferingGroups("a=missing\nb=1\n", "a=5\nb=1\n") == V({"a"}));
+  CHECK(rules::DifferingGroups("a=5\nb=1\n", "a=missing\nb=1\n") == V({"a"}));
+  CHECK(rules::DifferingGroups("a=missing\n", "a=unreadable\n") == V({"a"}));
+  CHECK(rules::DifferingGroups("a=missing2\n", "a=missing2\n").empty());            // only the exact word
   CHECK(rules::DifferingGroups("a=1\n", "a=1\n").empty());
 
   Group("DifferingGroups: how the lines are read");

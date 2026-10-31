@@ -579,7 +579,7 @@ std::vector<std::string> DifferingGroups(std::string_view files_a, std::string_v
   for (const std::string& name : names) {
     const auto ia = a.find(name), ib = b.find(name);
     if (ia == a.end() || ib == b.end() || ia->second != ib->second || ia->second == "unreadable" ||
-        ib->second == "unreadable")
+        ib->second == "unreadable" || ia->second == "missing" || ib->second == "missing")
       differing.push_back(name);
   }
   return differing;
