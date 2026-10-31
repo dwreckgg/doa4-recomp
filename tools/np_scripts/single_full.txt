@@ -1,9 +1,10 @@
 # boot -> title -> Versus -> Single Battle -> entry (P1 left, P2 right) -> Kasumi vs Ayane, costume 1 -> stage
 # (one right of RANDOM), as single.txt -> P1 fights (random input, seed 21, user 0 only) while P2 stays neutral
-# until the match ends (KO at about frame 6990: Kasumi wins 2-0; the input stops at 7040, after the KO, so no random
-# press skips the KO replay or the WINNER screen) -> the results screen R = 7460 (the first 60-frame shot of the
-# calibration p1gcal5 on p1g with the WINNER caption; 7400 still shows the KO replay; the score menu follows at 7700)
-# -> shot at R+60 -> A to continue at R+120 -> shot at R+240 -> quit at R+1200.
+# until the match ends. Calibrated on the ONLINE timeline (an online pair runs the input with its delay, so an offline
+# record's timeline differs): KO between frames 6620 and 6660 (replay of p1g_s1's recording, p1g_s1cal), input stops
+# at 6700, so no press skips the KO replay or the WINNER screen -> the results screen R = 7080 (the first 20-frame
+# shot with the WINNER caption in the online pair p1g_s1ocal; 7060 still shows the KO replay; the score menu follows
+# at 7320) -> shot at R+60 -> A to continue at R+120 -> shot at R+240 -> quit at R+1200.
 # Needs --headless=true (the entry's sign-in message box is answered with its default).
 connect 0 1
 1500 -
@@ -39,8 +40,8 @@ shot
 4 A
 600 -
 shot
-random 3646 21 0
-480 -
+random 3306 21 0
+380 -
 shot
 60 -
 4 A
