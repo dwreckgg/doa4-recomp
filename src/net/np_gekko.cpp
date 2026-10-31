@@ -1,6 +1,7 @@
 #include "np_gekko.h"
 
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -21,6 +22,20 @@ namespace doa4::np::gekko {
 // tests/host/np_exec_host_test.cpp's drip group goes red if a vendor bump moves it.
 constexpr uint8_t kGekkoSyncResponse = 5;
 constexpr auto kSyncResponseGap = std::chrono::milliseconds(200);  // = NetStats::SYNC_MSG_DELAY (net.h:125)
+// The remote-input peek (Task 11, carry 2b; GekkoNet's API has no accessor for the inputs it holds). An Inputs payload
+// (type 1, net.h:27-28) is the 3-byte header (type u8, magic u16 little-endian, net.h:42-45), then the body variant:
+// one index byte (0 = InputMsg, the first alternative of MsgBody, net.h:99-109) and InputMsg's members in order,
+// start_frame (i32 LE) then input_count (u16 LE) (net.h:47-53), packed by zpp::bits (backend.cpp:766-782). So bytes
+// 4..7 are the first frame and 8..9 the count; then total_size (u16 LE, 10..11), compressed (bool, 12) and the inputs
+// vector: its length as u32 LE (13..16, zpp::bits' default size prefix) and total_size bytes (InputMsg.total_size =
+// inputs.size(), backend.cpp:1500-1505). The peek reads a payload only if all of that is consistent - the length is
+// exactly 17 + total_size, the prefix equals total_size, the count is not 0, and an uncompressed body holds exactly
+// count x kPlayerInputBytes (the peer sends its one local player) - so a short or stray payload cannot move it. It
+// runs BEFORE GekkoNet's own checks (magic, deserialisation), so it is NOT authenticated: a well-formed payload with
+// any magic moves it. Display and diagnostics only. tests/host/np_live_host_test.cpp checks the parse against the
+// frames GekkoNet advances and feeds it a forged short payload.
+constexpr uint8_t kGekkoInputs = 1;
+constexpr size_t kInputsHeadBytes = 17;
 
 struct SessionImpl {
   GekkoSession* s = nullptr;
@@ -37,6 +52,7 @@ struct SessionImpl {
   bool sync_response_passed = false;                   // a SyncResponse was passed after kStarted ...
   std::chrono::steady_clock::time_point sync_response_at{};  // ... at this time
   uint32_t sync_responses_dropped = 0;
+  int32_t last_remote_input = -1;  // the remote-input peek (top of this file)
 };
 
 namespace {
@@ -81,6 +97,19 @@ GekkoNetResult** AdapterReceive(int* length) {
         }
         c->sync_response_passed = true;
         c->sync_response_at = now;
+      }
+      if (buf[0] == kGekkoInputs && buf.size() >= kInputsHeadBytes && buf[3] == 0) {  // the remote-input peek
+        auto u32 = [&](size_t i) { return uint32_t(buf[i]) | uint32_t(buf[i + 1]) << 8 | uint32_t(buf[i + 2]) << 16 | uint32_t(buf[i + 3]) << 24; };
+        const uint32_t start = u32(4);
+        const uint32_t count = uint32_t(buf[8]) | uint32_t(buf[9]) << 8;
+        const uint32_t total = uint32_t(buf[10]) | uint32_t(buf[11]) << 8;
+        const bool compressed = buf[12] != 0;
+        const bool well_formed = count > 0 && u32(13) == total && buf.size() == kInputsHeadBytes + total &&
+                                 (compressed || total == count * exec::kPlayerInputBytes);
+        if (well_formed) {
+          const int64_t last = int64_t(int32_t(start)) + int64_t(count) - 1;
+          if (last > c->last_remote_input && last <= INT32_MAX) c->last_remote_input = int32_t(last);
+        }
       }
       auto* r = static_cast<GekkoNetResult*>(std::malloc(sizeof(GekkoNetResult)));
       r->addr.size = 1;
@@ -161,6 +190,8 @@ uint32_t Session::local_inputs_added() const { return impl_->added; }
 
 uint32_t Session::sync_responses_dropped() const { return impl_->sync_responses_dropped; }
 
+int32_t Session::last_remote_input_frame() const { return impl_->last_remote_input; }
+
 std::vector<exec::Event> Session::Update() {
   SessionImpl& im = *impl_;
   std::vector<exec::Event> out;
@@ -216,6 +247,13 @@ std::vector<exec::Event> Session::Update() {
 }
 
 std::vector<SessionEvent> Session::TakeSessionEvents() { return std::exchange(impl_->events, {}); }
+
+void Session::Poll() {
+  SessionImpl& im = *impl_;
+  if (!im.s) return;
+  Scope scope(&im);
+  gekko_network_poll(im.s);
+}
 
 float Session::FramesAhead() {
   SessionImpl& im = *impl_;
