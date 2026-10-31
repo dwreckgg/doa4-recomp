@@ -7,6 +7,8 @@
 // Each hook is annotated with what it does and *why* it is necessary.
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -631,6 +633,87 @@ REX_HOOK_RAW(sub_8279FAA8) {
     }
   }
   __imp__sub_8279FAA8(ctx, base);
+}
+
+// ===========================================================================
+// FIX 13 — the loader thread waits until its critical section is initialised.
+//
+// sub_824F4560 (the main loop's init) creates the loader thread (start
+// 0x823FC5A0, CreateThread flags 0: it may run at once), sets its affinity
+// and its priority (-15, idle), and only then initialises the loader's
+// critical section: RtlInitializeCriticalSection(0x830ADBCC) at 0x824F4858,
+// the last call before it returns. The loader's first act is
+// RtlEnterCriticalSection(0x830ADBCC) (lr 0x823FC5CC). This runtime ignores
+// thread priorities and gives the new thread its own host thread, so now and
+// then the loader gets there first: the section's words are still zero, the
+// SDK's lock count goes 0 -> 1 and the loader waits on the section's header
+// (the SDK makes a host event for it and stashes its handle in the header, at
+// boot instead of at the first real contention). The initialisation then
+// sets the lock count back to -1 under the waiter. From then on the section
+// looks free: the main thread enters and leaves it without ever signalling,
+// and the loader waits for good. The first queued load job (ring 0x830ADB0C
+// entry 0, frame 44 of a session) is never taken: a desync at frame 44
+// online, a hung replay offline (notes/plans/2026-10-30-doa4-netplay-phase1/
+// debug-loader-idle-report.md).
+//
+// The fix keeps the order the game's code assumes: the loader thread's start
+// waits until sub_824F4560 has returned. Nothing in sub_824F4560 after the
+// thread creation waits for the loader, so the wait cannot deadlock; it is
+// bounded at 10 s anyway (then the loader runs as before, with a WARN). At
+// the loader's start one line says whether it had to wait and the section's
+// state; a state other than "initialised, free" (type 1, lock count -1, no
+// owner) logs a WARN: the assumption this fix relies on did not hold.
+// ===========================================================================
+extern "C" {
+REX_EXTERN(__imp__sub_824F4560);
+REX_EXTERN(__imp__sub_823FC5A0);
+}
+
+namespace {
+constexpr uint32_t kLoaderCriticalSection = 0x830ADBCC;
+std::mutex g_loader_init_mu;
+std::condition_variable g_loader_init_cv;
+bool g_loader_init_done = false;
+}  // namespace
+
+REX_HOOK_RAW(sub_824F4560) {
+  __imp__sub_824F4560(ctx, base);
+  {
+    std::lock_guard lk(g_loader_init_mu);
+    g_loader_init_done = true;
+  }
+  g_loader_init_cv.notify_all();
+}
+
+REX_HOOK_RAW(sub_823FC5A0) {
+  const auto t0 = std::chrono::steady_clock::now();
+  bool waited = false, timed_out = false;
+  {
+    std::unique_lock lk(g_loader_init_mu);
+    if (!g_loader_init_done) {
+      waited = true;
+      timed_out = !g_loader_init_cv.wait_for(lk, std::chrono::seconds(10), [] { return g_loader_init_done; });
+    }
+  }
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  const uint8_t* cs = base + kLoaderCriticalSection;
+  const uint8_t type = cs[0];
+  int32_t lock_count = 0;  // the SDK keeps this word in host order (X_RTL_CRITICAL_SECTION::lock_count)
+  std::memcpy(&lock_count, cs + 0x10, 4);
+  const uint32_t owner = rex::memory::load_and_swap<uint32_t>(cs + 0x18);
+  if (timed_out) {
+    REXLOG_WARN("[doa4][FIX][Loader] the main loop's init had not returned 10 s after the loader thread started; "
+                "the loader runs anyway (critical section {:08X}: type {} lock count {} owner {:08X})",
+                kLoaderCriticalSection, type, lock_count, owner);
+  } else if (type != 1 || lock_count != -1 || owner != 0) {
+    REXLOG_WARN("[doa4][FIX][Loader] the loader's critical section {:08X} is not initialised and free at the "
+                "loader's start (type {} lock count {} owner {:08X}); the loader may never take a job",
+                kLoaderCriticalSection, type, lock_count, owner);
+  } else {
+    REXLOG_INFO("[doa4][FIX][Loader] loader thread starts after the critical section init ({}; waited {:.1f} ms)",
+                waited ? "it started before the init returned" : "the init had returned", ms);
+  }
+  __imp__sub_823FC5A0(ctx, base);
 }
 
 // "Restart now" in the menu (doa4_menu.cpp) starts the new instance with
