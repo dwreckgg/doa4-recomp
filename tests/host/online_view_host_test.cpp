@@ -285,6 +285,63 @@ static void TestLocks() {
   CHECK_EQ(LockedLine(false), "");
 }
 
+// Fix round M2: one notion of "locked" - in a session, or the lobby is Starting / Restarting - and the input delay, the
+// four controls and the tab's session note all follow it.
+static void TestSessionLocks() {
+  const State all[] = {State::kOffline,    State::kHosting,    State::kConnecting, State::kConnected,
+                       State::kStarting,   State::kRestarting, State::kInSession};
+  int locked_states = 0;
+  for (const State st : all) {
+    for (const bool open : {false, true}) {
+      for (const bool session : {false, true}) {
+        In in = Open(st, true);
+        in.lobby_open = open;
+        in.in_session = session;
+        const bool want = session || (open && (st == State::kStarting || st == State::kRestarting || st == State::kInSession));
+        CHECK(SessionLocks(in) == want);
+        // the input delay and the controls read the same answer
+        CHECK(Describe(in).delay_enabled == !SessionLocks(in));
+        for (const Control c : {Control::kExtras, Control::kVideoRestart, Control::kAudioRestart, Control::kGameChange}) {
+          CHECK(LockedInSession(c, SessionLocks(in)) == want);
+        }
+        locked_states += want;
+      }
+    }
+  }
+  // 7 states x (lobby open or not) x (session flag): locked = flag, or open and Starting / Restarting / InSession
+  CHECK(locked_states == 7 * 2 + 3);
+  // the named cases
+  CHECK(!SessionLocks(In{}));
+  CHECK(!SessionLocks(Open(State::kConnected, true)));
+  CHECK(SessionLocks(Open(State::kStarting, true)));
+  CHECK(SessionLocks(Open(State::kRestarting, false)));
+  In s;
+  s.in_session = true;
+  CHECK(SessionLocks(s));
+  // a Starting lobby locks the four controls
+  CHECK(LockedInSession(Control::kExtras, SessionLocks(Open(State::kStarting, true))));
+  CHECK(!LockedInSession(Control::kExtras, SessionLocks(Open(State::kHosting, true))));
+}
+
+// Fix round I2: the build id is wanted only when the tab draws or a lobby / session exists.
+static void TestNeedsBuildId() {
+  CHECK(!NeedsBuildId(false, false, false));
+  CHECK(NeedsBuildId(true, false, false));
+  CHECK(NeedsBuildId(false, true, false));
+  CHECK(NeedsBuildId(false, false, true));
+  CHECK(NeedsBuildId(true, true, true));
+}
+
+// Fix round M3: the session note.
+static void TestSessionNote() {
+  In in = Open(State::kInSession, true);
+  in.in_session = true;
+  CHECK_EQ(Describe(in).session_note, "Settings changed during a session are restored when it ends.");
+  CHECK_EQ(Describe(Open(State::kConnected, true)).session_note, "");
+  CHECK_EQ(Describe(In{}).session_note, "");
+  CHECK_EQ(Describe(Open(State::kStarting, true)).session_note, "");
+}
+
 static void TestBanner() {
   CHECK_EQ(BannerText(false, Ending::kNone), "");
   CHECK_EQ(BannerText(true, Ending::kNone), "Waiting for the other player...");
@@ -330,6 +387,9 @@ int main() {
   TestVersionLine();
   TestEventLine();
   TestLocks();
+  TestSessionLocks();
+  TestNeedsBuildId();
+  TestSessionNote();
   TestBanner();
   TestTabLogLine();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);

@@ -134,6 +134,7 @@ struct Actor {
   std::function<void(Actor&, int32_t)> before_frame;  // test hook, inside the fiber, before Frame(f)
   std::function<void(Actor&)> on_end;                 // test hook, inside the fiber, after an end was returned
   std::function<float()> fa;                          // hooks.frames_ahead (empty: GekkoNet's)
+  std::function<float()> ping;                        // hooks.ping_ms (empty: GekkoNet's)
   uint64_t overshoot_us = 0, overshoot_after_us = 0;  // fake timer overshoot (see wait_packet)
   int overshot = 0;                                   // slices that overshot
   bool got_inputs = false;  // received an Inputs payload (the handshake is over for this side)
@@ -296,6 +297,7 @@ static void Setup(World& w) {
       me.events.push_back({e, frame, at, me.live->remote_slack()});
     };
     hooks.frames_ahead = A.fa;
+    hooks.ping_ms = A.ping;
     A.live = std::make_unique<live::Session>(&A.gk, &A.ex, clock, w.limits, hooks);
   }
 }
@@ -846,6 +848,27 @@ static void TestPacer() {
   PacerCase(0.99f, 0);
 }
 
+// Task 14 fix round I1: the session's ping is refreshed after every advanced frame: an injected value reaches
+// ping_ms() (A), and with no hook (B) it is exactly what the real GekkoNet session reports for the peer.
+static void TestPing() {
+  Group("ping");
+  World w;
+  w.label = "ping";
+  w.a[0].frames = w.a[1].frames = 60;
+  w.a[0].ping = [] { return 42.5f; };
+  Setup(w);
+  CHECKF(w.a[0].live->ping_ms() == 0.0f && w.a[1].live->ping_ms() == 0.0f, "ping before any frame: %.3f / %.3f",
+         w.a[0].live->ping_ms(), w.a[1].live->ping_ms());
+  Run(w);
+  Actor& A = w.a[0];
+  Actor& B = w.a[1];
+  CHECKF(OkCount(A) == 60 && OkCount(B) == 60, "ping: A %d B %d ok", OkCount(A), OkCount(B));
+  CHECKF(A.live->ping_ms() == 42.5f, "A: ping_ms() %.3f (injected 42.5)", A.live->ping_ms());
+  CHECKF(B.live->ping_ms() == B.gk.Stats().ping_ms, "B: ping_ms() %.3f vs GekkoNet's %.3f",
+         B.live->ping_ms(), B.gk.Stats().ping_ms);
+  std::printf("  (GekkoNet's own ping for B in this world: %.3f ms)\n", B.live->ping_ms());
+}
+
 // Teardown (carry 2a): Close() drops the pending Save, then destroys the gekko session; idempotent.
 static void TestClose() {
   Group("close");
@@ -1090,6 +1113,7 @@ int main(int argc, char** argv) {
   TestLeave();
   TestLoad();
   TestPacer();
+  TestPing();
   TestClose();
   TestThread();
   TestSlackAhead();

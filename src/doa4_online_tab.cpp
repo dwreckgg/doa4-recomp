@@ -39,6 +39,7 @@ void OnlineTab::Draw(const OnlineHost& host, const online_view::In& in, const on
   }
   if (!view.diagnostics_line.empty()) ImGui::TextDisabled("%s", view.diagnostics_line.c_str());
   if (!view.display_note.empty()) ImGui::TextColored(kNoteColor, "%s", view.display_note.c_str());
+  if (!view.session_note.empty()) ImGui::TextColored(kNoteColor, "%s", view.session_note.c_str());
 
   if (view.show_code) {
     ImGui::SeparatorText("Your code");

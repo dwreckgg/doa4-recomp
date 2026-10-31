@@ -15,7 +15,9 @@ namespace doa4 {
 
 // The app's side of the tab (MenuHost::online). Every callback runs on the UI thread. Empty `state` = no netplay.
 struct OnlineHost {
-  std::function<online_view::In()> state;                    // a snapshot of the lobby / session, the settings
+  // A snapshot of the lobby / session and the settings. `tab_shown`: the Online tab is drawing (it may then compute
+  // the build id; every other caller passes false, so an offline game that never opens the tab never hashes it).
+  std::function<online_view::In(bool tab_shown)> state;
   std::function<void(const std::string& code)> join;         // creates the lobby when none exists, then joins
   std::function<void()> host;                                // creates the lobby when none exists, then hosts
   std::function<void(const std::string& code)> reach_out;

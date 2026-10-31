@@ -78,10 +78,11 @@ struct MenuHost {
   // Netplay (Task 12 fix round I3): asked before an Extras action (an unlock, a tweak toggle); true = refused (in an
   // online session: *status says why, a log line is written). Empty: never refused.
   std::function<bool(std::string_view action, std::string* status)> refuse;
-  // Netplay (Task 14): true in a process that runs an online session. Four controls read their disabled state from
-  // online_view::LockedInSession with it (Extras, the Video and Audio "Restart now", the Game tab's "Change..."), and
-  // the refusal behind them reads the same answer. Empty: never in a session.
-  std::function<bool()> in_session;
+  // Netplay (Task 14): true while this process runs an online session or its lobby is starting one
+  // (online_view::SessionLocks). Four controls read their disabled state from online_view::LockedInSession with it
+  // (Extras, the Video and Audio "Restart now", the Game tab's "Change..."), and the refusal behind them reads the same
+  // answer. Empty: never locked.
+  std::function<bool()> session_locked;
   OnlineHost online;  // the Online tab's callbacks; empty `state` = the tab says it is unavailable
   // Game tab: the folder the game started from, whether --game_data_root
   // chose it, and the action that closes the menu and opens the setup screen
@@ -122,8 +123,8 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void DrawPhotoTab();
   void DrawOnlineTab();
   void DrawGameTab();
-  bool InSession() const;
-  bool Locked(online_view::Control control) const;  // LockedInSession(control, InSession())
+  bool SessionLocked() const;
+  bool Locked(online_view::Control control) const;  // LockedInSession(control, SessionLocked())
   // Logs the Online tab's state and the locks once per change (every frame the menu draws, whichever tab is shown).
   void LogNetState(const online_view::In& in, const online_view::View& view);
   // Saves the tweak's cvar; on success sets it and, for a live tweak, writes

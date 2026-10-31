@@ -125,10 +125,10 @@ MenuDialog::~MenuDialog() {
   host_.window->RemoveInputListener(this);
 }
 
-bool MenuDialog::InSession() const { return host_.in_session && host_.in_session(); }
+bool MenuDialog::SessionLocked() const { return host_.session_locked && host_.session_locked(); }
 
 bool MenuDialog::Locked(online_view::Control control) const {
-  return online_view::LockedInSession(control, InSession());
+  return online_view::LockedInSession(control, SessionLocked());
 }
 
 void MenuDialog::LogNetState(const online_view::In& in, const online_view::View& view) {
@@ -137,7 +137,7 @@ void MenuDialog::LogNetState(const online_view::In& in, const online_view::View&
     logged_tab_line_ = tab;
     REXLOG_INFO("{}", tab);
   }
-  const std::string locks = online_view::LockedLine(InSession());
+  const std::string locks = online_view::LockedLine(SessionLocked());
   if (!locks.empty() && !logged_locks_) {
     logged_locks_ = true;
     REXLOG_INFO("{}", locks);
@@ -146,7 +146,7 @@ void MenuDialog::LogNetState(const online_view::In& in, const online_view::View&
 
 void MenuDialog::PollNetState() {
   if (!host_.online.state) return;
-  const online_view::In online_in = host_.online.state();
+  const online_view::In online_in = host_.online.state(false);  // not the tab: no build id
   LogNetState(online_in, online_view::Describe(online_in));
 }
 
@@ -522,7 +522,7 @@ void MenuDialog::DrawOnlineTab() {
   online_view::In in;
   online_view::View view;
   if (host_.online.state) {
-    in = host_.online.state();
+    in = host_.online.state(true);
     view = online_view::Describe(in);
   }
   online_tab_.Draw(
@@ -549,7 +549,7 @@ void MenuDialog::DrawGameTab() {
   const bool change_locked = Locked(online_view::Control::kGameChange);
   ImGui::BeginDisabled(!tab.can_change || !host_.change_game_files || change_locked);
   if (ImGui::Button("Change...") &&
-      !online_view::Refuse(online_view::Control::kGameChange, InSession(), "change game files", &status_,
+      !online_view::Refuse(online_view::Control::kGameChange, SessionLocked(), "change game files", &status_,
                            [](const std::string& line) { REXLOG_INFO("{}", line); })) {
     // After this frame, with the menu closed first (the setup screen takes
     // its place; the menu must not be destroyed while it is drawing).
@@ -750,7 +750,7 @@ void MenuDialog::OnMouseDown(rex::ui::MouseEvent& e) {
 }
 
 void MenuDialog::Restart(online_view::Control control) {
-  if (online_view::Refuse(control, InSession(), "restart", &status_,
+  if (online_view::Refuse(control, SessionLocked(), "restart", &status_,
                           [](const std::string& line) { REXLOG_INFO("{}", line); })) {
     return;
   }

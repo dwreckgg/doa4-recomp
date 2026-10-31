@@ -1129,6 +1129,7 @@ void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
     s.timing.frame = int32_t(f);
     s.timing.delay = s.ho.delay;
     s.timing.frames_ahead = ahead;
+    s.timing.ping_ms = s.live->ping_ms();  // fix round I1: GekkoNet's round trip (np_live refreshes it every frame)
     s.timing.net_us = net;
     s.timing.wait_us = wait;
     s.timing.pacer_us = pacer;

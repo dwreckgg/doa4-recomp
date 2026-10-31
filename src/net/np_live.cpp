@@ -47,6 +47,7 @@ void Session::PeerLeft(int32_t at_frame, wire::LeaveReason why) {
 
 bool Session::banner_waiting() const { return banner_.load(); }
 float Session::frames_ahead() const { return frames_ahead_.load(); }
+float Session::ping_ms() const { return ping_ms_.load(); }
 int32_t Session::remote_slack() const { return remote_slack_.load(); }
 
 FrameResult Session::Finish(FrameResult r, End end, int32_t end_frame, std::string why, uint64_t at_us) {
@@ -198,6 +199,7 @@ FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& loc
   r.holds = holds_;
   const float fa = hooks_.frames_ahead ? hooks_.frames_ahead() : gekko_->FramesAhead();
   frames_ahead_.store(fa);
+  ping_ms_.store(hooks_.ping_ms ? hooks_.ping_ms() : gekko_->Stats().ping_ms);
   const int extra = rules::PacerExtraUs(fa);
   if (extra > 0) {
     const uint64_t p0 = clock_.now_us();
