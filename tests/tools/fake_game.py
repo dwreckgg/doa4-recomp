@@ -36,9 +36,14 @@ Test-only environment (the stand-in's own, not the game's):
   FAKE_GAME_BADEXIT same form: that run ends with the good quit line and every file, but exits with code 5
   FAKE_GAME_WRONGQUIT  same form, replays: that replay ends cleanly (exit 0) with another quit reason than the end of the
                     recording ("quit at frame N: quit frame", the reason a record run or DOA4_NP_QUIT gives)
+  FAKE_GAME_STARTFAIL  a comma-separated list of SUFFIX=CODE: a run whose name ends with SUFFIX exits at once with CODE (a
+                    negative number is a Windows error status such as -1073741515 = 0xC0000135, a missing DLL), writing no
+                    log and no file: a game that could not start
 Every run also logs where it was started and with what: "stand-in game: cwd <folder>", "stand-in game: args a|b|c",
 one "stand-in game: env DOA4_X=value" line per DOA4_ variable in its environment and "stand-in game: ud yes a,b" (the
-top-level names in its --user_data_root folder, "no" if there is none): the bundle's run_check.bat test reads them. A replay reads its recording as the real format (np_core.h: "D4NPREC1", version 2, 32-byte header, meta text,
+top-level names in its --user_data_root folder, "no" if there is none): the bundle's run_check.bat test reads them.
+"stand-in game: console-window none|hidden|visible" says whether it sits in a console with a window a person would see (the
+checks start everything without one). A replay reads its recording as the real format (np_core.h: "D4NPREC1", version 2, 32-byte header, meta text,
 52-byte frames) or as the text file the stand-in's own record runs write (just the frame count).
 Like the real runtime at startup (rexglue-sdk src/system/runtime.cpp: thread::EnableAffinityConfiguration sets
 the process mask to the SYSTEM mask, result ignored) every run first tries to widen its own CPU mask, then
@@ -127,6 +132,16 @@ def process_affinity():
     return mine.value
 
 
+def console_window():
+    """Whether this process sits in a console with a window: "none" (no console window at all: the checks start everything with
+    CREATE_NO_WINDOW), "hidden" or "visible" (a window a person would see)."""
+    import ctypes
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if not hwnd:
+        return "none"
+    return "visible" if ctypes.windll.user32.IsWindowVisible(hwnd) else "hidden"
+
+
 def listed(name, var):
     return any(s and name.endswith(s) for s in os.environ.get(var, "").split(","))
 
@@ -147,6 +162,10 @@ def main():
     mode = os.environ["DOA4_NP"]
     out = os.environ["DOA4_NP_DIR"]
     name = os.path.basename(os.path.dirname(os.path.normpath(out)))
+    for item in os.environ.get("FAKE_GAME_STARTFAIL", "").split(","):  # a game that could not start: no log, no file
+        suffix, _, code = item.partition("=")
+        if suffix and code and name.endswith(suffix):
+            sys.exit(int(code))
     if mode == "record":
         frames = int(os.environ.get("FAKE_GAME_FRAMES", "12"))
     else:
@@ -175,7 +194,8 @@ def main():
                # the SDL controller allow-list the game's SDL reads at start (np_run.py sets it so no real pad is opened)
                f"stand-in game: {SDL_PADS}={os.environ.get(SDL_PADS, '(unset)')}",
                # where and how the launcher started this process (the bundle's run_check.bat test pins them)
-               f"stand-in game: cwd {os.getcwd()}", "stand-in game: args " + "|".join(sys.argv[1:])]
+               f"stand-in game: cwd {os.getcwd()}", "stand-in game: args " + "|".join(sys.argv[1:]),
+               f"stand-in game: console-window {console_window()}"]
     started += [f"stand-in game: env {k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("DOA4_")]
     ud = next((a[len("--user_data_root="):] for a in sys.argv[1:] if a.startswith("--user_data_root=")), None)
     started.append("stand-in game: ud " + ("(no --user_data_root)" if ud is None else

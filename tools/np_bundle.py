@@ -1,5 +1,5 @@
 """Builds the phase-0 cross-PC bundle: everything the friend's PC needs to replay this PC's recordings and run the DPPS
-test, without Python (the friend has a DOA4 game folder of their own). The friend runs run_check.bat and sends back
+test, without Python (the friend has a DOA4 disc image or game folder of their own). The friend runs run_check.bat and sends back
 results.zip; tools/np_crosscheck.py compares it with this PC's runs.
 
   py -3 -I tools/np_bundle.py --bin NP_BIN_TAG_FOLDER --recs RUN[,RUN...] --userdata PRISTINE --dpps DPPS_EXE --out FOLDER
@@ -8,7 +8,8 @@ results.zip; tools/np_crosscheck.py compares it with this PC's runs.
 --recs  record run folders (np_run.py record: <run>/out/rec.d4r and run_result.txt); each folder's name is the recording's name
 --out   a new folder; FOLDER.zip is made beside it. Built as FOLDER.partial and renamed when complete: a failure leaves nothing.
 The bundle holds bin/ (the three files), recs/<name>.d4r, ud_pristine/ (the save every replay starts from: a copy of
---userdata), the DPPS exe, run_check.bat, run_one.ps1, README.txt and recordings.txt (templates: tools/np_bundle/).
+--userdata), the DPPS exe, run_check.bat, get_game_files.bat (the game's own first-run setup: the friend gets the game files out
+of their own disc image), run_one.ps1, README.txt and recordings.txt (templates: tools/np_bundle/).
 
 It refuses unless every recording was made by the build in --bin: the recording's meta (np_core.h: the "build=" line of
 the text after the 32-byte header) and the id of the exe must be the same id. The session refuses a replay of another build
@@ -370,6 +371,7 @@ def build_bundle(bin_dir, recs, userdata, dpps, out, minutes_each=3):
         dpps_name = os.path.basename(dpps)
         copy_file(dpps, os.path.join(tmp, dpps_name))
         files = {"run_check.bat": template("run_check.bat", RECS=" ".join(names), DPPS=dpps_name),
+                 "get_game_files.bat": template("get_game_files.bat"),
                  "run_one.ps1": template("run_one.ps1"),
                  "README.txt": template("README.txt", N=str(len(names)), MINUTES=str(minutes_each * len(names)), BUILD=exe_id,
                                         DATA=", ".join(data_ids), RECS=", ".join(names)),
