@@ -21,6 +21,8 @@
 //   DOA4_NP_SHOT_EVERY=<n>  a screenshot every n frames
 //   DOA4_NP_SWEEP=<n>|all   64 KB .data blocks hashed per frame (default 4)
 //   DOA4_NP_DUMP=f,f,...    full .data dumps at frames (dumps/data_<frame>.bin)
+//   DOA4_NP_HEAPDUMP=1      each dump also copies the committed pages of the guest heaps 00000000 and
+//                           40000000 (dumps/heap_<frame>.bin, region index heap_<frame>.txt; debug)
 // Request files in DOA4_NP_DIR, taken (deleted) when read, polled every 15 frames:
 //   np_pad.on   a pad script appended to the input queue (record only)
 //   np_shot.on  a screenshot now

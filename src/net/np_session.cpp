@@ -37,6 +37,8 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
 
 #include "generated/default/dead_or_alive_4_init.h"
 
@@ -91,9 +93,10 @@ constexpr uint32_t kMtState = 0x833F7600;  // DOA4_NP_FORCE_DESYNC flips a byte 
 enum class Mode { kOff, kRecord, kReplay, kOnline };
 
 struct Job {
-  enum Kind { kShot, kDump } kind;
+  enum Kind { kShot, kDump, kHeap } kind;
   uint32_t frame;
-  std::vector<uint8_t> bytes;  // kDump
+  std::vector<uint8_t> bytes;  // kDump, kHeap
+  std::string index;           // kHeap: one line per region in bytes, "base size allocation_base allocation_size"
 };
 
 // One packet of the game thread's GekkoNet traffic (carry 2f): the ring is dumped on every reported hold and every
@@ -128,6 +131,7 @@ struct State {
   std::vector<uint32_t> shot_frames;
   uint32_t shot_every = 0;
   std::vector<uint32_t> dump_frames;
+  bool heap_dump = false;  // DOA4_NP_HEAPDUMP=1: each dump also writes the guest heaps' committed pages
 
   // hashes
   std::vector<Region> regions;
@@ -408,6 +412,99 @@ void Enqueue(Job job) {
   s.job_cv.notify_one();
 }
 
+// DOA4_NP_POKE=<frame>:<addr>:set:<hex bytes>|add:<n>[;...] (a debug test switch, online, test dir only): at the
+// frame boundary of <frame>, after hashing, write the bytes at the guest address, or add n to the big-endian u32 there.
+// A perturbation probe: one side's guest memory is changed where the peers are known to differ; if guest code that
+// feeds game state reads it, the digests or sweeps part later in the session.
+void PokeAt(uint8_t* base, uint32_t f) {
+  struct Poke {
+    uint32_t frame, addr;
+    bool add;
+    uint32_t n;
+    std::vector<uint8_t> bytes;
+  };
+  static const std::vector<Poke> pokes = [] {
+    std::vector<Poke> out;
+    std::stringstream ss(TestDirEnv("DOA4_NP_POKE"));
+    std::string item;
+    while (std::getline(ss, item, ';')) {
+      std::stringstream is(item);
+      std::string fr, ad, op, val;
+      if (!std::getline(is, fr, ':') || !std::getline(is, ad, ':') || !std::getline(is, op, ':') ||
+          !std::getline(is, val)) {
+        continue;
+      }
+      Poke p{uint32_t(std::strtoul(fr.c_str(), nullptr, 10)), uint32_t(std::strtoul(ad.c_str(), nullptr, 16)),
+             op == "add", 0, {}};
+      if (p.add) {
+        p.n = uint32_t(std::strtoul(val.c_str(), nullptr, 10));
+      } else {
+        for (size_t i = 0; i + 1 < val.size(); i += 2) {
+          p.bytes.push_back(uint8_t(std::strtoul(val.substr(i, 2).c_str(), nullptr, 16)));
+        }
+      }
+      out.push_back(std::move(p));
+    }
+    return out;
+  }();
+  for (const Poke& p : pokes) {
+    if (p.frame != f) continue;
+    uint8_t* q = base + p.addr;
+    if (p.add) {
+      uint32_t v = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
+      const uint32_t old = v;
+      v += p.n;
+      q[0] = uint8_t(v >> 24), q[1] = uint8_t(v >> 16), q[2] = uint8_t(v >> 8), q[3] = uint8_t(v);
+      char line[96];
+      std::snprintf(line, sizeof(line), "poke at frame %u: %08X %08X -> %08X", f, p.addr, old, v);
+      Log(line);
+    } else {
+      std::memcpy(q, p.bytes.data(), p.bytes.size());
+      char line[96];
+      std::snprintf(line, sizeof(line), "poke at frame %u: %08X set %zu bytes", f, p.addr, p.bytes.size());
+      Log(line);
+    }
+  }
+}
+
+// DOA4_NP_HEAPDUMP=1 (a debug test switch): with each .data dump, a copy of every committed, readable page of
+// the guest's two virtual heaps (00000000 4 KB pages, 40000000 64 KB pages: the game's allocations, its
+// dispatcher objects and the thread stacks), taken on the game thread at the same point as the .data copy.
+// Physical heaps (A0000000.., GPU-written) are left out. The index lists each region as
+// "base size allocation_base allocation_size" (hex), in the order the bytes follow.
+void EnqueueHeapDump(uint32_t f) {
+  auto* ks = rex::system::kernel_state();
+  rex::memory::Memory* memory = ks ? ks->memory() : nullptr;
+  if (!memory) {
+    Log("heap dump " + std::to_string(f) + ": no guest memory");
+    return;
+  }
+  Job job{Job::kHeap, f, {}, {}};
+  for (const uint32_t heap_base : {0x00000000u, 0x40000000u}) {
+    rex::memory::BaseHeap* heap = memory->LookupHeap(heap_base == 0 ? 0x00010000u : heap_base);
+    if (!heap) continue;
+    const uint64_t end = uint64_t(heap->heap_base()) + heap->heap_size();
+    uint64_t a = heap->heap_base();
+    while (a < end) {
+      rex::memory::HeapAllocationInfo info{};
+      if (!heap->QueryRegionInfo(uint32_t(a), &info) || info.region_size == 0) {
+        a += heap->page_size();
+        continue;
+      }
+      if ((info.state & rex::memory::kMemoryAllocationCommit) && (info.protect & rex::memory::kMemoryProtectRead)) {
+        const uint8_t* p = memory->TranslateVirtual<const uint8_t*>(uint32_t(a));
+        job.bytes.insert(job.bytes.end(), p, p + info.region_size);
+        char line[64];
+        std::snprintf(line, sizeof(line), "%08X %08X %08X %08X\n", uint32_t(a), info.region_size,
+                      info.allocation_base, info.allocation_size);
+        job.index += line;
+      }
+      a += info.region_size;
+    }
+  }
+  Enqueue(std::move(job));
+}
+
 void WriterLoop() {
   State& s = S();
   for (;;) {
@@ -430,6 +527,18 @@ void WriterLoop() {
       const std::string err = doa4::photo::WriteImage(image, s.dir / "shots" / name,
                                                       doa4::photo::FileType::kPng);
       Log("shot " + std::to_string(job.frame) + (err.empty() ? " saved" : ": " + err));
+    } else if (job.kind == Job::kHeap) {
+      char name[40];
+      std::error_code ec;
+      std::filesystem::create_directories(s.dir / "dumps", ec);
+      std::snprintf(name, sizeof(name), "heap_%06u.bin", job.frame);
+      std::ofstream out(s.dir / "dumps" / name, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(job.bytes.data()), std::streamsize(job.bytes.size()));
+      std::snprintf(name, sizeof(name), "heap_%06u.txt", job.frame);
+      std::ofstream idx(s.dir / "dumps" / name, std::ios::binary);
+      idx << job.index;
+      Log("heap dump " + std::to_string(job.frame) + " (" + std::to_string(job.bytes.size()) + " bytes)" +
+          (out && idx ? " saved" : " FAILED"));
     } else {
       char name[40];
       std::snprintf(name, sizeof(name), "data_%06u.bin", job.frame);
@@ -1037,9 +1146,10 @@ void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
     s.dump_frames.erase(s.dump_frames.begin());
   }
   if (dump) {
-    Job job{Job::kDump, f, {}};
+    Job job{Job::kDump, f, {}, {}};
     job.bytes.assign(base + kDataLo, base + kDataHi);
     Enqueue(std::move(job));
+    if (s.heap_dump) EnqueueHeapDump(f);
   }
   if ((f % 15) == 0) PollRequests(s, f);
   static const std::string force = TestDirEnv("DOA4_NP_FORCE_DESYNC");
@@ -1047,6 +1157,7 @@ void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
     base[kMtState + 100] ^= 0x01;
     Log("forced desync: one byte of the MT state 0x833F7600 flipped at frame " + std::to_string(f));
   }
+  PokeAt(base, f);
 
   // (3) the unlock
   UnlockStep(s, f);
@@ -1085,7 +1196,7 @@ void OnFrameOnline(PPCContext& ctx, uint8_t* base) {
   }
   if (!r.ok) {
     if (r.end == live::End::kDesync) {
-      Job job{Job::kDump, f, {}};
+      Job job{Job::kDump, f, {}, {}};
       job.bytes.assign(base + kDataLo, base + kDataHi);
       Enqueue(std::move(job));
     }
@@ -1197,9 +1308,10 @@ void OnFrame(PPCContext& ctx, uint8_t* base) {
     s.dump_frames.erase(s.dump_frames.begin());
   }
   if (dump) {
-    Job job{Job::kDump, f, {}};
+    Job job{Job::kDump, f, {}, {}};
     job.bytes.assign(base + kDataLo, base + kDataHi);
     Enqueue(std::move(job));
+    if (s.heap_dump) EnqueueHeapDump(f);
   }
 
   // 2. Requests; the unlock of a replay of a session (R21: the frame hook's step 3, before det); the input of frame f.
@@ -1375,6 +1487,7 @@ void StartOnline(Host host) {
   s.shot_frames = FrameList(TestDirEnv("DOA4_NP_SHOTS"));
   s.shot_every = std::strtoul(TestDirEnv("DOA4_NP_SHOT_EVERY").c_str(), nullptr, 10);
   s.dump_frames = FrameList(TestDirEnv("DOA4_NP_DUMP"));
+  s.heap_dump = TestDirEnv("DOA4_NP_HEAPDUMP") == "1";
   OpenHashFiles(s);
   det::Start(s.seed, s.dir);
   s.running.store(true);
@@ -1633,6 +1746,7 @@ void Start(Host host) {
   s.shot_frames = FrameList(Env("DOA4_NP_SHOTS"));
   s.shot_every = std::strtoul(Env("DOA4_NP_SHOT_EVERY").c_str(), nullptr, 10);
   s.dump_frames = FrameList(Env("DOA4_NP_DUMP"));
+  s.heap_dump = Env("DOA4_NP_HEAPDUMP") == "1";
 
   OpenHashFiles(s);
   det::Start(s.seed, s.dir);
