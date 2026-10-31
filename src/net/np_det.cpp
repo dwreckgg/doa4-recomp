@@ -390,6 +390,17 @@ REX_HOOK_RAW(sub_82790130) {
 REX_HOOK_RAW(sub_82793B68) {
   const uint32_t start = ctx.r5.u32;
   __imp__sub_82793B68(ctx, base);
+  // Test switch DOA4_NP_FORCE_LOADER_RACE=<ms> (debug loader-idle): after the loader thread (start 0x823FC5A0) is
+  // created, its creator (sub_824F4560, the main thread) sleeps this long before it goes on to initialise the
+  // loader's critical section 0x830ADBCC, so the new thread reaches its first RtlEnterCriticalSection on that
+  // section before the initialisation: the order the host produces now and then by timing alone.
+  if (start == 0x823FC5A0u) {
+    if (const char* v = doa4::np::TestSwitch("DOA4_NP_FORCE_LOADER_RACE")) {
+      const unsigned long ms = std::strtoul(v, nullptr, 10);
+      REXLOG_INFO("[doa4][NET] forced loader race: the creator sleeps {} ms before the critical section init", ms);
+      Sleep(DWORD(ms));
+    }
+  }
   if (!doa4::np::Active()) return;
   const uint32_t handle = ctx.r3.u32;
   uint32_t tid = 0;
