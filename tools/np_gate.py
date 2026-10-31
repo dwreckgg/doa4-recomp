@@ -27,6 +27,9 @@ sys.dont_write_bytecode = True  # importing np_compare must not leave a __pycach
 import np_compare  # noqa: E402
 
 
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: the helper consoles this tool starts open no window
+
+
 def run(mode, name, a, extra):
     cmd = [sys.executable, os.path.join(HERE, "np_run.py"), mode, name, "--userdata", a.userdata,
            "--runs", a.runs, "--timeout", str(a.timeout), "--arg=--headless=true"] + extra
@@ -40,7 +43,9 @@ def run(mode, name, a, extra):
         cmd.append(f"--arg={arg}")
     if a.affinity:
         cmd += ["--affinity", a.affinity]
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    if a.show_window:
+        cmd.append("--show-window")
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
 
 
 def compare(x, y, runs, advisory):
@@ -48,7 +53,7 @@ def compare(x, y, runs, advisory):
            os.path.join(runs, y), "--blocks", "0"]
     if advisory:
         cmd.append("--sweep-advisory")
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW)
     return p.returncode, p.stdout.splitlines()
 
 
@@ -80,6 +85,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--sweep-advisory", action="store_true")
     ap.add_argument("--affinity", help="logical CPU mask for every run, e.g. 0x3")
+    ap.add_argument("--show-window", action="store_true", help="np_run.py --show-window for every run (the game is not started minimized)")
     a = ap.parse_args()
     if not a.script and not a.rec:
         sys.exit("--script or --rec")

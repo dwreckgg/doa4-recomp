@@ -36,9 +36,21 @@ Test-only environment (the stand-in's own, not the game's):
   FAKE_GAME_BADEXIT same form: that run ends with the good quit line and every file, but exits with code 5
   FAKE_GAME_WRONGQUIT  same form, replays: that replay ends cleanly (exit 0) with another quit reason than the end of the
                     recording ("quit at frame N: quit frame", the reason a record run or DOA4_NP_QUIT gives)
+  FAKE_GAME_STARTFAIL  a comma-separated list of SUFFIX=CODE: a run whose name ends with SUFFIX exits at once with CODE (a
+                    negative number is a Windows error status such as -1073741515 = 0xC0000135, a missing DLL), writing no
+                    log and no file: a game that could not start
+Self-test line (Task 10): every run with a --log_file writes the line the real game logs at start-up
+("[doa4][LIFE] dot products: canonical NaN on") into that file, as np_run.py and np_pair.py require of a good run:
+  FAKE_NO_SELFTEST=1  the line is left out; FAKE_SELFTEST_OFF=1  the line says OFF (<lane bits>) instead of on.
+Hidden launch (Task 10): with FAKE_STARTUP_NOTE=1 the first process of a run writes "show_window=<n> flags=<hex>" (its own
+STARTUPINFO as read from the process the tool started: wShowWindow and dwFlags) into startup.txt next to its --user_data_root folder, so the tests see how the
+tool started it (np_run.py and np_pair.py: 7 and flag 0x1, SW_SHOWMINNOACTIVE + STARTF_USESHOWWINDOW).
+Online mode (a start with DOA4_NP_TEST_DIR and no DOA4_NP, np_pair.py's): fake_online.py.
 Every run also logs where it was started and with what: "stand-in game: cwd <folder>", "stand-in game: args a|b|c",
 one "stand-in game: env DOA4_X=value" line per DOA4_ variable in its environment and "stand-in game: ud yes a,b" (the
-top-level names in its --user_data_root folder, "no" if there is none): the bundle's run_check.bat test reads them. A replay reads its recording as the real format (np_core.h: "D4NPREC1", version 2, 32-byte header, meta text,
+top-level names in its --user_data_root folder, "no" if there is none): the bundle's run_check.bat test reads them.
+"stand-in game: console-window none|hidden|visible" says whether it sits in a console with a window a person would see (the
+checks start everything without one). A replay reads its recording as the real format (np_core.h: "D4NPREC1", version 2, 32-byte header, meta text,
 52-byte frames) or as the text file the stand-in's own record runs write (just the frame count).
 Like the real runtime at startup (rexglue-sdk src/system/runtime.cpp: thread::EnableAffinityConfiguration sets
 the process mask to the SYSTEM mask, result ignored) every run first tries to widen its own CPU mask, then
@@ -127,6 +139,16 @@ def process_affinity():
     return mine.value
 
 
+def console_window():
+    """Whether this process sits in a console with a window: "none" (no console window at all: the checks start everything with
+    CREATE_NO_WINDOW), "hidden" or "visible" (a window a person would see)."""
+    import ctypes
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if not hwnd:
+        return "none"
+    return "visible" if ctypes.windll.user32.IsWindowVisible(hwnd) else "hidden"
+
+
 def listed(name, var):
     return any(s and name.endswith(s) for s in os.environ.get(var, "").split(","))
 
@@ -143,10 +165,82 @@ def recording_frames(path):
     return int(data.split()[0])
 
 
+def startup_info(pid):
+    """(wShowWindow, dwFlags) the process `pid` was started with, read from its PEB (RTL_USER_PROCESS_PARAMETERS, x64:
+    WindowFlags at 0xA4, ShowWindowFlags at 0xA8): the STARTUPINFO its creator passed to CreateProcess. The stand-in sits
+    behind fake_game.cmd, and cmd.exe starts python with a default STARTUPINFO of its own, so the process the tool started
+    (the parent, cmd.exe) is the one to read."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    nt = ctypes.WinDLL("ntdll")
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.OpenProcess(0x0410, False, pid)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+    if not h:
+        raise OSError(f"cannot open process {pid}")
+    try:
+        info = (ctypes.c_void_p * 6)()
+        if nt.NtQueryInformationProcess(h, 0, ctypes.byref(info), ctypes.sizeof(info), None) != 0:
+            raise OSError("NtQueryInformationProcess failed")
+
+        def read(address, size):
+            buf = ctypes.create_string_buffer(size)
+            got = ctypes.c_size_t()
+            if not k32.ReadProcessMemory(h, ctypes.c_void_p(address), buf, size, ctypes.byref(got)) or got.value != size:
+                raise OSError(f"cannot read process memory at {address:#x}")
+            return buf.raw
+
+        params = struct.unpack("<Q", read(info[1] + 0x20, 8))[0]  # PEB.ProcessParameters
+        flags, show = struct.unpack("<II", read(params + 0xA4, 8))
+        return show, flags
+    finally:
+        k32.CloseHandle(h)
+
+
+def arg_value(prefix):
+    return next((a[len(prefix):] for a in sys.argv[1:] if a.startswith(prefix)), None)
+
+
+def write_game_log_line():
+    """The start-up line of the game's own log (--log_file): the dot-product self-test np_run.py and np_pair.py require."""
+    path = arg_value("--log_file=")
+    if not path:
+        return
+    if os.environ.get("FAKE_NO_SELFTEST") == "1":
+        text = "[info] [core] [doa4][LIFE] stand-in game started, no self-test line"
+    elif os.environ.get("FAKE_SELFTEST_OFF") == "1":
+        text = "[info] [core] [doa4][LIFE] dot products: canonical NaN OFF (7FC00000 00000000 00000000 00000000)"
+    else:
+        text = "[info] [core] [doa4][LIFE] dot products: canonical NaN on"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text + "\n")
+
+
+def write_startup_note():
+    ud = arg_value("--user_data_root=")
+    if ud and os.environ.get("FAKE_STARTUP_NOTE") == "1":
+        show, flags = startup_info(os.getppid())  # behind fake_game.cmd: cmd.exe, the process the tool started
+        with open(os.path.join(os.path.dirname(os.path.normpath(ud)), "startup.txt"), "w") as f:
+            f.write(f"show_window={show} flags={flags:#x}\n")
+
+
 def main():
+    if "DOA4_NP" not in os.environ and "DOA4_NP_TEST_DIR" in os.environ:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # py -3 -I does not put the script's folder on the path
+        import fake_online
+        sys.exit(fake_online.online_main())
     mode = os.environ["DOA4_NP"]
     out = os.environ["DOA4_NP_DIR"]
     name = os.path.basename(os.path.dirname(os.path.normpath(out)))
+    for item in os.environ.get("FAKE_GAME_STARTFAIL", "").split(","):  # a game that could not start: no log, no file
+        suffix, _, code = item.partition("=")
+        if suffix and code and name.endswith(suffix):
+            sys.exit(int(code))
+    write_startup_note()
+    write_game_log_line()
     if mode == "record":
         frames = int(os.environ.get("FAKE_GAME_FRAMES", "12"))
     else:
@@ -175,7 +269,8 @@ def main():
                # the SDL controller allow-list the game's SDL reads at start (np_run.py sets it so no real pad is opened)
                f"stand-in game: {SDL_PADS}={os.environ.get(SDL_PADS, '(unset)')}",
                # where and how the launcher started this process (the bundle's run_check.bat test pins them)
-               f"stand-in game: cwd {os.getcwd()}", "stand-in game: args " + "|".join(sys.argv[1:])]
+               f"stand-in game: cwd {os.getcwd()}", "stand-in game: args " + "|".join(sys.argv[1:]),
+               f"stand-in game: console-window {console_window()}"]
     started += [f"stand-in game: env {k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("DOA4_")]
     ud = next((a[len("--user_data_root="):] for a in sys.argv[1:] if a.startswith("--user_data_root=")), None)
     started.append("stand-in game: ud " + ("(no --user_data_root)" if ud is None else

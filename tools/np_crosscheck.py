@@ -91,14 +91,32 @@ def main(argv=None):
             print(f"== {name}: no local run folder {local}")
             ok = False
             continue
-        p = subprocess.run([sys.executable, "-I", os.path.join(HERE, "np_compare.py"), local, friend], capture_output=True, text=True)
+        result = os.path.join(out_dir(friend), "run_result.txt")
+        friend_result = ("; ".join(l.strip() for l in read_text(result).splitlines() if l.strip())
+                         if os.path.exists(result) else "no run_result.txt")
+        # A run that never got as far as a digest (a refused recording, a game that did not start) has nothing to compare:
+        # say so in a line, instead of letting np_compare fail on the missing file.
+        no_digest = [who for who, run in (("friend", friend), ("local", local))
+                     if not os.path.exists(os.path.join(out_dir(run), "digest.d4d"))]
+        if no_digest:
+            print(f"== {name}: DIFFERS")
+            print(f"  the {' and the '.join(no_digest)} run has no digest.d4d, so there is nothing to compare; friend result: {friend_result}")
+            for line in friend_lines(friend):
+                print("  friend:", line)
+            ok = False
+            continue
+        p = subprocess.run([sys.executable, "-I", os.path.join(HERE, "np_compare.py"), local, friend], capture_output=True, text=True,
+                           creationflags=0x08000000)  # CREATE_NO_WINDOW
+        if "Traceback" in p.stderr:  # a file np_compare cannot read: its last line says which; the traceback is not the answer
+            print(f"== {name}: DIFFERS")
+            print("  np_compare could not read the runs: " + [l for l in p.stderr.splitlines() if l.strip()][-1])
+            ok = False
+            continue
         print(f"== {name}: {'EQUAL' if p.returncode == 0 else 'DIFFERS'}")
         print(p.stdout + p.stderr)
         equal += p.returncode == 0
         ok &= p.returncode == 0
-        result = os.path.join(out_dir(friend), "run_result.txt")
-        if os.path.exists(result):
-            print("  friend result: " + "; ".join(l.strip() for l in read_text(result).splitlines() if l.strip()))
+        print("  friend result: " + friend_result)
         for line in friend_lines(friend):
             print("  friend:", line)
     if os.path.isdir(out):

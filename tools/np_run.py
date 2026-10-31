@@ -12,9 +12,13 @@ Options: --exe, --game, --userdata (the pristine source), --runs (where run fold
 --env KEY=VALUE (repeatable: extra environment, e.g. DOA4_NP_FIX=none), --timeout seconds,
 --affinity MASK (logical CPU mask, e.g. 0x3: the game is started suspended, limited to those CPUs
 before any of its threads runs, then resumed; only the run's own process; command.txt ends with
-"affinity MASK").
+"affinity MASK"),
+--show-window (the game is started with the window state it asks for; by default it is started minimized without
+taking the focus: STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE, so a run never pops a window in front of the user).
 The game's environment gets SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT=0x0000/0x0000 (SDL opens no real controller)
 unless the caller set that variable; command.txt lists it with the DOA4_ variables.
+A run whose game.log lacks the dot-product self-test line "[doa4][LIFE] dot products: canonical NaN on" (or reports OFF)
+is never a good run either (selftest_problem()).
 Prints the run folder and the session log's last lines; writes out/run_result.txt and exits 0 only for a good run (see judge()).
 A replay the session refuses (another build, fix set, game data or settings than the recording's) or cannot read is
 never a good run: run_result.txt then has "status failed" and "quit refused: ..." / "quit cannot replay ...", or
@@ -52,8 +56,39 @@ WARN_PREFIX = "WARN "
 # --env or in this script's own environment); a launcher setting, not part of the recording's meta.
 SDL_PADS = ("SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT", "0x0000/0x0000")
 
+# The line the game logs at start-up (dead_or_alive_4_app.h: REXLOG_INFO("[doa4][LIFE] dot products: canonical NaN {}",
+# DotProductSelfTest())): "on" when the dot-product redirect returns the canonical NaN, else "OFF (<lane bit patterns>)".
+# A build whose redirect is off computes other results than the recordings' (observation Task 1 review M2).
+SELFTEST_PREFIX = "[doa4][LIFE] dot products: canonical NaN "
 
-def judge(mode, code, timed_out, log_lines, out_dir=None):
+# Hidden launch (ledger ruling 2026-10-30): a game started by a tool never takes the foreground.
+STARTF_USESHOWWINDOW = 0x00000001
+SW_SHOWMINNOACTIVE = 7
+
+
+def hidden_startupinfo():
+    """A STARTUPINFO that starts the process's first window minimized and without activation (the game's window is
+    created by the process itself, which honours wShowWindow for its first ShowWindow call)."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= STARTF_USESHOWWINDOW
+    si.wShowWindow = SW_SHOWMINNOACTIVE
+    return si
+
+
+def selftest_problem(lines):
+    """None if the game log `lines` hold the dot-product self-test line and every such line says "on"; else why not."""
+    found = []
+    for l in lines:
+        at = l.find(SELFTEST_PREFIX)
+        if at >= 0:
+            found.append(l[at:].strip())
+    if not found:
+        return "NO SELFTEST: game.log has no '" + SELFTEST_PREFIX + "on' line"
+    bad = next((l for l in found if l[len(SELFTEST_PREFIX):] != "on"), None)
+    return None if bad is None else f"SELFTEST not on: {bad}"
+
+
+def judge(mode, code, timed_out, log_lines, out_dir=None, game_lines=None):
     """(status, quit line): ok only if the game exited 0 by itself after the session quit for a
     reason that ends a good run of this mode, and the log holds no WARN line.
 
@@ -63,7 +98,9 @@ def judge(mode, code, timed_out, log_lines, out_dir=None):
     reason is "refusal not honoured (<what>): <the refusal>": the status is "failed" either way, so
     this is the line that tells a clean refusal from one the session ignored.
     A run whose log holds a line starting with WARN_PREFIX is failed with the reason "<the first WARN line>
-    (<the quit line, or 'no quit line'>)"."""
+    (<the quit line, or 'no quit line'>)".
+    game_lines (the game.log lines; None: not checked) must hold the dot-product self-test line saying "on"
+    (selftest_problem): a run that would otherwise be good fails with "<the problem> (<the quit line>)"."""
     at = next((i for i, l in enumerate(log_lines) if l.startswith(REFUSAL_PREFIXES)), None)
     if at is not None:
         flaws = []
@@ -84,6 +121,9 @@ def judge(mode, code, timed_out, log_lines, out_dir=None):
         return "failed", f"{warn} ({quit_line or 'no quit line'})"
     reason = quit_line.split(": ", 1)[1] if quit_line and ": " in quit_line else None
     ok = not timed_out and code == 0 and reason in OK_REASONS[mode]
+    problem = selftest_problem(game_lines) if ok and game_lines is not None else None
+    if problem is not None:
+        return "failed", f"{problem} ({quit_line})"
     return ("ok" if ok else "failed"), (quit_line or "none")
 
 
@@ -144,6 +184,7 @@ def main():
     ap.add_argument("--arg", action="append", default=[], help="extra game argument, e.g. --arg=--headless=true")
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--affinity", help="logical CPU mask, e.g. 0x3 (two logical CPUs)")
+    ap.add_argument("--show-window", action="store_true", help="do not start the game minimized without activation")
     a = ap.parse_args()
     affinity = None
     if a.affinity:
@@ -195,6 +236,7 @@ def main():
     t0 = time.time()
     flags = 0x00000004 if a.affinity else 0  # CREATE_SUSPENDED: limit the CPUs before any thread runs
     p = subprocess.Popen(args, env=env, cwd=os.path.dirname(a.exe), creationflags=flags,
+                         startupinfo=None if a.show_window else hidden_startupinfo(),
                          stdout=open(os.path.join(run, "stdout.txt"), "w"), stderr=subprocess.STDOUT)
     if a.affinity:
         try:
@@ -225,7 +267,9 @@ def main():
         print("\n".join(lines[-8:]))
     else:
         print("no np_log.txt: the session did not start")
-    status, quit_line = judge(a.mode, code, timed_out, lines, out)
+    game_log = os.path.join(run, "game.log")
+    game_lines = open(game_log, encoding="utf-8", errors="replace").read().splitlines() if os.path.exists(game_log) else []
+    status, quit_line = judge(a.mode, code, timed_out, lines, out, game_lines)
     with open(os.path.join(out, "run_result.txt"), "w", encoding="utf-8") as f:
         f.write(f"status {status}\nexit {code}\ntimeout {int(timed_out)}\nquit {quit_line}\n")
     print(f"status {status}", flush=True)
