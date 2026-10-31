@@ -60,6 +60,7 @@ HOLD_TO_BANNER_MS = 1000
 HOLD_TO_END_MS = 10000
 OK_REASONS = ("left", "peer left")
 POLL = 0.2
+CLOSE_REPEAT_S = 2.0  # end_all repeats its close request this often (fix round Q3)
 
 
 # --- small file helpers ------------------------------------------------------------------------------------------
@@ -404,10 +405,19 @@ class Pair:
                 time.sleep(0.2)
                 continue
             quiet_from = time.time()
+            # Task 12 fix round Q3: a close request reaches a process only through its windows, and a game that was just
+            # relaunched may not have one yet: the request is repeated every CLOSE_REPEAT_S until the process is gone,
+            # /F only after --end-grace.
             for pid in mine:
                 taskkill(pid, False)
             end = time.time() + self.a.end_grace
+            last = time.time()
             while time.time() < end and any(pid_alive(p) for p in mine):
+                if time.time() - last >= CLOSE_REPEAT_S:
+                    last = time.time()
+                    for pid in mine:
+                        if pid_alive(pid):
+                            taskkill(pid, False)
                 time.sleep(0.1)
             for pid, label in mine.items():
                 if pid_alive(pid):

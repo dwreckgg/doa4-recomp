@@ -2546,6 +2546,36 @@ def test_pair_pid_reuse(root):
         other.kill()
 
 
+def test_pair_close_repeated(root):
+    # Task 12 fix round Q3: a relaunched game has no window for its first seconds, so one close request never reaches it
+    # and end_all fell back to /F. end_all repeats the request every 2 s: the stand-in (no window for 3 s, then closes
+    # on WM_CLOSE) ends by the close, not by /F, within the grace.
+    mod = load("np_pair")
+    result = os.path.join(root, "result.txt")
+    env = dict(os.environ, FAKE_WINDOW_AFTER_S="3", FAKE_RESULT=result)
+    late = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "fake_late_window.py")], env=env,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        ctl = os.path.join(root, "late_host", "ctl")
+        os.makedirs(ctl)
+        with open(os.path.join(ctl, "pids.txt"), "w") as f:
+            f.write(f"pid {late.pid} offline {int(time.time() * 1000)}\n")
+        pair = mod.Pair(type("A", (), {"end_grace": 8.0, "orphan_watch": 0.2})())
+        pair.sides.append(mod.Side("host", os.path.join(root, "late_host")))
+        check(late.pid in pair.owned_pids(), "np_pair close repeat: the stand-in is owned (precondition)")
+        t0 = time.time()
+        forced = pair.end_all()
+        took = time.time() - t0
+        late.wait(timeout=10)
+        got = open(result).read() if os.path.exists(result) else ""
+        check(forced == [], f"np_pair close repeat: no /F was needed (forced {forced}, {took:.1f} s)")
+        check(got == "closed", f"np_pair close repeat: the stand-in ended by its close request (result {got!r})")
+        check(3.0 <= took < 8.0, f"np_pair close repeat: it ended after its window appeared and before the grace ({took:.1f} s)")
+    finally:
+        if late.poll() is None:
+            late.kill()
+
+
 def test_pair_affinity(root):
     # the joiner's job limit is read back from its live session process (the stand-in widens its own mask the way the runtime
     # does; a job limit holds), and logged in command.txt
