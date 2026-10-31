@@ -30,7 +30,7 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
   REFUSE=build|files|busy   this copy's join is refused with that reason (the host is not asked)
   LEAKY=1           with REFUSE: the refusal is reported, and LEAK_S (default 0.5) seconds later a session process starts
                     anyway (a refusal that did not hold)
-  HANDOFF=1         with REFUSE: the refused copy writes ud/netplay/handoff.bin at once (a hand-off, no session)
+  HANDOFF=1         with REFUSE: the refused copy writes ud/netplay/handoff.d4h at once (a hand-off, no session)
   NO_REFUSAL_KEY=1  status.txt carries no `refusal=` line
   RELAUNCH=1        the offline relaunch is relaunched once more, 1 s after it was ended (a game that relaunches itself after a
                     close request); LINGER bounds the life of the relaunched process
@@ -258,10 +258,12 @@ def command(st, line):
             st.state, st.event, st.refusal = "offline", refusal_text(refuse, my_files_salt()), refuse
             if os.environ.get("FAKE_ONLINE_LEAKY") == "1":
                 st.leak_at = time.time() + float(os.environ.get("FAKE_ONLINE_LEAK_S", "0.5"))
+            ud = fake_game.arg_value("--user_data_root=")
+            os.makedirs(os.path.join(ud, "netplay"), exist_ok=True)
+            with open(os.path.join(ud, "netplay", "events.txt"), "a") as f:  # the real lobby always writes its events here
+                f.write(f"{int(time.time() * 1000)} refused: {st.event}\n")
             if os.environ.get("FAKE_ONLINE_HANDOFF") == "1":
-                ud = fake_game.arg_value("--user_data_root=")
-                os.makedirs(os.path.join(ud, "netplay"), exist_ok=True)
-                with open(os.path.join(ud, "netplay", "handoff.bin"), "wb") as f:
+                with open(os.path.join(ud, "netplay", "handoff.d4h"), "wb") as f:
                     f.write(b"handoff")
         elif host is None:
             st.state, st.event = "offline", f"no host at port {port}"

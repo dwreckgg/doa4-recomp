@@ -2653,8 +2653,12 @@ def test_pair_refusal_leak(root):
     # a hand-off written by the refused copy
     code, out, runs = np_pair(root, "ho2", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build",
                               "--env-joiner", "FAKE_ONLINE_HANDOFF=1")
-    check(code == 1 and "wrote files under ud/netplay" in out, f"np_pair, a hand-off file in the refused copy: exit {code}\n{out}")
+    check(code == 1 and "wrote ud/netplay/handoff.d4h" in out, f"np_pair, a hand-off file in the refused copy: exit {code}\n{out}")
     check(not any(r[2] == "session" for r in pair_pids(runs, "ho2", "joiner")), "np_pair, hand-off: no session line (the hand-off check is the only one that sees it)")
+    # the lobby's own ud/netplay/events.txt is allowed: a plain refusal (the stand-in writes it as the real lobby does) is fine
+    code, out, runs = np_pair(root, "ev2", "--expect", "refused-build", "--env-joiner", "FAKE_ONLINE_REFUSE=build")
+    events = os.path.join(runs, "ev2_joiner", "ud", "netplay", "events.txt")
+    check(os.path.exists(events) and code == 0, f"np_pair, ud/netplay/events.txt present and allowed: exit {code}, events {os.path.exists(events)}\n{out}")
 
 
 def test_pair_orphans(root):

@@ -26,7 +26,7 @@ close request), `/F` after --end-grace seconds (15). Never by image name. Every 
 STARTF_USESHOWWINDOW + SW_SHOWMINNOACTIVE, helpers with CREATE_NO_WINDOW.
 A refusal is judged from the lobby's status.txt key `refusal=<none|build|files|busy|proto|session|other>` (a missing key fails
 with a clear message); the event text is only printed, and for files must name the salted group. A refused copy must also not be
-starting / restarting / in_session, have no ctl/session folder and no file under ud/netplay (a hand-off), watched for --settle
+starting / restarting / in_session, have no ctl/session folder, no ud/netplay/handoff.d4h and no non-empty ud/netplay/session or sessions folder (ud/netplay/events.txt is the lobby's own and allowed), watched for --settle
 seconds (8: longer than a real game's OnPostInitLogging).
 After the last close request end_all keeps watching every copy's pids.txt until it has not grown for --orphan-watch seconds (10),
 ending any new owned pid: a game that relaunches itself after a close request leaves nothing behind.
@@ -577,8 +577,12 @@ class Pair:
             if os.path.isdir(s.session_dir()):
                 self.problems.append(f"the refused {s.name} copy has a ctl/session folder")
             netplay = os.path.join(s.ud, "netplay")
-            if os.path.isdir(netplay) and any(files or dirs for _, dirs, files in os.walk(netplay)):
-                self.problems.append(f"the refused {s.name} copy wrote files under ud/netplay (a hand-off)")
+            if os.path.exists(os.path.join(netplay, "handoff.d4h")):
+                self.problems.append(f"the refused {s.name} copy wrote ud/netplay/handoff.d4h (a hand-off)")
+            for sub in ("session", "sessions"):
+                d = os.path.join(netplay, sub)
+                if os.path.isdir(d) and any(files or dirs for _, dirs, files in os.walk(d)):
+                    self.problems.append(f"the refused {s.name} copy has files under ud/netplay/{sub}")
 
     def compare(self, host, joiner):
         """(exit code, output lines, first differing digest frame or None) of np_compare.py on the two session folders."""
