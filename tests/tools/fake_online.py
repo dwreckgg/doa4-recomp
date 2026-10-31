@@ -48,6 +48,8 @@ Switches of the stand-in itself (FAKE_ONLINE_*, per copy, in its environment):
   LEFT_AT=<f>       after frame f the session ends `left` (a graceful quit), starts no offline relaunch and lingers until ended
   DESYNC_AT=<f> / DESYNC_OTHER=<hex> / DESYNC_RELAUNCH_S=<s>   with END=desync: the frame named, this copy's "other side"
                     value, the wait before the offline relaunch (default 8.0 s, as the game)
+  PEER_LEFT_WATCH=1 the session ends `peer left` as soon as the peer's np_log ends `left` (the quit Leave, Task 15 G2);
+                    PEER_LEFT_DELAY_S=<s> notices it that much later
   LOST_ANY=1        with END=lost: a peer whose session process is gone counts as vanished even if it wrote a terminal line
   SKIP_PEER_CHECK=1 the session does not look for a lobby-only peer (plays its frames)   NO_OFFLINE=1  after the lobby-only
                     peer's end, no offline relaunch
@@ -475,7 +477,16 @@ def session(ctl):
     left_at = os.environ.get("FAKE_ONLINE_LEFT_AT")
     left_at = int(left_at) if left_at else None
     frame, lost, peer_seen = 0, False, False
+    peer_quit = False
     while frame < rows:
+        if peer and os.environ.get("FAKE_ONLINE_PEER_LEFT_WATCH") == "1":
+            # the game since Task 15 G2: the other side's quit Leave ends this side at once with `peer left`
+            plog = os.path.join(peer, "session", "np_log.txt")
+            if os.path.exists(plog) and any(l.startswith("session ended at frame") and l.rstrip().endswith(": left")
+                                            for l in read_text(plog).splitlines()):
+                time.sleep(float(os.environ.get("FAKE_ONLINE_PEER_LEFT_DELAY_S", "0")))
+                peer_quit = True
+                break
         if end == "lost" and peer:
             pid = last_session_pid(peer)
             peer_seen = peer_seen or pid is not None
@@ -500,7 +511,7 @@ def session(ctl):
         frame += 1
         if pace:
             time.sleep(pace)
-    reason = end
+    reason = "peer left" if peer_quit else end
     if lost:
         t0 = time.time()
         event(f"hold begin frame {frame}")

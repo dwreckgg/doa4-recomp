@@ -2681,6 +2681,23 @@ def test_pair_lost(root):
     check(code == 1 and "needs --kill-joiner-at-frame" in out, f"np_pair, lost without --kill-joiner-at-frame: exit {code}\n{out}")
 
 
+def test_pair_quit(root):
+    # Task 15 G2 (gate S6q): --expect quit with --quit-joiner-at-frame: the joiner ends `left`, the host `peer left` within
+    # 1.5 s of np_pair's close request, the host relaunches offline (the joiner, ended by np_pair, is not waited for)
+    slow = ("--env-host", "FAKE_ONLINE_FRAME_MS=100", "--env-joiner", "FAKE_ONLINE_FRAME_MS=100")
+    q = ("--expect", "quit", "--quit-joiner-at-frame", "8", "--env-joiner", "FAKE_ONLINE_LEFT_AT=8")
+    code, out, runs = np_pair(root, "pq", *q, "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", *slow, quit_at=200)
+    check(code == 0 and "verdict quit" in out, f"np_pair, a graceful quit ends the host at once: exit {code}\n{out}")
+    check("host ended 'peer left'" in out, f"np_pair, quit: the host's end is named\n{out}")
+    code, out, runs = np_pair(root, "pqn", *q, *slow, quit_at=60)
+    check(code == 1 and "expected 'peer left'" in out, f"np_pair, quit: the host never learns of it: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "pql", *q, "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", "--env-host",
+                              "FAKE_ONLINE_PEER_LEFT_DELAY_S=2.5", *slow, quit_at=200)
+    check(code == 1 and "after the close request, expected <= 1500" in out, f"np_pair, quit: the host ends too late: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "pqk", "--expect", "quit", "--env-host", "FAKE_ONLINE_PEER_LEFT_WATCH=1", *slow)
+    check(code == 1 and "needs --quit-joiner-at-frame" in out, f"np_pair, --expect quit without --quit-joiner-at-frame: exit {code}\n{out}")
+
+
 def test_pair_lost_s6(root):
     # Task 15 R-S6a/b (gate S6 on p1g): the real survivor's events.txt starts with the frame-0 hold (with its own banner); the
     # disconnect is judged on the LAST hold begin at or after the kill frame; a copy np_pair ended itself is not waited for

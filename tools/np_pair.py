@@ -60,7 +60,7 @@ import np_run  # noqa: E402
 CREATE_NO_WINDOW = 0x08000000
 CREATE_SUSPENDED = 0x00000004
 SAVE_DIR = "B13EBABEBABEBABE"
-EXPECTS = ("ok", "desync", "lost", "refused-build", "refused-files", "refused-busy", "refused-session", "lobby")
+EXPECTS = ("ok", "desync", "lost", "quit", "refused-build", "refused-files", "refused-busy", "refused-session", "lobby")
 # --expect refused-session (Task 15 carry f, gate S8d): the joiner said yes but stayed a lobby (DOA4_NP_TEST_NO_RESTART=1), so
 # the host's session Hello reached a lobby; np_session.cpp ends the host's session with this reason at frame 0.
 REFUSED_SESSION_REASON = "internal: the other player's game did not start the session"
@@ -71,6 +71,7 @@ FRAME_LINE = re.compile(r"^frame (\d+)\b")
 TIMING_SLACK_MS = 50
 HOLD_TO_BANNER_MS = 1000
 HOLD_TO_END_MS = 10000
+QUIT_TO_END_MS = 1500  # Task 15 G2: the quit Leave ends the other side at once
 DESYNC_RELAUNCH_MS = 8000  # R16: the offline relaunch comes 8 s after a desync (5 s after other ends)
 OK_REASONS = ("left", "peer left")
 POLL = 0.2
@@ -317,6 +318,7 @@ class Pair:
         self.delay_host = 0
         self.ended_by_harness = set()  # copies whose session np_pair ended itself (--kill/--quit-joiner-at-frame)
         self.end_frame = None  # the ended copy's passed frame when np_pair ended it
+        self.end_time_ms = None  # unix ms of the graceful quit's close request (--quit-joiner-at-frame)
 
     # ------------------------------------------------------------------ setup
     def game_env(self, side, host):
@@ -536,6 +538,7 @@ class Pair:
                         taskkill(pid, True)
                         self.notes.append(f"joiner session pid {pid} ended hard (taskkill /F) at frame {self.end_frame}")
                     else:
+                        self.end_time_ms = int(time.time() * 1000)
                         taskkill(pid, False)  # the graceful quit: a close request, /F only after --end-grace
                         end = time.time() + a.end_grace
                         while time.time() < end and joiner.session_alive():
@@ -708,6 +711,9 @@ class Pair:
         if expect == "lost":
             self.judge_lost(lines, host, joiner, th, tj)
             return
+        if expect == "quit":
+            self.judge_quit(lines, host, joiner, th, tj)
+            return
         for s, t in ((host, th), (joiner, tj)):
             if t is None:
                 self.problems.append(f"the {s.name} copy's np_log.txt has no 'session ended at frame' line")
@@ -750,6 +756,28 @@ class Pair:
             self.problems.append(f"differ at frame {first}")
         elif code != 0:
             self.problems.append("np_compare failed: " + " | ".join(l.strip() for l in out if l.strip())[:600])
+
+    def judge_quit(self, lines, host, joiner, th, tj):
+        """Task 15 G2 (gate S6q): the joiner got a close request at --quit-joiner-at-frame; it ends `left`, the host ends `peer
+        left` QUIT_TO_END_MS or less after the close request (the quit Leave, not the 10 s limit), and relaunches offline."""
+        if self.a.quit_joiner_at_frame is None:
+            self.problems.append("--expect quit needs --quit-joiner-at-frame")
+            return
+        lines.append(f"host ended {th[1] if th else None!r}, joiner ended {tj[1] if tj else None!r}")
+        if th is None or th[1] != "peer left":
+            self.problems.append(f"the host copy ended {th[1] if th else None!r}, expected 'peer left'")
+        if tj is not None and tj[1] != "left":
+            self.problems.append(f"the joiner copy ended {tj[1]!r}, expected 'left' (a close request)")
+        ended = next((int(l.split()[0]) for l in read_lines(os.path.join(host.session_dir(), "events.txt"))
+                      if re.match(r"^\d+ session ended at frame", l)), None)
+        if self.end_time_ms is None or ended is None:
+            self.problems.append("no close request time or no session end in the host's events.txt")
+        else:
+            lines.append(f"host session ended {ended - self.end_time_ms} ms after the close request")
+            if ended - self.end_time_ms > QUIT_TO_END_MS:
+                self.problems.append(f"the host ended {ended - self.end_time_ms} ms after the close request, expected <= {QUIT_TO_END_MS}")
+        if not any(p[1] == "offline" for p in read_pids(host.ctl)):
+            self.problems.append("the host did not relaunch offline")
 
     def judge_desync(self, lines, host, joiner, th, tj):
         """Task 15 R-S7. An expected desync is ALL of: (1) both copies end `desync at frame F` with the same F (= the frame
