@@ -16,6 +16,8 @@
 
 #include <rex/perf/counter.h>
 
+#include "net/np_session.h"
+
 extern "C" {
 
 struct Doa4ProfileSnapshot {
@@ -165,6 +167,21 @@ void DiagOverlayDialog::OnDraw(ImGuiIO& io) {
                   (long long)(tex_h + tex_m));
       ImGui::Text("Pipeline hit/total : %lld / %lld", (long long)pip_h,
                   (long long)(pip_h + pip_m));
+    }
+
+    // Online session timings (the frame hook's buckets of the last frame; Task 14). Offline: no section.
+    if (doa4::np::Online() && ImGui::CollapsingHeader("Netplay", ImGuiTreeNodeFlags_DefaultOpen)) {
+      const doa4::np::NetTiming t = doa4::np::LastTiming();
+      ImGui::Text("Frame          : %d", static_cast<int>(t.frame));
+      ImGui::Text("Delay          : %d frames", t.delay);
+      ImGui::Text("Ping           : %.1f ms", t.ping_ms);
+      ImGui::Text("Frames ahead   : %.2f", t.frames_ahead);
+      ImGui::Text("Net            : %.0f us", t.net_us);
+      ImGui::Text("Wait           : %.0f us", t.wait_us);
+      ImGui::Text("Pacer          : %.0f us", t.pacer_us);
+      ImGui::Text("Hook           : %.0f us", t.hook_us);
+      ImGui::Text("Checksum       : %.0f us", t.hash_us);
+      ImGui::Text("Holds          : %u", static_cast<unsigned>(t.holds));
     }
   }
   ImGui::End();

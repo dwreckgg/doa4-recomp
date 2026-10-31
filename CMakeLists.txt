@@ -18,6 +18,9 @@ set(DEADORALIVE4_SOURCES
     src/doa4_diag_overlay.cpp
     src/doa4_config.cpp
     src/doa4_menu.cpp
+    src/doa4_online_view.cpp
+    src/doa4_online_tab.cpp
+    src/doa4_net_overlay.cpp
     src/doa4_unlocks.cpp
     src/doa4_tweaks.cpp
     src/doa4_backup.cpp

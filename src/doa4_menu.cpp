@@ -125,7 +125,35 @@ MenuDialog::~MenuDialog() {
   host_.window->RemoveInputListener(this);
 }
 
+bool MenuDialog::InSession() const { return host_.in_session && host_.in_session(); }
+
+bool MenuDialog::Locked(online_view::Control control) const {
+  return online_view::LockedInSession(control, InSession());
+}
+
+void MenuDialog::LogNetState(const online_view::In& in, const online_view::View& view) {
+  const std::string tab = online_view::TabLogLine(in, view);
+  if (tab != logged_tab_line_) {
+    logged_tab_line_ = tab;
+    REXLOG_INFO("{}", tab);
+  }
+  const std::string locks = online_view::LockedLine(InSession());
+  if (!locks.empty() && !logged_locks_) {
+    logged_locks_ = true;
+    REXLOG_INFO("{}", locks);
+  }
+}
+
+void MenuDialog::PollNetState() {
+  if (!host_.online.state) return;
+  const online_view::In online_in = host_.online.state();
+  LogNetState(online_in, online_view::Describe(online_in));
+}
+
 void MenuDialog::OnDraw(ImGuiIO& io) {
+  // The Online tab's state and the session locks are logged whichever tab is shown (the log is the test hook:
+  // the session's shots never hold the menu).
+  PollNetState();
   ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                           ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f), ImGuiCond_Appearing);
@@ -151,6 +179,10 @@ void MenuDialog::OnDraw(ImGuiIO& io) {
       }
       if (ImGui::BeginTabItem("Extras")) {
         DrawExtrasTab();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Online")) {
+        DrawOnlineTab();
         ImGui::EndTabItem();
       }
       if (ImGui::BeginTabItem("Game")) {
@@ -203,8 +235,13 @@ void MenuDialog::DrawVideoTab() {
   if (saved_scale != host_.running_scale) {
     ImGui::TextColored(kNoteColor, "Applies after a restart (running at x%d).",
                        host_.running_scale);
+    ImGui::BeginDisabled(Locked(online_view::Control::kVideoRestart));
     if (ImGui::Button("Restart now")) {
-      Restart();
+      Restart(online_view::Control::kVideoRestart);
+    }
+    ImGui::EndDisabled();
+    if (Locked(online_view::Control::kVideoRestart)) {
+      ImGui::TextColored(kNoteColor, "%s", online_view::kLockedText);
     }
     if (const char* warning = UnsavedUnlocksWarning(*host_.extras)) {
       ImGui::TextColored(kErrorColor, "%s", warning);
@@ -268,8 +305,13 @@ void MenuDialog::DrawAudioTab() {
   if (speakers::ChoiceIndex(saved) != speakers::ChoiceIndex(host_.running_speakers)) {
     ImGui::TextColored(kNoteColor, "Applies after a restart (running on %s).",
                        speakers::kChoices[speakers::ChoiceIndex(host_.running_speakers)].label);
+    ImGui::BeginDisabled(Locked(online_view::Control::kAudioRestart));
     if (ImGui::Button("Restart now")) {
-      Restart();
+      Restart(online_view::Control::kAudioRestart);
+    }
+    ImGui::EndDisabled();
+    if (Locked(online_view::Control::kAudioRestart)) {
+      ImGui::TextColored(kNoteColor, "%s", online_view::kLockedText);
     }
     if (const char* warning = UnsavedUnlocksWarning(*host_.extras)) {
       ImGui::TextColored(kErrorColor, "%s", warning);
@@ -403,6 +445,9 @@ void MenuDialog::DrawKeyboardSection() {
 
 void MenuDialog::DrawExtrasTab() {
   ImGui::SeparatorText("Unlocks");
+  // In an online session nothing here may touch the player's real save or the guest's tables (spec 6).
+  const bool extras_locked = Locked(online_view::Control::kExtras);
+  if (extras_locked) ImGui::TextColored(kNoteColor, "%s", online_view::kLockedText);
   const std::optional<uint32_t> profile =
       host_.guest ? unlocks::FindProfile(*host_.guest) : std::nullopt;
   if (!profile) {
@@ -410,7 +455,7 @@ void MenuDialog::DrawExtrasTab() {
   }
   for (const UnlockRow& row : kUnlockRows) {
     const bool done = profile && unlocks::IsUnlocked(*host_.guest, *profile, row.what);
-    ImGui::BeginDisabled(!profile || done);
+    ImGui::BeginDisabled(!profile || done || extras_locked);
     if (ImGui::Button(row.label, ImVec2(220.0f, 0.0f)) &&
         !(host_.refuse && host_.refuse(std::string("unlock ") + row.label, &status_))) {
       std::string error;
@@ -465,12 +510,33 @@ void MenuDialog::DrawExtrasTab() {
   for (size_t i = 0; i < tweaks::AllTweaks().size(); ++i) {
     const tweaks::Tweak& tweak = tweaks::AllTweaks()[i];
     bool on = rex::cvar::Query<bool>(tweak.cvar);
-    ImGui::BeginDisabled(!host_.guest);  // a tweak is applied to guest memory
+    ImGui::BeginDisabled(!host_.guest || extras_locked);  // a tweak is applied to guest memory
     if (ImGui::Checkbox(tweak.label, &on)) {
       SetTweak(i, on);
     }
     ImGui::EndDisabled();
   }
+}
+
+void MenuDialog::DrawOnlineTab() {
+  online_view::In in;
+  online_view::View view;
+  if (host_.online.state) {
+    in = host_.online.state();
+    view = online_view::Describe(in);
+  }
+  online_tab_.Draw(
+      host_.online, in, view,
+      [this](std::string_view name, std::string_view value, bool quote) { return SaveThenSet(name, value, quote); },
+      [this] {
+        // After this frame, with the menu closed first (Explorer in front stalls the UI-thread repaint).
+        host_.defer([close = host_.close_menu, dir = host_.user_data / "netplay" / "sessions"] {
+          if (close) close();
+          std::error_code ec;
+          std::filesystem::create_directories(dir, ec);
+          photo::OpenInExplorer(dir);
+        });
+      });
 }
 
 void MenuDialog::DrawGameTab() {
@@ -480,8 +546,11 @@ void MenuDialog::DrawGameTab() {
   ImGui::SeparatorText("Game files");
   ImGui::TextWrapped("%s", Utf8(tab.now).c_str());
   if (!tab.note.empty()) ImGui::TextWrapped("%s", tab.note.c_str());
-  ImGui::BeginDisabled(!tab.can_change || !host_.change_game_files);
-  if (ImGui::Button("Change...")) {
+  const bool change_locked = Locked(online_view::Control::kGameChange);
+  ImGui::BeginDisabled(!tab.can_change || !host_.change_game_files || change_locked);
+  if (ImGui::Button("Change...") &&
+      !online_view::Refuse(online_view::Control::kGameChange, InSession(), "change game files", &status_,
+                           [](const std::string& line) { REXLOG_INFO("{}", line); })) {
     // After this frame, with the menu closed first (the setup screen takes
     // its place; the menu must not be destroyed while it is drawing).
     host_.defer([close = host_.close_menu, change = host_.change_game_files] {
@@ -490,6 +559,10 @@ void MenuDialog::DrawGameTab() {
     });
   }
   ImGui::EndDisabled();
+  if (change_locked) {
+    ImGui::SameLine();
+    ImGui::TextColored(kNoteColor, "%s", online_view::kLockedText);
+  }
   ImGui::SameLine();
   if (ImGui::Button("Open folder")) {
     host_.defer([close = host_.close_menu, dir = tab.now] {
@@ -676,7 +749,11 @@ void MenuDialog::OnMouseDown(rex::ui::MouseEvent& e) {
   AssignKey(listen_row_, name);
 }
 
-void MenuDialog::Restart() {
+void MenuDialog::Restart(online_view::Control control) {
+  if (online_view::Refuse(control, InSession(), "restart", &status_,
+                          [](const std::string& line) { REXLOG_INFO("{}", line); })) {
+    return;
+  }
   wchar_t exe[MAX_PATH];
   DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
   if (length == 0 || length == MAX_PATH) {
