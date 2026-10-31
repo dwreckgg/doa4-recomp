@@ -113,6 +113,7 @@ bool ApplyGuestText(const std::string& text, std::string* why, bool* touched);
 // hook. No-op otherwise.
 void PrepareReplayRules();
 bool Online();
+bool BannerWaiting();                 // a hold has lasted >= 1 s and is still on (any thread; the overlay's banner)
 int32_t SessionFrame();               // the last frame hook's frame (-1 before the first)
 live::FrameResult LastResult();
 void RequestLeave();                  // UI: this side leaves at the next frame

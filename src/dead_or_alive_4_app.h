@@ -48,6 +48,8 @@
 #include "doa4_gamefiles.h"
 #include "doa4_graphics.h"
 #include "doa4_lowmem.h"
+#include "doa4_net_overlay.h"
+#include "doa4_online_view.h"
 #include "doa4_photo_hook.h"
 #include "doa4_photo_notice.h"
 #include "doa4_photo_service.h"
@@ -494,7 +496,10 @@ class DeadOrAlive4App : public rex::ReXApp {
         app_context().QuitFromUIThread();
       });
     };
-    host.overlay_changed = [] {};  // the Online tab and the banner arrive with Task 14
+    // the hold banner and the end banner (Task 14): posted to the UI thread, which creates / destroys the overlay
+    host.overlay_changed = [this] {
+      app_context().CallInUIThreadDeferred([this] { UpdateNetOverlay(); });
+    };
     host.send_leave = [this](int32_t frame, doa4::np::wire::LeaveReason reason) {
       if (lobby_) lobby_->SendLeave(frame, reason);
     };
@@ -670,7 +675,90 @@ class DeadOrAlive4App : public rex::ReXApp {
       REXLOG_WARN("[doa4][NET] the lobby could not start: {}", error);
     } else {
       REXLOG_INFO("[doa4][NET] lobby started on port {}", lobby_->status().port);
+      // the player's delay preference (with a test dir the harness's DOA4_NP_DELAY, read by the lobby itself, stays in charge)
+      if (test_dir_.empty()) {
+        lobby_->SetDelay(rex::cvar::Query<bool>("netplay_delay_auto"), rex::cvar::Query<int32_t>("netplay_delay"));
+      }
     }
+    UpdateNetOverlay();
+  }
+
+  // ---- the Online tab, the banner and the F9 box (Task 14) ----
+  // This process runs an online session: the one predicate behind the menu locks, their refusals and the tab.
+  bool InOnlineSession() const { return session_.has_value() && !launch_refused_; }
+
+  doa4::online_view::In OnlineViewIn() {
+    doa4::online_view::In in;
+    if (lobby_) {
+      in.lobby = lobby_->status();
+      in.lobby_open = true;
+    }
+    in.in_session = InOnlineSession();
+    if (in.in_session) {
+      const doa4::np::NetTiming t = doa4::np::LastTiming();
+      in.frame = t.frame;
+      in.delay = t.delay;
+      in.ping_ms = t.ping_ms;
+      in.frames_ahead = t.frames_ahead;
+    }
+    in.release = DOA4_RELEASE_TAG;
+    if (net_build_id_ == 0) net_build_id_ = doa4::np::BuildIdValue();  // hashed once (UI thread)
+    in.build = net_build_id_;
+    in.show_stats = rex::cvar::Query<bool>("netplay_show_stats");
+    return in;
+  }
+
+  doa4::NetOverlay::Content NetOverlayContent() {
+    namespace ov = doa4::online_view;
+    const ov::In in = OnlineViewIn();
+    ov::Ending ending = ov::Ending::kNone;
+    if (in.in_session) {
+      switch (doa4::np::LastResult().end) {
+        case doa4::np::live::End::kLeft: ending = ov::Ending::kLeft; break;
+        case doa4::np::live::End::kPeerLeft: ending = ov::Ending::kPeerLeft; break;
+        case doa4::np::live::End::kLost: ending = ov::Ending::kLost; break;
+        case doa4::np::live::End::kDesync: ending = ov::Ending::kDesync; break;
+        case doa4::np::live::End::kFrame0Timeout: ending = ov::Ending::kFrame0Timeout; break;
+        case doa4::np::live::End::kInternal: ending = ov::Ending::kInternal; break;
+        case doa4::np::live::End::kNone: break;
+      }
+    }
+    doa4::NetOverlay::Content c;
+    c.banner = ov::BannerText(in.in_session && doa4::np::BannerWaiting(), ending);
+    c.stats = ov::Describe(in).stats_lines;
+    return c;
+  }
+
+  // The overlay exists only while the banner is up or the F9 box can show (it is on and there is a lobby or a session):
+  // while any ImGui dialog exists the presenter paints from the UI thread. UI thread only.
+  void UpdateNetOverlay() {
+    if (net_closing_.load(std::memory_order_acquire) || !drawer_) return;
+    const doa4::online_view::In in = OnlineViewIn();
+    bool want = in.show_stats && (in.in_session || in.lobby_open);
+    if (!want && in.in_session) {
+      want = !NetOverlayContent().banner.empty();
+    }
+    // the banner text is logged here, not in the overlay's OnDraw: a minimized window never paints (the harness's games)
+    const std::string banner = in.in_session ? NetOverlayContent().banner : std::string();
+    if (banner != net_logged_banner_) {
+      net_logged_banner_ = banner;
+      if (!banner.empty()) REXLOG_INFO("[doa4][NET] overlay: banner \"{}\"", banner);
+    }
+    if (want && !net_overlay_) {
+      net_overlay_ = std::make_unique<doa4::NetOverlay>(drawer_, [this] { return NetOverlayContent(); });
+      REXLOG_INFO("[doa4][NET] overlay: shown");
+    } else if (!want && net_overlay_) {
+      net_overlay_.reset();
+      REXLOG_INFO("[doa4][NET] overlay: hidden");
+    }
+  }
+
+  // F9: the ping and input-delay box (in memory only; the Online tab checkbox saves the setting).
+  void ToggleNetStats() {
+    const bool now = !rex::cvar::Query<bool>("netplay_show_stats");
+    rex::cvar::SetFlagByName("netplay_show_stats", now ? "true" : "false");
+    REXLOG_INFO("[doa4][NET] F9: ping and delay box {}", now ? "on" : "off");
+    UpdateNetOverlay();
   }
   void OnPreLaunchModule() override {
     if (launch_refused_) {  // fix round I2: the guest never runs on the wrong user data (the module is not launched)
@@ -704,6 +792,10 @@ class DeadOrAlive4App : public rex::ReXApp {
     }
     rex::ui::UnregisterBind("bind_doa4_menu");
     rex::ui::UnregisterBind("bind_doa4_photo");
+    rex::ui::UnregisterBind("bind_doa4_netstats");
+    net_closing_.store(true, std::memory_order_release);
+    menu_tick_stop_.store(true, std::memory_order_release);
+    if (menu_tick_.joinable()) menu_tick_.join();
     photo_closing_.store(true, std::memory_order_release);
     doa4::photo::InstallSnapshotWatcher(nullptr);  // the watcher itself lives until exit
     photo_stop_.store(true, std::memory_order_release);
@@ -719,6 +811,7 @@ class DeadOrAlive4App : public rex::ReXApp {
       CloseSetup();
     }
     photo_notice_.reset();  // before the base app destroys the ImGui drawer
+    net_overlay_.reset();   // likewise
     menu_.reset();  // before the base app destroys the ImGui drawer
     rex::ui::UnregisterBind("bind_doa4_diag");
     diag_overlay_.reset();  // before the base app destroys the ImGui drawer
@@ -742,6 +835,8 @@ class DeadOrAlive4App : public rex::ReXApp {
                           [this, drawer] { ToggleDiagOverlay(drawer); });
     const char* env = std::getenv("DOA4_DIAG_OVERLAY");
     if (env && env[0] == '1') ToggleDiagOverlay(drawer);
+    rex::ui::RegisterBind("bind_doa4_netstats", "F9", "Show the online ping and input delay",
+                          [this] { ToggleNetStats(); });
 
     // Escape opens the menu, so it cannot also be the keyboard's Start (the
     // SDK default for keyboard-as-controller); applies whether or not
@@ -763,7 +858,20 @@ class DeadOrAlive4App : public rex::ReXApp {
     rex::ui::RegisterBind("bind_doa4_menu", "Escape", "Toggle DOA4 menu",
                           [this] { ToggleMenu(); });
     const char* menu_env = std::getenv("DOA4_MENU_OPEN");  // for tests
-    if (menu_env && menu_env[0] == '1') ToggleMenu();
+    if (menu_env && menu_env[0] == '1') {
+      ToggleMenu();
+      // test hook: the tab and lock log lines come from a timer (a minimized window never paints the menu)
+      menu_tick_ = std::thread([this] {
+        using namespace std::chrono_literals;
+        while (!menu_tick_stop_.load(std::memory_order_acquire)) {
+          app_context().CallInUIThreadDeferred([this] {
+            if (menu_) menu_->PollNetState();
+          });
+          std::this_thread::sleep_for(250ms);
+        }
+      });
+    }
+    UpdateNetOverlay();  // a session process whose netplay_show_stats is on shows the box from the start
     StartGfxTest();
     SetUpPhotos();
   }
@@ -979,9 +1087,34 @@ class DeadOrAlive4App : public rex::ReXApp {
     host.backup_root = BackupFolder();
     host.extras = &extras_;
     host.refuse = [this](std::string_view action, std::string* status) {
-      return doa4::RefuseInSession(session_.has_value(), action, status,
-                                   [](const std::string& line) { REXLOG_INFO("{}", line); });
+      // the same predicate as the Extras controls' disabled state (online_view::LockedInSession)
+      return doa4::online_view::Refuse(doa4::online_view::Control::kExtras, InOnlineSession(), action, status,
+                                       [](const std::string& line) { REXLOG_INFO("{}", line); });
     };
+    host.in_session = [this] { return InOnlineSession(); };
+    host.online.state = [this] { return OnlineViewIn(); };
+    host.online.host = [this] {
+      EnsureLobby();
+      if (lobby_) lobby_->Host(0);
+    };
+    host.online.join = [this](const std::string& code) {
+      EnsureLobby();
+      if (lobby_) lobby_->Join(code);
+    };
+    host.online.reach_out = [this](const std::string& code) {
+      if (lobby_) lobby_->ReachOut(code);
+    };
+    host.online.disconnect = [this] {
+      if (lobby_) lobby_->Disconnect();
+    };
+    host.online.start_session = [this] {
+      if (lobby_) lobby_->StartSession();
+    };
+    host.online.leave_session = [] { doa4::np::RequestLeave(); };
+    host.online.set_delay = [this](bool automatic, int frames) {
+      if (lobby_) lobby_->SetDelay(automatic, frames);
+    };
+    host.online.shown_changed = [this] { UpdateNetOverlay(); };
     host.game_files = game_files_;
     host.game_files_from_command_line = game_files_from_command_line_;
     host.user_data = UserData();
@@ -1066,6 +1199,12 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::filesystem::path user_data_;  // the resolved save folder (WithUserData)
   bool game_files_from_command_line_ = false;
   std::unique_ptr<doa4::DiagOverlayDialog> diag_overlay_;
+  std::unique_ptr<doa4::NetOverlay> net_overlay_;  // the banner / F9 box; exists only while one is shown
+  std::atomic<bool> net_closing_{false};           // set at shutdown: no new overlay
+  std::string net_logged_banner_;                  // the last banner text logged (UI thread)
+  std::thread menu_tick_;                          // DOA4_MENU_OPEN=1 only: polls the menu's net state
+  std::atomic<bool> menu_tick_stop_{false};
+  uint64_t net_build_id_ = 0;                      // np::BuildIdValue(), hashed on first use (UI thread)
   std::unique_ptr<doa4::MenuDialog> menu_;
   std::atomic<bool> menu_open_{false};
   rex::ui::ImGuiDrawer* drawer_ = nullptr;

@@ -1,7 +1,7 @@
 // In-game menu, opened and closed with Escape (bind_doa4_menu).
 //
 // Tabs: Video (display mode, render scale), Audio (speakers), Controls (per-slot controller
-// remap, keyboard binds), Photo, Extras (unlocks, game tweaks) and Game (where
+// remap, keyboard binds), Photo, Extras (unlocks, game tweaks), Online (hosting and joining a friend) and Game (where
 // the game files are). Every setting is
 // applied to its cvar and saved to dead_or_alive_4.toml with doa4::SaveTomlKey. The game keeps running while
 // the menu is open; its input is blocked (DeadOrAlive4App::OnBlocksGuestInput),
@@ -24,6 +24,8 @@
 
 #include "doa4_extras.h"
 #include "doa4_guest.h"
+#include "doa4_online_tab.h"
+#include "doa4_online_view.h"
 #include "doa4_photo_service.h"
 #include "doa4_tweaks.h"
 
@@ -76,6 +78,11 @@ struct MenuHost {
   // Netplay (Task 12 fix round I3): asked before an Extras action (an unlock, a tweak toggle); true = refused (in an
   // online session: *status says why, a log line is written). Empty: never refused.
   std::function<bool(std::string_view action, std::string* status)> refuse;
+  // Netplay (Task 14): true in a process that runs an online session. Four controls read their disabled state from
+  // online_view::LockedInSession with it (Extras, the Video and Audio "Restart now", the Game tab's "Change..."), and
+  // the refusal behind them reads the same answer. Empty: never in a session.
+  std::function<bool()> in_session;
+  OnlineHost online;  // the Online tab's callbacks; empty `state` = the tab says it is unavailable
   // Game tab: the folder the game started from, whether --game_data_root
   // chose it, and the action that closes the menu and opens the setup screen
   // to choose another (used from the next start).
@@ -94,6 +101,10 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   MenuDialog(rex::ui::ImGuiDrawer* drawer, MenuHost host);
   ~MenuDialog() override;
 
+  // Logs the Online tab's state and the session locks if they changed (the same call OnDraw makes every frame). The
+  // app calls it from a timer when DOA4_MENU_OPEN=1: a minimized window never paints, so OnDraw alone would not log.
+  void PollNetState();
+
  protected:
   void OnDraw(ImGuiIO& io) override;
   void OnKeyDown(rex::ui::KeyEvent& e) override;
@@ -109,7 +120,12 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void DrawKeyboardSection();
   void DrawExtrasTab();
   void DrawPhotoTab();
+  void DrawOnlineTab();
   void DrawGameTab();
+  bool InSession() const;
+  bool Locked(online_view::Control control) const;  // LockedInSession(control, InSession())
+  // Logs the Online tab's state and the locks once per change (every frame the menu draws, whichever tab is shown).
+  void LogNetState(const online_view::In& in, const online_view::View& view);
   // Saves the tweak's cvar; on success sets it and, for a live tweak, writes
   // or reverts its bytes. Failures go to status_.
   void SetTweak(size_t tweak, bool on);
@@ -120,7 +136,8 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   void PollPadListen(const rex::input::X_INPUT_GAMEPAD& pad);
   void AssignPad(size_t target, size_t source);
   void AssignKey(size_t row, const std::string& key_name);
-  void Restart();
+  // `control` is the Restart now button's own (kVideoRestart / kAudioRestart): refused in an online session.
+  void Restart(online_view::Control control);
   // Sets the cvar and saves it; `quote` writes the value as a TOML string.
   // Failures go to status_.
   void SetAndSave(std::string_view name, std::string_view value, bool quote);
@@ -133,6 +150,9 @@ class MenuDialog : public rex::ui::ImGuiDialog, public rex::ui::WindowInputListe
   bool pad_connected_ = false;  // last non-busy GetRawState answer for slot_
   double next_save_poll_ = 0.0;  // ImGui time of the next "has the game saved?" check
   std::string status_;     // last error, shown in red
+  OnlineTab online_tab_;
+  std::string logged_tab_line_;  // the last "[doa4][NET] tab: ..." line written
+  bool logged_locks_ = false;    // the "menu: locked in session" line was written
 };
 
 }  // namespace doa4

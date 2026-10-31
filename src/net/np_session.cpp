@@ -192,7 +192,7 @@ struct State {
   std::mutex events_mu;
   double unix_offset_ms = 0;  // unix ms = Now() / 1000 + offset
   uint64_t hold_begin_us = 0;
-  bool banner_shown = false;
+  std::atomic<bool> banner_shown{false};  // read by the UI thread (BannerWaiting)
   HANDLE timer = nullptr;      // a high-resolution waitable timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION), game thread
   std::mutex result_mu;
   live::FrameResult last_result;
@@ -749,8 +749,8 @@ void OnLiveEvent(live::Event e, int32_t frame, uint64_t at_us) {
     case live::Event::kHoldEnd: {
       const uint64_t n = (at_us - s.hold_begin_us) / 1000;
       Event(s, UnixFromUs(s, at_us), "hold end frame " + std::to_string(frame) + " after " + std::to_string(n) + " ms");
-      if (s.banner_shown && s.host.overlay_changed) s.host.overlay_changed();
-      s.banner_shown = false;
+      // cleared first: the overlay update is posted to the UI thread and must see the banner gone
+      if (s.banner_shown.exchange(false) && s.host.overlay_changed) s.host.overlay_changed();
       break;
     }
     case live::Event::kEnd: break;  // written by EndOnline with the reason
@@ -1450,6 +1450,9 @@ void PrepareReplayRules() {
 }
 
 bool Online() { return S().mode == Mode::kOnline; }
+
+// The hold banner is up (a hold has lasted >= 1 s and not ended yet); UI thread.
+bool BannerWaiting() { return S().banner_shown.load(); }
 
 int32_t SessionFrame() { return S().session_frame.load(); }
 

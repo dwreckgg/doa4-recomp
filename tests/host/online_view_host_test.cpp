@@ -1,0 +1,337 @@
+// Host test for src/doa4_online_view (Task 14): what the Online tab shows and enables, the banner words, the F9 lines
+// and the four session locks. Built and run by run_online_view_test.bat. No files, no sockets.
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "../../src/doa4_online_view.h"
+
+using namespace doa4::online_view;
+using doa4::np::online::State;
+using doa4::np::online::Status;
+
+static int g_checks = 0;
+static int g_failures = 0;
+#define CHECK(cond)                                                    \
+  do {                                                                 \
+    ++g_checks;                                                        \
+    if (!(cond)) {                                                     \
+      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);      \
+      std::fflush(stdout);                                             \
+      ++g_failures;                                                    \
+    }                                                                  \
+  } while (0)
+#define CHECK_EQ(a, b)                                                                                      \
+  do {                                                                                                      \
+    ++g_checks;                                                                                             \
+    const std::string va_ = (a), vb_ = (b);                                                                 \
+    if (va_ != vb_) {                                                                                       \
+      std::printf("FAIL %s:%d: %s\n   got:  [%s]\n   want: [%s]\n", __FILE__, __LINE__, #a, va_.c_str(),   \
+                  vb_.c_str());                                                                             \
+      std::fflush(stdout);                                                                                  \
+      ++g_failures;                                                                                         \
+    }                                                                                                       \
+  } while (0)
+
+static In Open(State state, bool host) {
+  In in;
+  in.lobby_open = true;
+  in.lobby.state = state;
+  in.lobby.is_host = host;
+  in.release = "netplay-v1.2.3";
+  in.build = 0x0123456789abcdefull;
+  return in;
+}
+
+static bool Has(const std::string& hay, const std::string& needle) { return hay.find(needle) != std::string::npos; }
+
+static void TestOffline() {
+  In in;  // the lobby is not open: nothing exists yet
+  const View v = Describe(in);
+  CHECK(v.show_join && v.show_host);
+  CHECK(!v.show_leave && !v.show_disconnect && !v.show_start && !v.show_code && !v.show_reach_out);
+  CHECK(!v.start_enabled);
+  CHECK(v.delay_enabled);
+  CHECK_EQ(v.status_line, "Not connected");
+  CHECK(v.stats_lines.empty());
+  CHECK_EQ(v.diagnostics_line, "");
+  CHECK_EQ(v.display_note, "");
+  // an open lobby that is Offline looks the same
+  View o = Describe(Open(State::kOffline, false));
+  CHECK(o.show_join && o.show_host && !o.show_disconnect && o.stats_lines.empty() && o.diagnostics_line.empty());
+  // Offline with show_stats on: still no stats lines, and no dropped counter even when the lobby counted some
+  In s = Open(State::kOffline, false);
+  s.show_stats = true;
+  s.lobby.dropped = 9;
+  CHECK(Describe(s).stats_lines.empty());
+  CHECK_EQ(Describe(s).diagnostics_line, "");
+}
+
+static void TestHosting() {
+  In in = Open(State::kHosting, true);
+  in.lobby.my_code = "AbCdEfG";
+  in.lobby.code_note = "Public address found";
+  in.show_stats = true;
+  const View v = Describe(in);
+  CHECK(v.show_code && v.show_reach_out && v.show_disconnect);
+  CHECK(!v.show_join && !v.show_host && !v.show_start && !v.show_leave);
+  CHECK_EQ(v.code_note, "Public address found");
+  CHECK_EQ(v.status_line, "Waiting for the other player to join");
+  CHECK(v.stats_lines.empty());  // not connected yet
+  CHECK_EQ(v.diagnostics_line, "Dropped packets: 0");
+  CHECK(v.delay_enabled);
+  // a hosting lobby with no code yet (the STUN answer is pending) shows no code
+  In nocode = in;
+  nocode.lobby.my_code.clear();
+  CHECK(!Describe(nocode).show_code);
+}
+
+static void TestConnectedHost() {
+  In in = Open(State::kConnected, true);
+  in.lobby.my_code = "AbCdEfG";
+  in.lobby.ping_ms = 42;
+  in.lobby.delay = 2;
+  in.lobby.ping_samples = 3;
+  in.lobby.can_start = false;  // the lobby's R14: >= 4 ping samples
+  View v = Describe(in);
+  CHECK(v.show_start && !v.start_enabled);  // 3 samples: shown, disabled
+  CHECK(v.show_disconnect && !v.show_leave && !v.show_join && !v.show_host);
+  CHECK(!v.show_reach_out);
+  CHECK(v.delay_enabled);
+  CHECK(Has(v.status_line, "42 ms"));
+  in.lobby.ping_samples = 4;
+  in.lobby.can_start = true;
+  v = Describe(in);
+  CHECK(v.show_start && v.start_enabled);  // 4 samples: enabled
+  // the hint comes from the lobby when it is the host's
+  in.lobby.hint = "Press Start online session (both games restart).";
+  CHECK_EQ(Describe(in).hint, "Press Start online session (both games restart).");
+  // Connected with no ping sample yet
+  In none = Open(State::kConnected, true);
+  CHECK(Has(Describe(none).status_line, "measuring"));
+}
+
+static void TestConnectedJoiner() {
+  In in = Open(State::kConnected, false);
+  in.lobby.ping_ms = 42;
+  in.lobby.ping_samples = 9;
+  in.lobby.can_start = false;
+  in.lobby.hint = "something else the lobby said";
+  const View v = Describe(in);
+  CHECK(!v.show_start);
+  CHECK(!v.show_code);  // a joiner has no code to hand out, even when its lobby holds one
+  In coded = in;
+  coded.lobby.my_code = "AbCdEfG";
+  CHECK(!Describe(coded).show_code);
+  CHECK(v.show_disconnect && !v.show_leave);
+  CHECK_EQ(v.hint, "The host starts the online session; both games then restart.");
+  CHECK_EQ(v.display_note, "The host's display settings are used during the session");
+  // a joiner that is still Connecting has no hint of ours
+  CHECK(Describe(Open(State::kConnecting, false)).hint !=
+        "The host starts the online session; both games then restart.");
+  CHECK_EQ(Describe(Open(State::kConnecting, false)).status_line, "Connecting...");
+  CHECK(Describe(Open(State::kConnecting, false)).show_disconnect);
+}
+
+static void TestStartingAndRestarting() {
+  const View st = Describe(Open(State::kStarting, true));
+  CHECK_EQ(st.status_line, "Starting the online session...");
+  CHECK(!st.delay_enabled);  // locked while starting
+  CHECK(st.show_disconnect && !st.show_start);
+  const View re = Describe(Open(State::kRestarting, false));
+  CHECK_EQ(re.status_line, "Restarting into the online session...");
+  CHECK(!re.delay_enabled && !re.show_disconnect && !re.show_leave);
+}
+
+static void TestInSession() {
+  In in = Open(State::kInSession, true);
+  in.in_session = true;
+  in.frame = 1200;
+  in.delay = 3;
+  in.ping_ms = 42.4f;
+  in.show_stats = true;
+  in.lobby.dropped = 3;
+  View v = Describe(in);
+  CHECK(v.show_leave && !v.show_disconnect && !v.show_join && !v.show_host && !v.show_start);
+  CHECK(!v.delay_enabled);
+  CHECK(Has(v.status_line, "host") && !Has(v.status_line, "joiner"));
+  CHECK(Has(v.status_line, "3 frames") && Has(v.status_line, "42 ms"));
+  CHECK_EQ(v.diagnostics_line, "Dropped packets: 3");
+  CHECK_EQ(v.display_note, "The host's display settings are used during the session");
+  // the process-level flag wins over a lobby that has not reached kInSession yet (the peer's first Hello is pending)
+  In early = in;
+  early.lobby.state = State::kConnecting;
+  early.lobby.is_host = false;
+  const View e = Describe(early);
+  CHECK(e.show_leave && !e.show_disconnect && !e.delay_enabled);
+  CHECK(Has(e.status_line, "joiner"));
+  // the session's ping and delay come from the session, not from the lobby's own fields
+  in.lobby.ping_ms = 99;
+  in.lobby.delay = 7;
+  v = Describe(in);
+  CHECK(Has(v.status_line, "3 frames") && Has(v.status_line, "42 ms") && !Has(v.status_line, "99"));
+  CHECK(v.stats_lines.size() == 2);
+  if (v.stats_lines.size() == 2) {
+    CHECK_EQ(v.stats_lines[0], "Ping 42 ms");
+    CHECK_EQ(v.stats_lines[1], "Delay 3 frames (50 ms)");
+  }
+}
+
+static void TestStats() {
+  In in = Open(State::kConnected, true);
+  in.show_stats = true;
+  in.lobby.ping_ms = 42;
+  in.lobby.delay = 2;
+  View v = Describe(in);
+  CHECK(v.stats_lines.size() == 2);
+  if (v.stats_lines.size() == 2) {
+    CHECK_EQ(v.stats_lines[0], "Ping 42 ms");
+    CHECK_EQ(v.stats_lines[1], "Delay 2 frames (33 ms)");
+  }
+  in.lobby.delay = 1;
+  v = Describe(in);
+  CHECK(v.stats_lines.size() == 2);
+  if (v.stats_lines.size() == 2) CHECK_EQ(v.stats_lines[1], "Delay 1 frame (17 ms)");
+  in.lobby.delay = 8;
+  v = Describe(in);
+  CHECK(v.stats_lines.size() == 2);
+  if (v.stats_lines.size() == 2) CHECK_EQ(v.stats_lines[1], "Delay 8 frames (133 ms)");
+  // the box follows the F9 setting
+  in.show_stats = false;
+  CHECK(Describe(in).stats_lines.empty());
+  // rounding of the ping: 41.6 -> 42, 41.4 -> 41
+  in.show_stats = true;
+  in.lobby.ping_ms = 41.6f;
+  v = Describe(in);
+  CHECK(v.stats_lines.size() == 2);
+  if (!v.stats_lines.empty()) CHECK_EQ(v.stats_lines[0], "Ping 42 ms");
+  in.lobby.ping_ms = 41.4f;
+  v = Describe(in);
+  if (!v.stats_lines.empty()) CHECK_EQ(v.stats_lines[0], "Ping 41 ms");
+  // the free function: not connected -> nothing
+  CHECK(StatsLines(false, 42, 2).empty());
+  CHECK(StatsLines(true, 42, 2).size() == 2);
+}
+
+static void TestDiagnostics() {
+  In in = Open(State::kConnected, true);
+  in.lobby.dropped = 3;
+  CHECK_EQ(Describe(in).diagnostics_line, "Dropped packets: 3");
+  in.lobby.dropped = 0;
+  CHECK_EQ(Describe(in).diagnostics_line, "Dropped packets: 0");
+  CHECK_EQ(Describe(Open(State::kOffline, false)).diagnostics_line, "");
+}
+
+static void TestVersionLine() {
+  In in = Open(State::kOffline, false);
+  View v = Describe(in);
+  CHECK_EQ(v.version_line, "netplay-v1.2.3 (build 0123456789abcdef)");
+  in.release = "dev";
+  v = Describe(in);
+  CHECK(Has(v.version_line, "dev, self-built"));
+  CHECK(Has(v.version_line, "only the same build can join"));
+  CHECK(Has(v.version_line, "0123456789abcdef"));
+  // a release tag whose build number is 0 is a dev build too
+  in.release = "netplay-v1.2.0";
+  CHECK(Has(Describe(in).version_line, "self-built"));
+  // an unreadable build id
+  in.release = "netplay-v1.2.3";
+  in.build = 0;
+  CHECK(Has(Describe(in).version_line, "build unreadable"));
+  CHECK(!Has(Describe(in).version_line, "0000000000000000"));
+}
+
+static void TestEventLine() {
+  In in = Open(State::kOffline, false);
+  in.lobby.event = "Your game and the host's are not the same build.";
+  in.lobby.refusal = "build";
+  CHECK_EQ(Describe(in).event_line, "Your game and the host's are not the same build.");
+  // the session process: the lobby set the flag; the flag alone still shows the text
+  In r = Open(State::kOffline, false);
+  r.in_session = true;
+  r.lobby.session_refused = true;
+  CHECK_EQ(Describe(r).event_line, "The other player's game did not start the session.");
+  r.lobby.event = "The other player's game did not start the session.";
+  CHECK_EQ(Describe(r).event_line, "The other player's game did not start the session.");
+  // no event, no flag: nothing
+  CHECK_EQ(Describe(Open(State::kOffline, false)).event_line, "");
+}
+
+static void TestLocks() {
+  const Control all[] = {Control::kExtras, Control::kVideoRestart, Control::kAudioRestart, Control::kGameChange};
+  for (const Control c : all) {
+    CHECK(LockedInSession(c, true));
+    CHECK(!LockedInSession(c, false));
+    // the refusal reads the same answer as the disabled state
+    for (const bool s : {false, true}) {
+      std::string status = "unchanged";
+      std::vector<std::string> log;
+      const bool refused = Refuse(c, s, "tweak x", &status, [&](const std::string& l) { log.push_back(l); });
+      CHECK(refused == LockedInSession(c, s));
+      if (s) {
+        CHECK_EQ(status, "Not during an online session");
+        CHECK(log.size() == 1);
+        if (log.size() == 1) CHECK_EQ(log[0], "[doa4][NET] menu: refused tweak x in session");
+      } else {
+        CHECK_EQ(status, "unchanged");  // nothing written when not refused
+        CHECK(log.empty());
+      }
+    }
+  }
+  CHECK(Refuse(Control::kExtras, true, "a", nullptr, {}));  // null status and empty log are allowed
+  CHECK_EQ(LockedLine(true),
+           "[doa4][NET] menu: locked in session: extras=1 video_restart=1 audio_restart=1 game_change=1");
+  CHECK_EQ(LockedLine(false), "");
+}
+
+static void TestBanner() {
+  CHECK_EQ(BannerText(false, Ending::kNone), "");
+  CHECK_EQ(BannerText(true, Ending::kNone), "Waiting for the other player...");
+  CHECK_EQ(BannerText(false, Ending::kDesync), "The games went out of sync. The session ended; both games restart.");
+  CHECK_EQ(BannerText(false, Ending::kLost),
+           "The other player stopped responding. The session ended; both games restart.");
+  CHECK_EQ(BannerText(false, Ending::kPeerLeft), "The other player left the session.");
+  CHECK_EQ(BannerText(false, Ending::kFrame0Timeout), "The other player's game did not come back.");
+  CHECK_EQ(BannerText(false, Ending::kLeft), "You left the session.");
+  CHECK_EQ(BannerText(false, Ending::kInternal), "The session ended unexpectedly; both games restart.");
+  // an ending wins over a hold that was still showing
+  CHECK_EQ(BannerText(true, Ending::kLost), BannerText(false, Ending::kLost));
+  CHECK(BannerText(true, Ending::kLeft) != "Waiting for the other player...");
+}
+
+static void TestTabLogLine() {
+  In in = Open(State::kConnected, true);
+  in.lobby.can_start = true;
+  CHECK_EQ(TabLogLine(in, Describe(in)), "[doa4][NET] tab: connected start=1 leave=0");
+  in.lobby.can_start = false;
+  CHECK_EQ(TabLogLine(in, Describe(in)), "[doa4][NET] tab: connected start=0 leave=0");
+  In s = Open(State::kInSession, true);
+  s.in_session = true;
+  CHECK_EQ(TabLogLine(s, Describe(s)), "[doa4][NET] tab: in_session start=0 leave=1");
+  In h = Open(State::kHosting, true);
+  CHECK_EQ(TabLogLine(h, Describe(h)), "[doa4][NET] tab: hosting start=0 leave=0");
+  CHECK_EQ(TabLogLine(In{}, Describe(In{})), "[doa4][NET] tab: offline start=0 leave=0");
+  // an in_session process whose lobby still says connecting reports the session (the process-level flag wins)
+  In e = Open(State::kConnecting, false);
+  e.in_session = true;
+  CHECK_EQ(TabLogLine(e, Describe(e)), "[doa4][NET] tab: in_session start=0 leave=1");
+}
+
+int main() {
+  TestOffline();
+  TestHosting();
+  TestConnectedHost();
+  TestConnectedJoiner();
+  TestStartingAndRestarting();
+  TestInSession();
+  TestStats();
+  TestDiagnostics();
+  TestVersionLine();
+  TestEventLine();
+  TestLocks();
+  TestBanner();
+  TestTabLogLine();
+  std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
+  return g_failures ? 1 : 0;
+}
