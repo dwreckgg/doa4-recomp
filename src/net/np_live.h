@@ -10,8 +10,8 @@
 // destructor calls Close(). The live::Session must be destroyed before the gekko::Session and the Executor objects.
 //
 // Threads (S2a): Frame runs on the game thread only; the thread of the first Frame call is captured and a Frame call
-// from any other thread ends the session with End::kInternal (the debug check of the single-producer contract, Task
-// 7 review). The gekko Send / Receive callbacks (the transport's PushGekko / PopGekko) are therefore called only from
+// from any other thread returns End::kInternal at once without touching GekkoNet or the session's state (the debug
+// check of the single-producer contract, Task 7 review; the game thread's session goes on). The gekko Send / Receive callbacks (the transport's PushGekko / PopGekko) are therefore called only from
 // the game thread, inside Frame (np_live never touches the transport; the transport must outlive the gekko::Session).
 // Leave (UI thread or the frame hook) and PeerLeft (the transport's I/O thread) store into atomics Frame reads;
 // banner_waiting, frames_ahead and remote_slack are atomics Frame writes and any thread reads.
@@ -89,15 +89,21 @@ class Session {
   // session ends. Every call that does not end at once runs at least one Update (session events are taken once per
   // Update). Once an end is returned, every later call returns the same end without touching GekkoNet.
   FrameResult Frame(int32_t f, uint32_t checksum_entering, const Pad& local);
-  void Leave(int32_t at_frame);         // this side leaves at that frame (UI or the script's quit); any thread
-  void PeerLeft(int32_t at_frame, wire::LeaveReason why);  // from the lobby channel (I/O thread)
+  // This side leaves at that frame (UI or the script's quit); any thread. Repeated calls keep the EARLIEST frame. The
+  // call that reaches it (or the next call, if it is already past) returns kLeft with end_frame = that frame.
+  void Leave(int32_t at_frame);
+  // From the lobby channel (I/O thread). Frame and reason are stored as one atomic word, so they cannot tear.
+  void PeerLeft(int32_t at_frame, wire::LeaveReason why);
   bool banner_waiting() const;          // a hold has lasted >= banner_ms (any thread)
   float frames_ahead() const;
   // Frames of the peer's input this side holds beyond the frame it is about to advance (carry 2b), >= 0; updated
-  // after every Update. Read from np_gekko's peek at the Inputs payloads (gekko::Session::last_remote_input_frame).
+  // after every Update. Read from np_gekko's peek at the Inputs payloads (gekko::Session::last_remote_input_frame),
+  // which is UNAUTHENTICATED (a well-formed payload with any magic moves it): display and diagnostics only - Task 12
+  // must not base a decision on it.
   int32_t remote_slack() const;
-  // Executor::DropPending() then gekko::Session::Destroy(); idempotent. Later Frame calls return End::kInternal
-  // ("session closed") unless an end was already returned (then that end).
+  // Executor::DropPending() then gekko::Session::Destroy(); idempotent. GAME THREAD ONLY (the thread that calls Frame,
+  // or any thread once Frame is no longer called). Later Frame calls return End::kInternal ("session closed") unless
+  // an end was already returned (then that end).
   void Close();
 
  private:
@@ -110,17 +116,18 @@ class Session {
   Hooks hooks_;
 
   std::atomic<int32_t> leave_at_{INT32_MAX};
-  std::atomic<int32_t> peer_left_at_{INT32_MAX};
-  std::atomic<uint8_t> peer_reason_{0};
+  // PeerLeft: (uint64(reason) << 32) | uint32(frame); kNoPeerLeft until a PeerLeft call.
+  static constexpr uint64_t kNoPeerLeft = uint64_t(uint32_t(INT32_MAX));
+  std::atomic<uint64_t> peer_left_{kNoPeerLeft};
   std::atomic<bool> banner_{false};
   std::atomic<float> frames_ahead_{0.f};
   std::atomic<int32_t> remote_slack_{0};
 
+  // Game thread only (Frame and Close). A Frame call from another thread reads only thread_ and returns.
   bool closed_ = false;
   bool ended_ = false;
   FrameResult end_result_;
-  bool thread_set_ = false;
-  std::thread::id thread_{};
+  std::atomic<std::thread::id> thread_{};  // the thread of the first Frame call (default id: none yet)
   bool frame0_started_ = false;
   uint64_t frame0_begin_us_ = 0;
   uint32_t holds_ = 0;

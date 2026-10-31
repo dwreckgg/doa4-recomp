@@ -134,6 +134,8 @@ struct Actor {
   std::function<void(Actor&, int32_t)> before_frame;  // test hook, inside the fiber, before Frame(f)
   std::function<void(Actor&)> on_end;                 // test hook, inside the fiber, after an end was returned
   std::function<float()> fa;                          // hooks.frames_ahead (empty: GekkoNet's)
+  uint64_t overshoot_us = 0, overshoot_after_us = 0;  // fake timer overshoot (see wait_packet)
+  int overshot = 0;                                   // slices that overshot
   bool got_inputs = false;  // received an Inputs payload (the handshake is over for this side)
   int sent = 0;
   Bytes first_inputs, first_sync_request;  // the first such payload this side sent (layout print)
@@ -273,6 +275,12 @@ static void Setup(World& w) {
       if (Released(w, s)) return;
       me.st = Actor::kWaitPacket;
       me.wake = w.t + uint64_t(ms) * kMs;
+      // Overshoot (fix round 1, I1): a real waitable timer wakes late; once the hold has run overshoot_after_us, every
+      // slice of this side in Frame(hold frame) wakes overshoot_us late (a packet release still ends it at the release).
+      if (me.overshoot_us && h.begin != kInf && me.cur == h.at_frame && me.last_now >= h.begin + me.overshoot_after_us) {
+        me.wake += me.overshoot_us;
+        ++me.overshot;
+      }
       Block(me);
     };
     clock.sleep_precise = [&w, s](uint32_t us) {
@@ -463,17 +471,17 @@ static void TestLockstep() {
     if (!(x == want)) ++wrong;
   }
   CHECKF(unequal == 0 && wrong == 0, "%zu frames differ between the sides, %zu from the pattern", unequal, wrong);
-  // Remote slack (carry 2b): >= 0 throughout, and the peek is consistent with GekkoNet: frame f is never advanced
-  // before the peek has seen the peer's input for f.
+  // Remote slack (carry 2b): the peek is consistent with GekkoNet (frame f is never advanced before the peek has seen
+  // the peer's input for f), and the slack is not stuck at 0 in lockstep (the peer's adds run delay frames ahead, so
+  // some reading is >= 1; observed max 4). The old "never negative" check was vacuous (the store clamps at 0): dropped.
   for (int s = 0; s < 2; ++s) {
     const Actor& A = w.a[s];
-    int neg = 0, early = 0, mx = 0;
+    int early = 0, mx = 0;
     for (size_t i = 0; i < A.results.size(); ++i) {
-      if (A.slack_after[i] < 0) ++neg;
       if (A.results[i].second.ok && A.last_remote_after[i] < A.results[i].first) ++early;
       mx = std::max(mx, int(A.slack_after[i]));
     }
-    CHECKF(neg == 0 && early == 0, "side %d: %d negative slack readings, %d frames advanced before the peek saw them", s, neg, early);
+    CHECKF(early == 0 && mx >= 1, "side %d: %d frames advanced before the peek saw them, slack max %d", s, early, mx);
     std::printf("info: lockstep side %d: remote slack max %d, last remote input frame %d\n", s, mx,
                 A.last_remote_after.empty() ? -2 : A.last_remote_after.back());
   }
@@ -721,21 +729,48 @@ static void TestLeave() {
     World w;
     w.label = "leave, peer told early";
     w.a[0].frames = w.a[1].frames = 260;
+    // M4 (fix round 1): a second, later Leave keeps the earliest frame (200, not 205).
     w.a[0].before_frame = [](Actor& me, int32_t f) {
       if (f == 150) me.live->Leave(200);
+      if (f == 152) me.live->Leave(205);
     };
+    // The reason travels with the frame (one atomic): kDesync, not the default kLeft.
     w.a[1].before_frame = [](Actor& me, int32_t f) {
-      if (f == 150) me.live->PeerLeft(200, wire::LeaveReason::kLeft);
+      if (f == 150) me.live->PeerLeft(200, wire::LeaveReason::kDesync);
     };
     Setup(w);
     Run(w);
+    const Actor& A = w.a[0];
+    const live::FrameResult* ra = Last(A);
+    CHECKF(ra && ra->end == live::End::kLeft && ra->end_frame == 200 && A.results.back().first == 200 && OkCount(A) == 200,
+           "A (Leave 200 then 205): end %s at %d in Frame(%d), %d ok", ra ? EndName(ra->end) : "-", ra ? ra->end_frame : -1,
+           A.results.empty() ? -1 : A.results.back().first, OkCount(A));
     const Actor& B = w.a[1];
     const live::FrameResult* rb = Last(B);
     CHECKF(rb && rb->end == live::End::kPeerLeft && rb->end_frame == 200 && B.results.back().first == 200 && OkCount(B) == 200,
            "B: end %s at %d in Frame(%d), %d ok", rb ? EndName(rb->end) : "-", rb ? rb->end_frame : -1,
            B.results.empty() ? -1 : B.results.back().first, OkCount(B));
     CHECKF(B.gk.local_inputs_added() == 200, "B: %u adds", B.gk.local_inputs_added());
-    CHECKF(rb && rb->why.find("left") != std::string::npos, "B's why \"%s\"", rb ? rb->why.c_str() : "");
+    CHECKF(rb && rb->why == "the other player left at frame 200 (desync)", "B's why \"%s\"", rb ? rb->why.c_str() : "");
+  }
+  {
+    // M1 (fix round 1): a Leave for a frame already past ends the next call, and end_frame is the Leave frame.
+    World w;
+    w.label = "leave, frame already past";
+    w.a[0].frames = w.a[1].frames = 260;
+    w.a[0].before_frame = [](Actor& me, int32_t f) {
+      if (f == 198) me.live->Leave(195);
+    };
+    Setup(w);
+    Run(w);
+    const Actor& A = w.a[0];
+    const live::FrameResult* ra = Last(A);
+    CHECKF(ra && ra->end == live::End::kLeft && ra->end_frame == 195 && A.results.back().first == 198 && OkCount(A) == 198 &&
+               ra->why == "left at frame 195",
+           "A: end %s at %d in Frame(%d), %d ok, why \"%s\"", ra ? EndName(ra->end) : "-", ra ? ra->end_frame : -1,
+           A.results.empty() ? -1 : A.results.back().first, OkCount(A), ra ? ra->why.c_str() : "");
+    const EvRec* e = FindEv(A, live::Event::kEnd);
+    CHECKF(e && e->frame == 195, "A: kEnd event frame %d", e ? e->frame : -1);
   }
 }
 
@@ -835,22 +870,151 @@ static void TestClose() {
   CHECK(A.gk.local_inputs_added() == adds);
 }
 
-// The single-producer debug check (carry 2c): a Frame call from a second thread ends the session without touching GekkoNet.
+// The single-producer debug check (carry 2c; fix round 1 M3): a Frame call from a second thread returns kInternal
+// WITHOUT touching GekkoNet and without writing the session's state - the game thread's session goes on (no end, no
+// kEnd event), so the wrong-thread call cannot race the game thread on ended_ / end_result_ / on_event.
 static void TestThread() {
   Group("second thread");
   World w;
   w.label = "thread";
   w.a[0].frames = w.a[1].frames = 10;
+  live::FrameResult r;
+  uint32_t adds_before = 0, adds_after = 0;
+  w.a[0].before_frame = [&](Actor& me, int32_t f) {
+    if (f != 5) return;
+    adds_before = me.gk.local_inputs_added();
+    std::thread th([&] { r = me.live->Frame(5, Entering(me), Pad{}); });
+    th.join();
+    adds_after = me.gk.local_inputs_added();
+  };
   Setup(w);
   Run(w);
-  Actor& A = w.a[0];
-  const uint32_t adds = A.gk.local_inputs_added();
-  live::FrameResult r;
-  std::thread th([&] { r = A.live->Frame(10, Entering(A), Pad{}); });
-  th.join();
-  CHECKF(r.end == live::End::kInternal && r.why == "Frame called from a second thread" && !r.ok, "end %s why \"%s\"", EndName(r.end),
-         r.why.c_str());
-  CHECK(A.gk.local_inputs_added() == adds && adds == 10);
+  const Actor& A = w.a[0];
+  CHECKF(r.end == live::End::kInternal && r.why == "Frame called from a second thread" && !r.ok && r.end_frame == 5,
+         "end %s at %d why \"%s\"", EndName(r.end), r.end_frame, r.why.c_str());
+  CHECKF(adds_before == 5 && adds_after == 5, "adds %u -> %u around the wrong-thread call", adds_before, adds_after);
+  CHECKF(OkCount(A) == 10 && CountEv(A, live::Event::kEnd) == 0, "A after the wrong-thread call: %d ok, %d kEnd events", OkCount(A),
+         CountEv(A, live::Event::kEnd));
+}
+
+// Fix round 1, I1: a slice that overshoots its deadline (a real waitable timer wakes 0.5-1+ ms late; a stalled thread
+// more) and ends on the packet's release makes the hold's last Update advance. The deadlines it passed are still
+// reported, with the real begin. Three cases, each with A's slices overshooting once the hold has run `after`:
+//  - 120 ms hold at frame 50, 60 ms overshoot from the start: slices end at 76 ms (no packet), then at the release
+//    (120 ms) on an Update that advances. The report deadline (100 ms) was passed only inside the second slice.
+//  - 1.03 s hold at frame 100, 100 ms overshoot after 950 ms: the slice that starts in 950..966 ms ends at the release
+//    (1.03 s), past the banner deadline (1 s), on an Update that advances.
+//  - 10.02 s hold at frame 100, 100 ms overshoot after 9.95 s: the slice past the end deadline (10 s) ends at the
+//    release on an Update that advances: the frame advanced first, so no kLost (the hold is reported). B runs only to
+//    frame 102 (it would otherwise hold at 103 for over 10 s and end kLost, which is not this case).
+static void TestOvershoot() {
+  Group("overshooting slices");
+  {
+    World w;
+    w.label = "overshoot, 120 ms hold";
+    w.a[0].frames = w.a[1].frames = 80;
+    w.a[0].overshoot_us = 60 * kMs;
+    ArmHold(w, 0, 50, 120 * kMs);
+    Setup(w);
+    Run(w);
+    const Actor& A = w.a[0];
+    const uint64_t begin = w.hold[0].begin;
+    CHECKF(OkCount(A) == 80 && begin != kInf && A.overshot > 0, "A %d ok, hold begun %d, %d slices overshot", OkCount(A),
+           begin != kInf, A.overshot);
+    if (A.results.size() < 80) return;
+    const live::FrameResult& r = A.results[50].second;
+    std::printf("info: overshoot 120 ms: frame 50: %d waits, hold_us %llu, wait+net %llu\n", A.waits_in_call[50],
+                (unsigned long long)r.hold_us, (unsigned long long)(r.timing.wait_us + r.timing.net_us));
+    CHECKF(r.ok && r.holds == A.results[49].second.holds + 1 && r.hold_us >= 120'000, "frame 50: holds %u (before %u), hold_us %llu",
+           r.holds, A.results[49].second.holds, (unsigned long long)r.hold_us);
+    std::vector<EvRec> ev;
+    for (const EvRec& e : A.events)
+      if (e.frame == 50) ev.push_back(e);
+    CHECKF(ev.size() == 2 && ev[0].ev == live::Event::kHoldBegin && ev[0].at == begin && ev[1].ev == live::Event::kHoldEnd,
+           "frame 50: %zu events (first %d at %lld us from begin)", ev.size(), ev.empty() ? -1 : int(ev[0].ev),
+           ev.empty() ? -1LL : (long long)(ev[0].at - begin));
+  }
+  {
+    World w;
+    w.label = "overshoot, 1.03 s hold";
+    w.a[0].frames = w.a[1].frames = 130;
+    w.a[0].overshoot_us = 100 * kMs;
+    w.a[0].overshoot_after_us = 950 * kMs;
+    ArmHold(w, 0, 100, 1030 * kMs);
+    Setup(w);
+    Run(w);
+    const Actor& A = w.a[0];
+    const uint64_t begin = w.hold[0].begin;
+    CHECKF(OkCount(A) == 130 && begin != kInf && A.overshot == 1, "A %d ok, hold begun %d, %d slices overshot", OkCount(A),
+           begin != kInf, A.overshot);
+    if (A.results.size() < 130) return;
+    const live::FrameResult& r = A.results[100].second;
+    CHECKF(r.ok && r.holds == A.results[99].second.holds + 1 && r.hold_us >= 1'030'000, "frame 100: holds %u (before %u), hold_us %llu",
+           r.holds, A.results[99].second.holds, (unsigned long long)r.hold_us);
+    CHECKF(CountEv(A, live::Event::kBannerWaiting, 100) == 1 && CountEv(A, live::Event::kBannerWaiting) == 1,
+           "kBannerWaiting raised %d times at frame 100", CountEv(A, live::Event::kBannerWaiting, 100));
+    const EvRec* b = FindEv(A, live::Event::kBannerWaiting);
+    CHECKF(b && b->at >= begin + 1'030'000, "kBannerWaiting at begin + %lld us (the advancing Update, after the release)",
+           b ? (long long)(b->at - begin) : -1LL);
+    int after_true = 0;
+    for (const WaitRec& wr : A.waits) after_true += wr.frame > 100 && wr.banner;
+    CHECKF(after_true == 0 && !A.live->banner_waiting(), "banner up after the hold: %d samples, now %d", after_true,
+           A.live->banner_waiting());
+  }
+  {
+    World w;
+    w.label = "overshoot, 10.02 s hold";
+    w.a[0].frames = 102;
+    w.a[1].frames = 103;
+    w.a[0].overshoot_us = 100 * kMs;
+    w.a[0].overshoot_after_us = 9'950 * kMs;
+    ArmHold(w, 0, 100, 10'020 * kMs);
+    Setup(w);
+    Run(w);
+    const Actor& A = w.a[0];
+    CHECKF(OkCount(A) == 102 && OkCount(w.a[1]) == 103 && A.overshot == 1 && CountEv(A, live::Event::kEnd) == 0,
+           "A %d ok (end %s), B %d ok, %d slices overshot", OkCount(A), EndName(EndOf(A)), OkCount(w.a[1]), A.overshot);
+    if (A.results.size() < 102) return;
+    const live::FrameResult& r = A.results[100].second;
+    CHECKF(r.ok && r.hold_us >= 10'020'000 && r.holds == A.results[99].second.holds + 1 && CountEv(A, live::Event::kHoldBegin, 100) == 1,
+           "frame 100: ok %d hold_us %llu holds %u", r.ok, (unsigned long long)r.hold_us, r.holds);
+  }
+}
+
+// Fix round 1, M2: the slack peek reads only well-formed Inputs payloads. A forged 10-byte "Inputs" payload claiming
+// frame 1000 (header, index 0, start 1000, count 1, nothing else) reaches A at frame 50; the peek must ignore it (an
+// Inputs body is start, count, total_size, compressed, then a u32-length vector of total_size bytes, net.h:47-53).
+static void TestForgedInputs() {
+  Group("forged Inputs payload");
+  World w;
+  w.label = "forged inputs";
+  w.a[0].frames = w.a[1].frames = 80;
+  w.a[0].before_frame = [&w](Actor&, int32_t f) {
+    if (f == 50) w.q[0].push_back({w.t, Bytes{0x01, 0x00, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, 0x01, 0x00}});
+    // Past the length gate, each breaking one consistency rule (a probe showed the short one alone never reaches them):
+    // frame 2000, total_size 10 and prefix 10 but no body bytes (length 17, not 27);
+    if (f == 55)
+      w.q[0].push_back({w.t, Bytes{0x01, 0x00, 0x00, 0x00, 0xD0, 0x07, 0x00, 0x00, 0x01, 0x00, 0x0A, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00}});
+    // frame 3000, count 5, uncompressed, 16 body bytes (consistent length, but 5 frames need 80).
+    if (f == 60) {
+      Bytes b{0x01, 0x00, 0x00, 0x00, 0xB8, 0x0B, 0x00, 0x00, 0x05, 0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00};
+      b.resize(b.size() + 16, 0);
+      w.q[0].push_back({w.t, b});
+    }
+  };
+  Setup(w);
+  Run(w);
+  const Actor& A = w.a[0];
+  CHECKF(OkCount(A) == 80, "A: %d ok", OkCount(A));
+  int high = 0, mx = 0;
+  for (size_t i = 0; i < A.results.size(); ++i) {
+    high += A.last_remote_after[i] > A.results[i].first + 8;
+    mx = std::max(mx, A.last_remote_after[i]);
+  }
+  CHECKF(high == 0, "A: %d readings of the peek more than 8 frames past the frame (max %d)", high, mx);
+  // Positive control: the peek still moves with real payloads after the forged one.
+  CHECKF(!A.last_remote_after.empty() && A.last_remote_after.back() >= 79, "A: last remote input %d at the end",
+         A.last_remote_after.empty() ? -2 : A.last_remote_after.back());
 }
 
 // Remote slack grows when the peer runs ahead (carry 2b): A pauses 100 ms of fake time before each of its frames 60..69,
@@ -930,6 +1094,8 @@ int main(int argc, char** argv) {
   TestThread();
   TestSlackAhead();
   TestMagicZero();
+  TestOvershoot();
+  TestForgedInputs();
   g_done = true;
   watchdog.join();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);

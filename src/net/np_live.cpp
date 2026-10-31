@@ -35,11 +35,14 @@ void Session::Close() {
   if (gekko_) gekko_->Destroy();
 }
 
-void Session::Leave(int32_t at_frame) { leave_at_.store(at_frame); }
+void Session::Leave(int32_t at_frame) {
+  int32_t cur = leave_at_.load();
+  while (at_frame < cur && !leave_at_.compare_exchange_weak(cur, at_frame)) {
+  }
+}
 
 void Session::PeerLeft(int32_t at_frame, wire::LeaveReason why) {
-  peer_reason_.store(uint8_t(why));
-  peer_left_at_.store(at_frame);
+  peer_left_.store(uint64_t(uint8_t(why)) << 32 | uint32_t(at_frame));
 }
 
 bool Session::banner_waiting() const { return banner_.load(); }
@@ -62,17 +65,21 @@ FrameResult Session::Finish(FrameResult r, End end, int32_t end_frame, std::stri
 }
 
 FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& local) {
+  // The single-producer check first: a call from another thread reads nothing else and writes nothing (no end is
+  // latched, no event raised), so it cannot race the game thread; it only reports itself.
+  const std::thread::id me = std::this_thread::get_id();
+  std::thread::id owner{};
+  if (!thread_.compare_exchange_strong(owner, me) && owner != me) {
+    FrameResult wrong;
+    wrong.end = End::kInternal;
+    wrong.end_frame = f;
+    wrong.why = "Frame called from a second thread";
+    return wrong;
+  }
   if (ended_) return end_result_;  // the same end; GekkoNet and the executor are not touched again
   FrameResult r;
   uint64_t t = clock_.now_us();
   if (closed_) return Finish(r, End::kInternal, f, "session closed", t);
-  const std::thread::id me = std::this_thread::get_id();
-  if (!thread_set_) {
-    thread_set_ = true;
-    thread_ = me;
-  } else if (me != thread_) {
-    return Finish(r, End::kInternal, f, "Frame called from a second thread", t);
-  }
   if (f == 0 && !frame0_started_) {
     frame0_started_ = true;
     frame0_begin_us_ = t;
@@ -83,15 +90,16 @@ FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& loc
     const int32_t leave = leave_at_.load();
     if (f >= leave) {
       char why[64];
-      std::snprintf(why, sizeof why, "left at frame %d", int(f));
-      *out = Finish(r, End::kLeft, f, why, at);
+      std::snprintf(why, sizeof why, "left at frame %d", int(leave));
+      *out = Finish(r, End::kLeft, leave, why, at);
       return true;
     }
-    const int32_t peer = peer_left_at_.load();
+    const uint64_t packed = peer_left_.load();
+    const int32_t peer = int32_t(uint32_t(packed));
     if (f >= peer) {
       char why[96];
       std::snprintf(why, sizeof why, "the other player left at frame %d (%s)", int(peer),
-                    ReasonText(wire::LeaveReason(peer_reason_.load())));
+                    ReasonText(wire::LeaveReason(uint8_t(packed >> 32))));
       *out = Finish(r, End::kPeerLeft, peer, why, at);
       return true;
     }
@@ -127,25 +135,32 @@ FrameResult Session::Frame(int32_t f, uint32_t checksum_entering, const Pad& loc
       return Finish(r, End::kDesync, f, why, t1);
     }
     if (step.end != exec::End::kNone) return Finish(r, End::kInternal, f, step.why, t1);
+    // A hold: deadlines in whole milliseconds since its begin (frame 0's end: since the first Frame(0) call). The
+    // report and the banner are judged on EVERY Update of a hold, the advancing one included: a slice that overshoots
+    // (a real timer wakes late) can pass a deadline and end on the packet's release, and that hold still happened.
+    // The end deadline is judged only when the frame did not advance (an input that arrived wins).
+    auto report = [&](uint64_t elapsed) {
+      if (!reported && elapsed >= limits_.hold_report_ms) {
+        reported = true;
+        ++holds_;
+        if (hooks_.on_event) hooks_.on_event(Event::kHoldBegin, f, begin);
+      }
+      if (!bannered && elapsed >= limits_.banner_ms) {
+        bannered = true;
+        banner_.store(true);
+        if (hooks_.on_event) hooks_.on_event(Event::kBannerWaiting, f, t1);
+      }
+    };
+    if (in_hold) report((t1 - begin) / 1000);
     if (step.advanced) break;
     if (left(t1, &out)) return out;
 
-    // A hold: deadlines in whole milliseconds since its begin (frame 0's end: since the first Frame(0) call).
     if (!in_hold) {
       in_hold = true;
       begin = t1;
     }
     const uint64_t elapsed = (t1 - begin) / 1000;
-    if (!reported && elapsed >= limits_.hold_report_ms) {
-      reported = true;
-      ++holds_;
-      if (hooks_.on_event) hooks_.on_event(Event::kHoldBegin, f, begin);
-    }
-    if (!bannered && elapsed >= limits_.banner_ms) {
-      bannered = true;
-      banner_.store(true);
-      if (hooks_.on_event) hooks_.on_event(Event::kBannerWaiting, f, t1);
-    }
+    report(elapsed);
     uint64_t end_elapsed = elapsed, end_limit = limits_.end_ms;
     if (f == 0) {
       end_elapsed = (t1 - frame0_begin_us_) / 1000;
