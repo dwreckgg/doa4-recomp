@@ -214,6 +214,9 @@ class DeadOrAlive4App : public rex::ReXApp {
     // The dot-product NaN redirect is compile-time, and the build id hashes bytes, not features: this line says
     // whether this exe has it (netplay phase 1, Task 1; the gate reads it from every run's game.log).
     REXLOG_INFO("[doa4][LIFE] dot products: canonical NaN {}", doa4::np::DotProductSelfTest());
+    // The netplay release identity (CMakeLists.txt: DOA4_RELEASE_*; "dev" for local builds). A [LIFE] line, so an
+    // offline run still has no [NET]/[NP] line (gate S9); plan 1b reads it.
+    REXLOG_INFO("[doa4][LIFE] version {} ({} releases of {})", DOA4_RELEASE_TAG, DOA4_RELEASE_CHANNEL, DOA4_RELEASE_REPO);
   }
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;

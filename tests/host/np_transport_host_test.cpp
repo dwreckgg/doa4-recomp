@@ -684,7 +684,7 @@ struct FakeStun {
   Udp sock;
   rules::Endpoint answer;  // the XOR-MAPPED-ADDRESS it reports
   int ignore_first = 0;    // requests left unanswered at the start
-  bool silent = false;     // never answers
+  std::atomic<bool> silent{false};  // never answers (may be set while it runs: TestStunExpiry)
   std::atomic<bool> stop{false};
   std::mutex mu;
   std::vector<int64_t> req_us;          // when each binding request arrived
@@ -1099,6 +1099,130 @@ static void TestStunSource() {
   t.Stop();
 }
 
+// Task 9 carry 2e (Task 7 review M-1): STUN answers expire. The class and the mapped address come only from answers
+// newer than 2 x stun_refresh_ms, so a server that stops answering cannot keep a stale kSymmetric (or a stale mapped
+// address) alive. Refresh 300 ms: an answer is stale 600 ms after it arrived; the next refresh round comes <= 300 ms
+// later, so a silent server's answer drops out within ~300-950 ms of the moment it went silent. Limits: 3 s per step.
+static void TestStunExpiry() {
+  Group("transport, STUN answers expire after 2 x stun_refresh_ms");
+  FakeStun f1, f2;
+  f1.answer = Pub(51234);
+  f2.answer = Pub(51299);  // another port: kSymmetric while both answer
+  f1.Begin();
+  f2.Begin();
+  LogSink l;
+  net::Transport t;
+  net::Config c = LoopCfg();
+  c.stun = true;
+  c.stun_servers = {"127.0.0.1:" + std::to_string(f1.sock.port), "127.0.0.1:" + std::to_string(f2.sock.port)};
+  c.stun_refresh_ms = 300;
+  std::string e;
+  CHECKF(t.Start(c, l.Fn(), &e), "start: %s", e.c_str());
+  auto wait_nat = [&](rules::Nat want, int ms) {
+    const int64_t t0 = NowUs();
+    while (NowUs() - t0 < int64_t(ms) * 1000) {
+      if (t.stats().nat == want) return (NowUs() - t0) / 1000;
+      SleepMs(5);
+    }
+    return int64_t(-1);
+  };
+  CHECKF(wait_nat(rules::Nat::kSymmetric, 2000) >= 0, "kSymmetric not reached (nat %d)", int(t.stats().nat));
+  // The fixture's precondition: kSymmetric holds over several refresh rounds while both answer (not a transient).
+  SleepMs(1000);
+  CHECKF(t.stats().nat == rules::Nat::kSymmetric, "kSymmetric did not hold while both answered (nat %d)", int(t.stats().nat));
+  f2.silent = true;  // server 2 dies: its last answer must stop counting
+  const int64_t one = wait_nat(rules::Nat::kOneAnswer, 3000);
+  CHECKF(one >= 0, "a dead server kept the class: nat %d 3 s after server 2 went silent (expected kOneAnswer)", int(t.stats().nat));
+  const net::Stats s1 = t.stats();
+  CHECK(s1.mapped && *s1.mapped == Pub(51234));
+  std::printf("info: STUN expiry: kOneAnswer %lld ms after server 2 went silent\n", (long long)one);
+  // Not too early: its last answer (<= 300 ms before it went silent) lives 600 ms, so the class holds >= 300 ms.
+  CHECKF(one >= 300, "the class changed only %lld ms after server 2 went silent (an answer must live 2 x 300 ms)", (long long)one);
+  f1.silent = true;  // both dead: no class, no mapped address
+  const int64_t none = wait_nat(rules::Nat::kNoAnswer, 3000);
+  CHECKF(none >= 0, "nat %d 3 s after both servers went silent (expected kNoAnswer)", int(t.stats().nat));
+  const net::Stats s2 = t.stats();
+  CHECKF(!s2.mapped, "a mapped address survived every server going silent");
+  // Positive control: server 1 answers again -> kOneAnswer and mapped come back (the expiry is not a latch).
+  f1.silent = false;
+  CHECKF(wait_nat(rules::Nat::kOneAnswer, 2000) >= 0, "server 1 answering again did not restore kOneAnswer (nat %d)", int(t.stats().nat));
+  t.Stop();
+}
+
+// Task 9 carries 2h and 2a. (2h) A kGekko datagram that arrives while no peer is set is normal at session start (the
+// other game is a few ms ahead): it is counted in Stats::gekko_early, not as kSource/kToken, and never reaches
+// PopGekko. (2a) A datagram with the DOA4 magic and another protocol version is counted kProto as before AND handed to
+// on_foreign_proto (source, its proto byte, its type byte, its size), so the lobby can answer a game of another version
+// with advice instead of a plain timeout; a datagram without the magic never reaches it.
+static void TestGekkoEarlyAndForeignProto() {
+  Group("transport, kGekko before SetPeer counted apart; on_foreign_proto");
+  LogSink l;
+  net::Transport t;
+  std::mutex mu;
+  struct Foreign {
+    rules::Endpoint from;
+    uint8_t proto, type;
+    size_t bytes;
+  };
+  std::vector<Foreign> foreign;
+  int packets = 0;
+  t.on_foreign_proto = [&](const rules::Endpoint& from, uint8_t proto, uint8_t type, size_t bytes) {
+    std::lock_guard<std::mutex> lock(mu);
+    foreign.push_back(Foreign{from, proto, type, bytes});
+  };
+  t.on_packet = [&](const rules::Endpoint&, const wire::Packet&) {
+    std::lock_guard<std::mutex> lock(mu);
+    ++packets;
+  };
+  std::string e;
+  CHECKF(t.Start(LoopCfg(), l.Fn(), &e), "start: %s", e.c_str());
+  Udp third;
+  CHECK(third.ok());
+  for (int i = 0; i < 3; ++i) third.SendTo(t.port(), wire::Encode(wire::Type::kGekko, kToken, Payload(uint32_t(i), 12)));
+  SleepMs(150);
+  net::Stats s = t.stats();
+  CHECKF(s.gekko_early == 3, "gekko_early %u after 3 kGekko before any peer", s.gekko_early);
+  CHECKF(SumDropped(s) == 0, "the early kGekko were also counted as drops (%u)", SumDropped(s));
+  Bytes got;
+  CHECK(!t.PopGekko(&got));
+  // With a peer set, the same datagram from a non-peer is kSource again, and gekko_early stays.
+  Udp peer;
+  t.SetPeer(Loop(peer.port), kToken);
+  third.SendTo(t.port(), wire::Encode(wire::Type::kGekko, kToken, Payload(9, 12)));
+  SleepMs(150);
+  s = t.stats();
+  CHECKF(s.gekko_early == 3 && s.dropped[size_t(wire::Drop::kSource)] == 1, "after SetPeer: gekko_early %u, kSource %u", s.gekko_early,
+         s.dropped[size_t(wire::Drop::kSource)]);
+  // ClearPeer: early again.
+  t.ClearPeer();
+  third.SendTo(t.port(), wire::Encode(wire::Type::kGekko, kToken, Payload(10, 12)));
+  SleepMs(150);
+  CHECKF(t.stats().gekko_early == 4, "after ClearPeer: gekko_early %u", t.stats().gekko_early);
+
+  // on_foreign_proto: a Hello header of protocol kProto + 1 with a 20-byte body.
+  Bytes d = wire::Encode(wire::Type::kHello, 0, Bytes(20, 7));
+  d[4] = uint8_t(wire::kProto + 1);
+  third.SendTo(t.port(), d);
+  Bytes nomagic = d;  // the same with a wrong magic: kMagic, no callback
+  nomagic[0] ^= 0xFF;
+  third.SendTo(t.port(), nomagic);
+  third.SendTo(t.port(), wire::Encode(wire::Type::kPing, 0, Bytes{1, 2, 3, 4}));  // our proto: on_packet, not the hook
+  SleepMs(150);
+  s = t.stats();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    CHECKF(foreign.size() == 1, "on_foreign_proto ran %zu times (expected once)", foreign.size());
+    if (foreign.size() == 1) {
+      CHECK(foreign[0].from == Loop(third.port));
+      CHECK(foreign[0].proto == uint8_t(wire::kProto + 1) && foreign[0].type == uint8_t(wire::Type::kHello));
+      CHECKF(foreign[0].bytes == d.size(), "bytes %zu, sent %zu", foreign[0].bytes, d.size());
+    }
+    CHECK(packets == 1);
+  }
+  CHECK(s.dropped[size_t(wire::Drop::kProto)] == 1 && s.dropped[size_t(wire::Drop::kMagic)] == 1);
+  t.Stop();
+}
+
 // Review I-3(b): the transport takes its port exclusively (SO_EXCLUSIVEADDRUSE). Without it Windows lets a later
 // socket that sets SO_REUSEADDR bind the same address and port, and that socket then receives the transport's datagrams.
 static SOCKET ReuseBind(uint16_t port, int* err) {
@@ -1319,6 +1443,8 @@ int main(int argc, char** argv) {
   TestSimTransport();
   TestSimDrop();
   TestStunSource();
+  TestStunExpiry();
+  TestGekkoEarlyAndForeignProto();
   TestExclusiveBind();
   TestOutboundQueueFull();
   TestNoLogAfterStop();

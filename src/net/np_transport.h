@@ -54,6 +54,9 @@ struct Config {
   // interface as it starts, logs one line with the number set, and closes the WLAN handle as it ends (Stop), which
   // releases the mode. Off by default: the session process turns it on (Task 9/12); offline nothing calls WLAN.
   bool wifi_streaming = false;
+  // Map the port on the router (np_upnp) when hosting. Read by the lobby (np_online) only, never with loopback; the
+  // app sets it from netplay_upnp and DOA4_NP_UPNP. Off by default: host tests never call np_upnp.
+  bool upnp = false;
 };
 
 struct Stats {
@@ -63,9 +66,14 @@ struct Stats {
   uint32_t sim_dropped = 0, sim_delayed = 0;
   uint32_t sim_drop_hits = 0;     // kGekko datagrams dropped by Config::sim_drop
   rules::Nat nat = rules::Nat::kNoAnswer;
-  std::optional<rules::Endpoint> mapped;  // this socket as the first STUN server sees it
+  // `nat` and `mapped` come only from answers newer than 2 x stun_refresh_ms (Task 9 carry 2e): a server that stopped
+  // answering drops out of the class; with no fresh answer at all, kNoAnswer and no mapped address.
+  std::optional<rules::Endpoint> mapped;  // this socket as the first STUN server (with a fresh answer) sees it
   uint32_t stun_answers = 0;
   int32_t wifi_interfaces = -1;   // Wi-Fi interfaces put in media streaming mode; -1 = not asked (flag off or not yet)
+  // kGekko datagrams that arrived while no peer was set (Task 9 carry 2h): normal at session start, when the other game
+  // is a few ms ahead, so they are counted here and NOT in dropped[] (kSource/kToken); never queued for PopGekko.
+  uint32_t gekko_early = 0;
 };
 
 // The network simulator (DOA4_NP_SIM, a test switch). It sits on the I/O thread's send path: every datagram the
@@ -115,6 +123,10 @@ class Transport {
   // ---- I/O thread side (the lobby, np_online, runs in these callbacks) ----
   std::function<void(const rules::Endpoint& from, const wire::Packet& packet)> on_packet;  // DOA4 packets except kGekko
   std::function<void(uint32_t now_ms)> on_tick;  // every 5 ms (a high-resolution timer); now_ms = ms since Start
+  // A datagram with the DOA4 magic but another protocol version (counted kProto as always): its source, its proto and
+  // type bytes and its size, so the lobby can answer a game of another version with advice (Task 9 carry 2a). Only the
+  // header's first 6 bytes are trusted to mean anything across versions (magic, proto, type).
+  std::function<void(const rules::Endpoint& from, uint8_t proto, uint8_t type, size_t bytes)> on_foreign_proto;
   void SendTo(const rules::Endpoint& to, std::vector<uint8_t> datagram);  // I/O thread only; an empty datagram is not sent
   void Broadcast(uint16_t port, std::vector<uint8_t> datagram);           // I/O thread only; no-op with loopback
   // The peer and token kGekko traffic is accepted from and sent with. Any thread (the lobby calls them on the I/O

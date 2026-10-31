@@ -223,6 +223,7 @@ struct Transport::Impl {
   std::shared_ptr<Resolve> resolve;
   std::vector<std::optional<rules::Endpoint>> stun_eps;  // per configured server
   std::vector<std::optional<rules::Endpoint>> answers;   // per configured server: its latest mapped answer
+  std::vector<uint32_t> answer_ms;                       // ... when it arrived (NowMs)
   std::array<uint8_t, 12> tid{};
   uint32_t stun_last_ms = 0;
   uint64_t rng = 0;
@@ -290,6 +291,7 @@ struct Transport::Impl {
   void StunPump();
   void SendStunRound(uint32_t now_ms);
   bool HandleStun(const rules::Endpoint& from, std::span<const uint8_t> d);
+  void StunClassify(uint32_t now_ms);
   void Close();
 };
 
@@ -406,17 +408,25 @@ void Transport::Impl::Handle(const rules::Endpoint& from, std::span<const uint8_
   const wire::Drop why = wire::Decode(d, &pk);
   if (why != wire::Drop::kNone) {
     CountDrop(why);
+    // kProto: the magic matched and the datagram has a whole header, so its proto and type bytes can be handed on
+    if (why == wire::Drop::kProto && owner->on_foreign_proto) owner->on_foreign_proto(from, d[4], d[5], d.size());
     return;
   }
   if (pk.type != wire::Type::kGekko) {
     if (owner->on_packet) owner->on_packet(from, pk);
     return;
   }
-  bool source_ok, token_ok;
+  bool has, source_ok, token_ok;
   {
     std::lock_guard<std::mutex> lock(peer_mu);
+    has = has_peer;
     source_ok = has_peer && from == peer;
     token_ok = pk.token == token;
+  }
+  if (!has) {  // carry 2h: before SetPeer (session start), counted apart from the drops
+    std::lock_guard<std::mutex> lock(stats_mu);
+    ++st.gekko_early;
+    return;
   }
   if (!source_ok) {
     CountDrop(wire::Drop::kSource);
@@ -473,14 +483,40 @@ void Transport::Impl::StunPump() {
     }
     stun_resolved = true;
     answers.assign(stun_eps.size(), std::nullopt);
+    answer_ms.assign(stun_eps.size(), 0);
     for (size_t i = 0; i < stun_eps.size(); ++i)
       if (!stun_eps[i]) Log("[doa4][NET] STUN server " + config.stun_servers[i] + " not resolved");
   }
   const uint32_t now = NowMs();
   if (!stun_answered) {
     if (!stun_sent || now - stun_last_ms >= kStunRetryMs) SendStunRound(now);
-  } else if (now - stun_last_ms >= config.stun_refresh_ms) {
-    SendStunRound(now);  // R20: also while connected, keeps the NAT mapping alive
+  } else {
+    if (now - stun_last_ms >= config.stun_refresh_ms) SendStunRound(now);  // R20: also while connected, keeps the NAT mapping alive
+    StunClassify(now);  // carry 2e: answers age out even when no new one arrives
+  }
+}
+
+// The class and the mapped address from the answers that are still fresh: newer than 2 x stun_refresh_ms (Task 9 carry
+// 2e, Task 7 review M-1: a dead server cannot keep a stale kSymmetric alive). The brief's "or the current round" adds
+// nothing: once answered, rounds go out every stun_refresh_ms, so an answer to the current round is always fresh.
+void Transport::Impl::StunClassify(uint32_t now_ms) {
+  const uint64_t ttl = 2ull * config.stun_refresh_ms;
+  std::vector<rules::Endpoint> got;  // in server order: got.front() is the first server with a fresh answer
+  for (size_t i = 0; i < answers.size(); ++i)
+    if (answers[i] && uint64_t(now_ms - answer_ms[i]) <= ttl) got.push_back(*answers[i]);
+  const rules::Nat nat = rules::ClassifyNat(got);
+  std::optional<rules::Endpoint> mapped;
+  if (!got.empty()) mapped = got.front();
+  {
+    std::lock_guard<std::mutex> lock(stats_mu);
+    st.nat = nat;
+    st.mapped = mapped;
+  }
+  if (nat != logged_nat || logged_mapped != mapped) {
+    logged_nat = nat;
+    logged_mapped = mapped;
+    Log("[doa4][NET] STUN: " + std::to_string(got.size()) + " of " + std::to_string(stun_eps.size()) +
+        " servers answered recently, NAT " + NatName(nat) + (mapped ? ", mapped " + rules::EndpointText(*mapped) : ", no mapped address"));
   }
 }
 
@@ -509,23 +545,14 @@ bool Transport::Impl::HandleStun(const rules::Endpoint& from, std::span<const ui
   rules::Endpoint mapped;
   if (!rules::StunMapped(d, tid, &mapped)) return false;
   stun_answered = true;
+  const uint32_t now = NowMs();
   answers[idx] = mapped;
-  std::vector<rules::Endpoint> got;  // in server order: got.front() is the first server that answered
-  for (const auto& a : answers)
-    if (a) got.push_back(*a);
-  const rules::Nat nat = rules::ClassifyNat(got);
+  answer_ms[idx] = now;
   {
     std::lock_guard<std::mutex> lock(stats_mu);
     ++st.stun_answers;
-    st.nat = nat;
-    st.mapped = got.front();
   }
-  if (nat != logged_nat || logged_mapped != got.front()) {
-    logged_nat = nat;
-    logged_mapped = got.front();
-    Log("[doa4][NET] STUN: " + std::to_string(got.size()) + " of " + std::to_string(stun_eps.size()) + " servers answered, NAT " +
-        NatName(nat) + ", mapped " + rules::EndpointText(got.front()));
-  }
+  StunClassify(now);
   return true;
 }
 

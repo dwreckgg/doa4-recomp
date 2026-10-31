@@ -45,6 +45,13 @@ set(DEADORALIVE4_SOURCES
     src/net/np_det_middleware.cpp
     src/net/np_det_workers.cpp
     src/net/np_det_trace.cpp
+    src/net/np_wire.cpp
+    src/net/np_rules.cpp
+    src/net/np_handoff.cpp
+    src/net/np_transport.cpp
+    src/net/np_upnp.cpp
+    src/net/np_files.cpp
+    src/net/np_online.cpp
 )
 
 if(WIN32)
@@ -56,6 +63,14 @@ else()
 endif()
 
 rexglue_setup_target(dead_or_alive_4)
+
+# Netplay release identity (plan 1b's CI sets these; local builds are "dev").
+set(DOA4_RELEASE_TAG "dev" CACHE STRING "Netplay release tag: netplay-v<major>.<minor>.<run> in CI")
+set(DOA4_RELEASE_REPO "Dwreckgg/doa4-recomp" CACHE STRING "GitHub repository of the netplay releases")
+set(DOA4_RELEASE_CHANNEL "netplay" CACHE STRING "Netplay release channel (the tag prefix)")
+set(DOA4_NETPLAY_VERSION "1.0" CACHE STRING "major.minor of the netplay releases")
+target_compile_definitions(dead_or_alive_4 PRIVATE DOA4_RELEASE_TAG="${DOA4_RELEASE_TAG}"
+    DOA4_RELEASE_REPO="${DOA4_RELEASE_REPO}" DOA4_RELEASE_CHANNEL="${DOA4_RELEASE_CHANNEL}")
 
 # Netplay: GekkoNet (BSD-2) for the lockstep input exchange, without its ASIO adapter (the port's transport
 # carries its packets), and miniupnpc (BSD-3) to open the host's port on the router. Both from the DOA2U

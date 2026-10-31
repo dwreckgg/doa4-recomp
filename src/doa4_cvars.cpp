@@ -26,3 +26,19 @@ REXCVAR_DEFINE_STRING(doa4_photo_dir, "", "DOA4",
                       "Folder for photos (empty: the Pictures folder's DOA4 folder)");
 REXCVAR_DEFINE_BOOL(doa4_photo_auto, false, "DOA4",
                     "Also save a full-quality copy when an in-game snapshot is saved to the Album");
+
+// Online tab (netplay phase 1; np_online.h). Saved through doa4::SaveTomlKey by the Online tab (Task 14). Host-only:
+// none of them is carried to the other player (np_handoff's census lists them as not carried).
+REXCVAR_DEFINE_UINT32(netplay_port, 7200, "DOA4",
+                      "Online play: preferred UDP port (7200-7215 keep the join code short)");
+REXCVAR_DEFINE_BOOL(netplay_delay_auto, true, "DOA4",
+                    "Online play: input delay from the measured ping");
+REXCVAR_DEFINE_INT32(netplay_delay, 2, "DOA4",
+                     "Online play: input delay in frames when not automatic (1-8)")
+    .range(1, 8);
+REXCVAR_DEFINE_STRING(netplay_last_join, "", "DOA4",
+                      "Online play: the last code joined");
+REXCVAR_DEFINE_BOOL(netplay_show_stats, false, "DOA4",
+                    "Online play: show the connection stats line");
+REXCVAR_DEFINE_BOOL(netplay_upnp, true, "DOA4",
+                    "Online play: open the port on the router (UPnP) when hosting");

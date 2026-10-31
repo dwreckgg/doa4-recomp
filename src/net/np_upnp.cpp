@@ -23,7 +23,6 @@
 namespace doa4::np::upnp {
 namespace {
 
-constexpr const char* kLease = "3600";
 constexpr const char* kPermanent = "0";
 constexpr int kOnlyPermanentLeases = 725;  // UPnP error OnlyPermanentLeasesSupported (upnpcommands.h)
 constexpr const char* kDescription = "DOA4 PC online play";
@@ -46,6 +45,8 @@ struct Shared {
   IGDdatas data{};
   bool have_urls = false;
   bool mapped = false;
+  bool leased = false;  // mapped with kLeaseSeconds (not the permanent fallback): renewed by the worker
+  std::chrono::steady_clock::time_point mapped_at{};
   uint16_t mapped_port = 0;
 };
 
@@ -69,6 +70,7 @@ void DeleteMapping(Shared& s) {
     UPNP_DeletePortMapping(s.urls.controlURL, s.data.first.servicetype, port.c_str(), "UDP", nullptr);
   }
   s.mapped = false;
+  s.leased = false;
   if (s.have_urls) {
     FreeUPNPUrls(&s.urls);
     s.have_urls = false;
@@ -99,8 +101,10 @@ void DoMap(Shared& s, uint16_t want) {
   if (UPNP_GetExternalIPAddress(s.urls.controlURL, s.data.first.servicetype, ext) != UPNPCOMMAND_SUCCESS) ext[0] = 0;
   if (!ext[0] && wan[0]) std::snprintf(ext, sizeof ext, "%s", wan);
   const std::string port = std::to_string(want);
+  const std::string lease = std::to_string(kLeaseSeconds);
   int r = UPNP_AddPortMapping(s.urls.controlURL, s.data.first.servicetype, port.c_str(), port.c_str(), lan, kDescription, "UDP",
-                              nullptr, kLease);
+                              nullptr, lease.c_str());
+  const bool leased = r != kOnlyPermanentLeases;
   if (r == kOnlyPermanentLeases)
     r = UPNP_AddPortMapping(s.urls.controlURL, s.data.first.servicetype, port.c_str(), port.c_str(), lan, kDescription, "UDP",
                             nullptr, kPermanent);
@@ -113,6 +117,8 @@ void DoMap(Shared& s, uint16_t want) {
     return;
   }
   s.mapped = true;
+  s.leased = leased;
+  s.mapped_at = std::chrono::steady_clock::now();
   s.mapped_port = want;
   char msg[200];
   if (igd == UPNP_PRIVATEIP_IGD || !ext[0]) {
@@ -134,14 +140,29 @@ void Worker() {
   for (;;) {
     Job j;
     {
-      std::lock_guard<std::mutex> lock(s.mu);
-      if (s.jobs.empty()) {
-        s.worker_running = false;
-        s.cv.notify_all();
-        break;
+      std::unique_lock<std::mutex> lock(s.mu);
+      bool end = false;
+      for (;;) {
+        if (!s.jobs.empty()) {
+          j = s.jobs.front();
+          s.jobs.pop_front();
+          break;
+        }
+        if (!(s.mapped && s.leased)) {  // nothing to renew: the worker ends
+          s.worker_running = false;
+          s.cv.notify_all();
+          end = true;
+          break;
+        }
+        // carry 2f: renew the lease before it runs out (a job arriving first is served first; Enqueue notifies)
+        const auto due = s.mapped_at + std::chrono::milliseconds(RenewDelayMs(kLeaseSeconds));
+        if (std::chrono::steady_clock::now() >= due) {
+          j = Job{false, s.mapped_port};
+          break;
+        }
+        s.cv.wait_until(lock, due);
       }
-      j = s.jobs.front();
-      s.jobs.pop_front();
+      if (end) break;
     }
     if (j.unmap) {
       DeleteMapping(s);
@@ -157,6 +178,7 @@ void Enqueue(const Job& j) {
   Shared& s = S();
   std::lock_guard<std::mutex> lock(s.mu);
   s.jobs.push_back(j);
+  s.cv.notify_all();  // a worker waiting for a lease renewal takes the job now
   if (s.worker_running) return;
   try {
     std::thread(Worker).detach();

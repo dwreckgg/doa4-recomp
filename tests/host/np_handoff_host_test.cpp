@@ -287,7 +287,11 @@ static const NotCarried kSdkNotCarried[] = {
     {"vulkan_validation_enabled", "gpu-backend"},
     {"writable_executable_memory", "unused"},
 };
-static const char* const kPortNotCarried[] = {"doa4_game_files", "doa4_photo_auto", "doa4_photo_dir", "doa4_photo_format", "doa4_user_data"};
+// (Task 9 adds the Online tab's netplay_* settings: each player's own network preferences; the input delay a session
+// uses travels in the hand-off itself, not as a guest setting.)
+static const char* const kPortNotCarried[] = {"doa4_game_files", "doa4_photo_auto", "doa4_photo_dir", "doa4_photo_format", "doa4_user_data",
+                                              "netplay_port", "netplay_delay_auto", "netplay_delay", "netplay_last_join",
+                                              "netplay_show_stats", "netplay_upnp"};
 // the trust class: carried settings whose non-default value weakens a boundary of the PC that applies it
 struct Trusted {
   const char* name;
