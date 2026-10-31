@@ -105,6 +105,39 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+### DOA2U recomp: Wi-Fi media streaming mode (MIT)
+
+DOA2U recomp by Parker Allan, parkerallan/doa2u-recomp, MIT. Upstream: https://github.com/parkerallan/doa2u-recomp.
+`src/net/np_transport.cpp` (`Transport::Impl::WifiOn` / `WifiOff`) is ported from `doa2u/src/nic/nic_net.c`
+(`wlan_no_background_scans`, commit `361dccf`): media streaming mode on every connected Wi-Fi interface while the
+transport runs, so Windows does not scan for other networks and hold outgoing frames. The DOA2U project states that its
+code is MIT ("Project code is MIT", its README, section License) and ships no separate licence file; the MIT
+permission notice is reproduced here with the author's name.
+
+```
+MIT License
+
+Copyright (c) 2026 Parker Allan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Credits
 
 - Tekken 6 online, by Ekspym and mahmoud-mess: the audio and XMA lockstep of the SDK fork this port runs on

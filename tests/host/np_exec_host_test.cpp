@@ -973,12 +973,16 @@ static void TestRealDeadLink() {
 // process working set passes 1 GB, both checked every tick; and a watchdog thread ends the whole run with a FAIL line at
 // 90 s or 1.5 GB, in case one Update never returns. The datagrams GekkoNet sends per frame are printed (maximum and the
 // average over the first and the last 100 frames, per side): traffic that grows without bound shows as a rising count.
-// The same harness with one copy per datagram runs first as the control (a normal link's count).
-// Measured (Task 7): once connected GekkoNet answers every SyncResponse it receives (backend.cpp:955-958, 984-987), so
-// each duplicate becomes a SyncResponse that bounces between the sides for good. Without the 256 cap the queues
-// saturated within the first frames (~1,000 datagrams per frame per side); with it, ~380 per frame (max 768 = 3 Updates
-// x 256), flat from the first 100 frames to the last 100, the working set flat. Bounded, not rising: not the BLOCKED case.
+// The same harness with one copy per datagram runs first as the control (a normal link's count), and a third run replays
+// one captured handshake SyncResponse into side B every 10 frames from frame 100 (the drip; the Task 7 review's probe).
+// Why: once connected GekkoNet answers every SyncResponse it receives (backend.cpp:955-958, 984-987), so a duplicated or
+// replayed one bounces between the sides until a datagram is lost, and each further one adds a chain. Measured before
+// np_gekko's SyncResponse guard: the duplicating link sat at ~380 datagrams per frame per side (the 256-read cap and the
+// queues), the drip grew 5 -> 20 -> 40 per frame (linear in the replays). Pinned with the guard: every run's last-100
+// average <= 4 datagrams per frame per side (the control is 3.00: Inputs, InputAck, SessionHealth), and the drip run's
+// guard dropped replays (positive evidence it acted). The drip goes red if a GekkoNet bump moves SyncResponse off byte 0 = 5.
 constexpr int kDupFrames = 600;
+constexpr double kMaxPerFrame = 4.0;  // datagrams per frame per side, last-100 average (the review's pin)
 constexpr size_t kDupQueue = 1024;
 constexpr long long kDupTimeLimitMs = 60'000;
 constexpr size_t kDupMemLimit = size_t(1) << 30;  // 1 GB
@@ -990,7 +994,9 @@ static size_t WorkingSet() {
 }
 
 // copies = 2: the duplicating link; copies = 1: the same harness as a control (a normal link's traffic per frame).
-static void RunBoundedLink(int copies, const char* label) {
+// drip_every > 0: from side A's frame 100, one copy of the first SyncResponse A sent (captured in the handshake) is put
+// in B's queue every drip_every of A's frames.
+static void RunBoundedLink(int copies, const char* label, int drip_every = 0) {
   std::atomic<bool> group_done{false};
   const auto t0 = std::chrono::steady_clock::now();
   std::thread guard([&] {  // the backstop: an Update that never returns, or memory that grows inside one call
@@ -1011,6 +1017,8 @@ static void RunBoundedLink(int copies, const char* label) {
   int sent[2] = {0, 0}, delivered[2] = {0, 0}, dropped_full[2] = {0, 0};
   int cur[2] = {0, 0};
   std::vector<int> per_frame[2];  // datagrams side s sent during each of its frames
+  Bytes captured_sr;              // the first SyncResponse side A sent (byte 0 = 5, GekkoNet net.h:27-33)
+  int drips = 0, next_drip = 100;
   for (int s = 0; s < 2; ++s) {
     gekko::Config cfg;
     cfg.num_players = 2;
@@ -1021,6 +1029,7 @@ static void RunBoundedLink(int copies, const char* label) {
         [&, s](std::span<const uint8_t> payload) {
           ++sent[s];
           ++cur[s];
+          if (s == 0 && captured_sr.empty() && !payload.empty() && payload[0] == 5) captured_sr.assign(payload.begin(), payload.end());
           for (int copy = 0; copy < copies; ++copy) {
             if (q[1 - s].size() >= kDupQueue) {
               ++dropped_full[1 - s];
@@ -1050,6 +1059,11 @@ static void RunBoundedLink(int copies, const char* label) {
         per_frame[s].push_back(cur[s]);
         cur[s] = 0;
       }
+    if (drip_every > 0 && !captured_sr.empty() && r.side[0].advances >= next_drip && q[1].size() < kDupQueue) {
+      q[1].push_back(captured_sr);
+      ++drips;
+      next_drip += drip_every;
+    }
     elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     const size_t ws = WorkingSet();
     ws_max = std::max(ws_max, ws);
@@ -1087,14 +1101,26 @@ static void RunBoundedLink(int copies, const char* label) {
     const size_t m = std::min<size_t>(100, f.size());
     for (size_t i = 0; i < m; ++i) first100 += f[i];
     if (m) first100 /= double(m);
+    const uint32_t guard_drops = r.side[s].session.sync_responses_dropped();
     std::printf("info: %s side %d: %d advances, %d datagrams sent, %d delivered to it, %d dropped (queue full), queue "
-                "max %zu; datagrams per frame: max %d, first-100 average %.2f, last-100 average %.2f\n",
-                label, s, r.side[s].advances, sent[s], delivered[s], dropped_full[s], q_max[s], mx, first100, last100);
+                "max %zu; datagrams per frame: max %d, first-100 average %.2f, last-100 average %.2f; SyncResponses dropped by "
+                "the guard %u\n",
+                label, s, r.side[s].advances, sent[s], delivered[s], dropped_full[s], q_max[s], mx, first100, last100, guard_drops);
+    CHECKF(n == 100 && last100 <= kMaxPerFrame, "%s side %d: last-100 average %.2f datagrams per frame (pin <= %.0f; %zu frames)",
+           label, s, last100, kMaxPerFrame, n);
+    if (copies == 1 && drip_every == 0)
+      CHECKF(guard_drops == 0, "%s side %d: the guard dropped %u SyncResponses on a clean link", label, s, guard_drops);
     CHECKF(r.side[s].advances >= kDupFrames, "%s side %d: %d advances (expected %d)", label, s, r.side[s].advances, kDupFrames);
     CHECKF(r.side[s].desyncs.empty(), "%s side %d: %zu DesyncDetected events", label, s, r.side[s].desyncs.size());
     CHECKF(!r.side[s].step_ended, "%s side %d: the executor ended the session", label, s);
     CHECKF(r.side[s].disconnects == 0, "%s side %d: %d kDisconnected events", label, s, r.side[s].disconnects);
     CHECKF(q_max[s] <= kDupQueue, "%s side %d: queue reached %zu (bound %zu)", label, s, q_max[s], kDupQueue);
+  }
+  if (drip_every > 0) {
+    // Fixture: the replays happened (50 from frame 100 to 600 at one per 10) and the guard is what kept the count flat.
+    CHECKF(!captured_sr.empty() && drips >= 45, "%s: %d SyncResponses replayed (captured %zu bytes)", label, drips, captured_sr.size());
+    CHECKF(r.side[1].session.sync_responses_dropped() > 0, "%s: the guard on B dropped no replayed SyncResponse", label);
+    std::printf("info: %s: %d replayed\n", label, drips);
   }
   // The frames both sides ran carry the same inputs, in order, and the pattern each side added (CommonChecks).
   r.link.sent[0] = sent[0];
@@ -1106,6 +1132,63 @@ static void TestRealDuplicatingLink() {
   Group("real GekkoNet, every datagram delivered twice through bounded queues, 600 frames (and a single-copy control)");
   RunBoundedLink(1, "single-copy link (control)");
   RunBoundedLink(2, "duplicating link");
+  RunBoundedLink(1, "SyncResponse drip (1 per 10 frames)", 10);
+}
+
+// The guard leaves the handshake to GekkoNet (it acts only after this side's kStarted), so handshakes over a lossy link
+// still finish: 12 seeded runs at 10% loss each way, wall clock (GekkoNet resends the handshake every 200 ms,
+// backend.cpp:375-381). The review measured 12/12 with the guard, mean 559 ms, max 1081 (unguarded: mean 565, max 1330).
+// Watchdog: each run gives up after 5 s (FAIL), the whole group after 12 x 5 s.
+static void TestRealHandshakeLoss() {
+  Group("real GekkoNet, handshakes at 10% loss with the SyncResponse guard, 12 runs");
+  int finished = 0;
+  long long sum_ms = 0, max_ms = 0;
+  for (uint32_t seed = 1; seed <= 12; ++seed) {
+    PairResult r;
+    std::deque<Bytes> q[2];
+    uint32_t rng = seed * 2654435761u;
+    auto lose = [&rng] {  // 10% loss, xorshift32
+      rng ^= rng << 13;
+      rng ^= rng >> 17;
+      rng ^= rng << 5;
+      return rng % 100 < 10;
+    };
+    for (int s = 0; s < 2; ++s) {
+      gekko::Config cfg;
+      cfg.num_players = 2;
+      cfg.local_slot = s;
+      cfg.delay = kDelay;
+      CHECK(r.side[s].session.Create(
+          cfg,
+          [&, s](std::span<const uint8_t> p) {
+            if (!lose() && q[1 - s].size() < kDupQueue) q[1 - s].emplace_back(p.begin(), p.end());
+          },
+          [&, s](Bytes* out) {
+            if (q[s].empty()) return false;
+            *out = std::move(q[s].front());
+            q[s].pop_front();
+            return true;
+          }));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    long long ms = 0;
+    bool both = false;
+    for (r.ticks = 0; !both && ms < 5000; ++r.ticks) {
+      StepSide(r, 0, true);
+      StepSide(r, 1, true);
+      both = r.side[0].started && r.side[1].started;
+      ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      if (!both) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (both) {
+      ++finished;
+      sum_ms += ms;
+      max_ms = std::max(max_ms, ms);
+    }
+    CHECKF(both, "seed %u: the handshake at 10%% loss did not finish in 5 s", seed);
+  }
+  std::printf("info: handshakes at 10%% loss: %d of 12 finished, mean %lld ms, max %lld ms\n", finished,
+              finished ? sum_ms / finished : 0, max_ms);
 }
 
 int main(int argc, char** argv) {
@@ -1130,6 +1213,7 @@ int main(int argc, char** argv) {
   TestRealEventsBatched();
   TestRealDeadLink();
   TestRealDuplicatingLink();
+  TestRealHandshakeLoss();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

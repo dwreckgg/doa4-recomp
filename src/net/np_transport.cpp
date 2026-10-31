@@ -8,10 +8,14 @@
 // answers are parsed by rules::StunMapped (the codec of Task 3).
 #include "np_transport.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX  // std::min / std::max below; windows.h's macros must not see them, whatever the build defines
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <windows.h>
+#include <wlanapi.h>  // types only: wlanapi.dll is loaded at run time (Config::wifi_streaming), nothing is linked
 
 #include <algorithm>
 #include <array>
@@ -35,7 +39,7 @@ namespace doa4::np::net {
 namespace sim {
 
 bool Parse(std::string_view text, Params* out) {
-  uint32_t v[3] = {0, 0, 0};
+  std::array<uint32_t, 3> v = {0, 0, 0};
   size_t field = 0, digits = 0;
   for (size_t i = 0; i <= text.size(); ++i) {
     if (i == text.size() || text[i] == ',') {
@@ -45,11 +49,36 @@ bool Parse(std::string_view text, Params* out) {
       continue;
     }
     const char c = text[i];
-    if (c < '0' || c > '9' || ++digits > 5) return false;
+    // field >= 3: a digit of a fourth field (review I-1: the write below ran past the array before the comma check)
+    if (c < '0' || c > '9' || field >= 3 || ++digits > 5) return false;
     v[field] = v[field] * 10 + uint32_t(c - '0');
   }
   if (field != 3 || v[0] > 10000 || v[1] > 10000 || v[2] > 100) return false;
   if (out) *out = Params{v[0], v[1], v[2]};
+  return true;
+}
+
+bool ParseDrop(std::string_view text, std::vector<uint32_t>* out) {
+  std::vector<uint32_t> ks;
+  if (!text.empty()) {
+    uint32_t k = 0;
+    size_t digits = 0;
+    for (size_t i = 0; i <= text.size(); ++i) {
+      if (i == text.size() || text[i] == ',') {
+        if (digits == 0 || ks.size() >= 64) return false;
+        ks.push_back(k);
+        k = 0;
+        digits = 0;
+        continue;
+      }
+      const char c = text[i];
+      if (c < '0' || c > '9' || ++digits > 9) return false;
+      k = k * 10 + uint32_t(c - '0');
+    }
+  }
+  std::sort(ks.begin(), ks.end());
+  ks.erase(std::unique(ks.begin(), ks.end()), ks.end());
+  if (out) *out = std::move(ks);
   return true;
 }
 
@@ -150,6 +179,7 @@ void ResolveServers(std::shared_ptr<Resolve> res, std::vector<std::string> names
 struct Transport::Impl {
   Transport* owner = nullptr;
   Config config;
+  mutable std::mutex log_mu;  // every call of `log` holds it; Stop clears `log` under it (no call after Stop returns)
   Log log;
   sim::Params sim;
   bool sim_on = false;
@@ -199,10 +229,16 @@ struct Transport::Impl {
   rules::Nat logged_nat = rules::Nat::kNoAnswer;
   std::optional<rules::Endpoint> logged_mapped;
   int64_t next_tick_us = 0;  // on_tick runs at the first loop at or after this
+  uint64_t gekko_out = 0;    // kGekko datagrams drained so far: the index Config::sim_drop counts
+  HANDLE wlan = nullptr;     // the WLAN client handle while media streaming mode is held (Config::wifi_streaming)
+  void* wlan_close = nullptr;  // WlanCloseHandle, from wlanapi.dll
 
   void Log(const std::string& line) const {
+    std::lock_guard<std::mutex> lock(log_mu);
     if (log) log(line);
   }
+  void WifiOn();
+  void WifiOff();
   uint32_t NowMs() const {
     return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
   }
@@ -268,6 +304,7 @@ struct Transport::Impl {
 void Transport::Impl::Run() {
   io_tid = GetCurrentThreadId();
   Log("[doa4][NET] transport started on port " + std::to_string(port.load()));
+  if (config.wifi_streaming) WifiOn();
   std::vector<uint8_t> buf(kRecvBuffer);
   HANDLE waits[3] = {sock_event, wake, timer};
   const DWORD n_waits = timer ? 3 : 2;
@@ -297,6 +334,50 @@ void Transport::Impl::Run() {
       if (owner->on_tick) owner->on_tick(uint32_t(now_us / 1000));
     }
   }
+  WifiOff();  // the mode ends with the handle (Stop joins this thread before it returns)
+}
+
+// ---- Wi-Fi media streaming mode: DOA2U recomp by Parker Allan (parkerallan/doa2u-recomp, MIT), nic_net.c 277-302
+// (wlan_no_background_scans, commit 361dccf), with the handle closed at the end instead of kept for the process. ----
+void Transport::Impl::WifiOn() {
+  int32_t set = 0;
+  HMODULE m = LoadLibraryW(L"wlanapi.dll");  // kept loaded: WLAN may hold threads of its own in the process
+  using OpenFn = DWORD(WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
+  using EnumFn = DWORD(WINAPI*)(HANDLE, PVOID, PWLAN_INTERFACE_INFO_LIST*);
+  using SetFn = DWORD(WINAPI*)(HANDLE, const GUID*, WLAN_INTF_OPCODE, DWORD, const VOID*, PVOID);
+  using FreeFn = VOID(WINAPI*)(PVOID);
+  OpenFn open = m ? reinterpret_cast<OpenFn>(GetProcAddress(m, "WlanOpenHandle")) : nullptr;
+  EnumFn enumi = m ? reinterpret_cast<EnumFn>(GetProcAddress(m, "WlanEnumInterfaces")) : nullptr;
+  SetFn seti = m ? reinterpret_cast<SetFn>(GetProcAddress(m, "WlanSetInterface")) : nullptr;
+  FreeFn freem = m ? reinterpret_cast<FreeFn>(GetProcAddress(m, "WlanFreeMemory")) : nullptr;
+  wlan_close = m ? reinterpret_cast<void*>(GetProcAddress(m, "WlanCloseHandle")) : nullptr;
+  DWORD ver = 0;
+  if (open && enumi && seti && freem && wlan_close && open(2, nullptr, &ver, &wlan) == ERROR_SUCCESS) {
+    PWLAN_INTERFACE_INFO_LIST list = nullptr;
+    if (enumi(wlan, nullptr, &list) == ERROR_SUCCESS && list) {
+      BOOL on = TRUE;
+      for (DWORD i = 0; i < list->dwNumberOfItems; ++i) {
+        if (list->InterfaceInfo[i].isState != wlan_interface_state_connected) continue;
+        if (seti(wlan, &list->InterfaceInfo[i].InterfaceGuid, wlan_intf_opcode_media_streaming_mode, sizeof on, &on,
+                 nullptr) == ERROR_SUCCESS)
+          ++set;
+      }
+      freem(list);
+    }
+  } else {
+    wlan = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(stats_mu);
+    st.wifi_interfaces = set;
+  }
+  Log("[doa4][NET] Wi-Fi media streaming mode (background scans off) on " + std::to_string(set) + " interface(s)" +
+      (m ? "" : "; wlanapi.dll not available"));
+}
+
+void Transport::Impl::WifiOff() {
+  if (wlan && wlan_close) reinterpret_cast<DWORD(WINAPI*)(HANDLE, PVOID)>(wlan_close)(wlan, nullptr);
+  wlan = nullptr;
 }
 
 void Transport::Impl::ReceiveAll(std::vector<uint8_t>& buf) {
@@ -368,6 +449,16 @@ void Transport::Impl::DrainOutbound() {
     if (!has) continue;  // no peer: discarded
     std::vector<uint8_t> d = wire::Encode(wire::Type::kGekko, tok, p);
     if (d.empty()) continue;  // too long for one datagram: discarded
+    const uint64_t k = gekko_out++;
+    if (!config.sim_drop.empty() && std::binary_search(config.sim_drop.begin(), config.sim_drop.end(), k)) {
+      {
+        std::lock_guard<std::mutex> lock(stats_mu);
+        ++st.sim_drop_hits;
+      }
+      Log("[doa4][NET] sim_drop: kGekko datagram " + std::to_string(k) + " dropped (GekkoNet packet type " +
+          std::to_string(p.empty() ? -1 : int(p[0])) + ")");
+      continue;
+    }
     SendOut(addr, std::move(d));
   }
 }
@@ -485,7 +576,11 @@ bool Transport::Start(const Config& config, Log log, std::string* error) {
   }
   if (!m.wake || !m.arrived) return fail("could not create the transport's events");
   m.config = config;
-  m.log = std::move(log);
+  std::sort(m.config.sim_drop.begin(), m.config.sim_drop.end());  // DrainOutbound binary-searches it
+  {
+    std::lock_guard<std::mutex> lock(m.log_mu);
+    m.log = std::move(log);
+  }
   m.sim_on = false;
   if (!config.sim.empty()) {
     if (!sim::Parse(config.sim, &m.sim)) return fail("bad DOA4_NP_SIM \"" + config.sim + "\" (expected delay_ms,jitter_ms,loss_pct)");
@@ -584,6 +679,8 @@ void Transport::Stop() {
   m.io_tid = 0;  // a later thread that reuses the id is not the I/O thread
   m.Close();
   m.running = false;
+  std::lock_guard<std::mutex> lock(m.log_mu);  // waits for a WARN line in progress on another thread
+  m.log = nullptr;                              // review M-3: the sink is never called once Stop returns
 }
 
 uint16_t Transport::port() const { return impl_->port.load(); }

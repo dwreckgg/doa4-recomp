@@ -42,7 +42,18 @@ struct Config {
   bool lan_broadcast = true;         // off with loopback
   std::string sim;                   // DOA4_NP_SIM "delay_ms,jitter_ms,loss_pct" (test switch); "" = off
   uint32_t sim_seed = 1;
+  // DOA4_NP_SIM_DROP "k1,k2,..." (test switch, sim::ParseDrop; the app reads it only with DOA4_NP_TEST_DIR, like the
+  // other switches): the 0-based indices, among the kGekko datagrams this transport sends, of those to drop. Applied when
+  // the I/O thread drains the outbound ring, before the random simulator (a dropped one takes no draw); each drop is
+  // counted (sim_drop_hits) and logged with the GekkoNet packet type (the payload's first byte). Empty = none.
+  std::vector<uint32_t> sim_drop;
   uint32_t stun_refresh_ms = 15000;  // R20: binding refresh once answered; host tests pass 300
+  // Wi-Fi media streaming mode while the transport runs (no background scans: on Wi-Fi they hold outgoing frames for
+  // ~2 s about once a minute). Ported from DOA2U recomp by Parker Allan (parkerallan/doa2u-recomp, MIT): nic_net.c
+  // wlan_no_background_scans. wlanapi.dll is loaded at run time; the I/O thread sets the mode on every connected
+  // interface as it starts, logs one line with the number set, and closes the WLAN handle as it ends (Stop), which
+  // releases the mode. Off by default: the session process turns it on (Task 9/12); offline nothing calls WLAN.
+  bool wifi_streaming = false;
 };
 
 struct Stats {
@@ -50,9 +61,11 @@ struct Stats {
   uint32_t queue_full = 0;        // kGekko payloads lost to a full ring: PushGekko refused, or an arriving one dropped
   uint32_t wrong_thread = 0;      // socket calls attempted off the I/O thread (each also logs a WARN line)
   uint32_t sim_dropped = 0, sim_delayed = 0;
+  uint32_t sim_drop_hits = 0;     // kGekko datagrams dropped by Config::sim_drop
   rules::Nat nat = rules::Nat::kNoAnswer;
   std::optional<rules::Endpoint> mapped;  // this socket as the first STUN server sees it
   uint32_t stun_answers = 0;
+  int32_t wifi_interfaces = -1;   // Wi-Fi interfaces put in media streaming mode; -1 = not asked (flag off or not yet)
 };
 
 // The network simulator (DOA4_NP_SIM, a test switch). It sits on the I/O thread's send path: every datagram the
@@ -72,6 +85,9 @@ struct Decision {
 };
 // Pure: the fate of draw n under (params, seed). Loss is drawn as (hash % 100) < loss_pct.
 Decision Decide(const Params& params, uint32_t seed, uint64_t n);
+// DOA4_NP_SIM_DROP: "k1,k2,..." - unsigned decimal indices (at most 9 digits each, at most 64 of them), sorted and
+// without repeats in *out. "" is valid (no drops). False (and *out left as it was) for anything else.
+bool ParseDrop(std::string_view text, std::vector<uint32_t>* out);
 }  // namespace sim
 
 class Transport {
@@ -87,11 +103,12 @@ class Transport {
   // Binds, then starts the I/O thread. The bind tries config.port, then (unless exact_port) the next ports up to
   // kPortBase + kPorts - 1, then any free port; exact_port refuses anything but config.port, and the error names it.
   // A Transport starts once: a second Start (running or stopped) fails. on_packet / on_tick are set before Start.
-  // The log function is called on the I/O thread, and on any thread that breaks the thread rule (its WARN line).
-  // Whatever log, on_packet and on_tick reach must outlive the I/O thread, i.e. Stop() or ~Transport: the first line is
-  // logged by the thread as it starts, after Start has returned.
+  // The log function is called on the I/O thread, and on any thread that breaks the thread rule (its WARN line), one
+  // call at a time (under a mutex: it must not call back into the transport). It is never called once Stop has
+  // returned. Whatever log, on_packet and on_tick reach must outlive the I/O thread, i.e. Stop() or ~Transport: the
+  // first line is logged by the thread as it starts, after Start has returned.
   bool Start(const Config& config, Log log, std::string* error);
-  void Stop();                       // closes the socket and joins the thread; returns within 200 ms
+  void Stop();                       // closes the socket and joins the thread; returns within 200 ms; drops the log
   uint16_t port() const;             // the bound port (0 before Start)
   Path path() const { return Path::kDirect; }
 

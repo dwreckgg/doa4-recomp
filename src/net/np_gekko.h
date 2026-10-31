@@ -30,6 +30,8 @@ class Session {
   // second add for the same frame (input.cpp:50-65): the delay is GekkoNet's, never the caller's (ruling F4).
   void AddLocalInput(const Pad& pad);
   uint32_t local_inputs_added() const;             // calls of AddLocalInput so far (Task 11's once-per-frame check)
+  // Incoming GekkoNet SyncResponses dropped by the guard (after kStarted, at most one per 200 ms is passed: np_gekko.cpp).
+  uint32_t sync_responses_dropped() const;
   std::vector<exec::Event> Update();               // one gekko_update_session, converted
   std::vector<SessionEvent> TakeSessionEvents();   // since the last call
   float FramesAhead();

@@ -486,8 +486,25 @@ static void TestDeliveryAndFilters() {
 // Ports
 // =====================================================================================================
 
+// Review M-5: two copies of this suite at once would race for the same P. The ports group (the only one on fixed ports;
+// every other group binds port 0) holds a named mutex of the user's session while it runs, so a second copy waits.
+struct PortsLock {
+  HANDLE h = CreateMutexW(nullptr, FALSE, L"Local\\doa4_np_transport_test_ports");
+  bool held = false;
+  PortsLock() {
+    const DWORD w = h ? WaitForSingleObject(h, 120000) : WAIT_FAILED;
+    held = w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
+  }
+  ~PortsLock() {
+    if (held) ReleaseMutex(h);
+    if (h) CloseHandle(h);
+  }
+};
+
 static void TestPorts() {
   Group("transport, ports: preferred, next, exact");
+  PortsLock lock;
+  CHECKF(lock.held, "the ports mutex was not taken within 120 s");
   // P comes from INSIDE the range with its lower neighbour free too (P - 1, P, P + 1 all free), so a fallback that
   // wrongly restarted at kPortBase (DOA2U goes on from P + 1, netplay.c:323-327) lands on P - 1, not P + 1 (T2.2).
   // 7215 stays out of the choice: the any-port case below uses it.
@@ -651,6 +668,18 @@ static void TestWrongThread() {
 // STUN with fake servers on loopback
 // =====================================================================================================
 
+// A STUN binding success for transaction `tid` (12 bytes) carrying `e` as its XOR-MAPPED-ADDRESS.
+static Bytes StunSuccess(const uint8_t* tid, const rules::Endpoint& e) {
+  Bytes r = {0x01, 0x01, 0x00, 0x0C, 0x21, 0x12, 0xA4, 0x42};
+  r.insert(r.end(), tid, tid + 12);
+  const uint16_t xp = uint16_t(e.port ^ 0x2112);
+  const uint8_t ck[4] = {0x21, 0x12, 0xA4, 0x42};
+  Bytes attr = {0x00, 0x20, 0x00, 0x08, 0x00, 0x01, uint8_t(xp >> 8), uint8_t(xp)};
+  for (int i = 0; i < 4; ++i) attr.push_back(uint8_t(e.ip[size_t(i)] ^ ck[i]));
+  r.insert(r.end(), attr.begin(), attr.end());
+  return r;
+}
+
 struct FakeStun {
   Udp sock;
   rules::Endpoint answer;  // the XOR-MAPPED-ADDRESS it reports
@@ -658,8 +687,9 @@ struct FakeStun {
   bool silent = false;     // never answers
   std::atomic<bool> stop{false};
   std::mutex mu;
-  std::vector<int64_t> req_us;  // when each binding request arrived
-  int answers = 0;              // answers sent
+  std::vector<int64_t> req_us;          // when each binding request arrived
+  std::array<uint8_t, 12> last_tid{};   // the transaction id of the last request
+  int answers = 0;                      // answers sent
   std::thread th;
   void Begin() {
     th = std::thread([this] {
@@ -673,16 +703,11 @@ struct FakeStun {
         {
           std::lock_guard<std::mutex> lock(mu);
           req_us.push_back(t);
+          std::copy(d.begin() + 8, d.begin() + 20, last_tid.begin());
           n = int(req_us.size());
         }
         if (silent || n <= ignore_first) continue;
-        Bytes r = {0x01, 0x01, 0x00, 0x0C, 0x21, 0x12, 0xA4, 0x42};
-        r.insert(r.end(), d.begin() + 8, d.begin() + 20);
-        const uint16_t xp = uint16_t(answer.port ^ 0x2112);
-        const uint8_t ck[4] = {0x21, 0x12, 0xA4, 0x42};
-        Bytes attr = {0x00, 0x20, 0x00, 0x08, 0x00, 0x01, uint8_t(xp >> 8), uint8_t(xp)};
-        for (int i = 0; i < 4; ++i) attr.push_back(uint8_t(answer.ip[size_t(i)] ^ ck[i]));
-        r.insert(r.end(), attr.begin(), attr.end());
+        const Bytes r = StunSuccess(d.data() + 8, answer);
         if (sock.SendTo(from, r) == int(r.size())) {
           std::lock_guard<std::mutex> lock(mu);
           ++answers;
@@ -701,6 +726,10 @@ struct FakeStun {
   int Answers() {
     std::lock_guard<std::mutex> lock(mu);
     return answers;
+  }
+  std::array<uint8_t, 12> LastTid() {
+    std::lock_guard<std::mutex> lock(mu);
+    return last_tid;
   }
   ~FakeStun() { End(); }
 };
@@ -944,6 +973,287 @@ static void TestSimTransport() {
   CHECK(sb.sim_dropped == 0 && sb.sim_delayed == 0 && SumDropped(sb) == 0);  // B runs no simulator
 }
 
+// The deterministic drop option (Config::sim_drop, DOA4_NP_SIM_DROP; research item 5): the parser, then exactly the
+// listed kGekko datagrams are dropped, counted and logged with their GekkoNet packet type, and a dropped one takes no
+// draw of the random simulator.
+static void TestSimDrop() {
+  Group("simulator, deterministic drops (sim_drop)");
+  std::vector<uint32_t> ks = {99};
+  CHECK(net::sim::ParseDrop("", &ks) && ks.empty());
+  CHECK(net::sim::ParseDrop("5", &ks) && ks == std::vector<uint32_t>({5}));
+  CHECK(net::sim::ParseDrop("7,3,7,0", &ks) && ks == std::vector<uint32_t>({0, 3, 7}));
+  CHECK(net::sim::ParseDrop("999999999", &ks) && ks == std::vector<uint32_t>({999999999}));
+  std::string sixty_four;
+  for (int i = 0; i < 64; ++i) sixty_four += (i ? "," : "") + std::to_string(i);
+  const std::string sixty_five = sixty_four + ",64";
+  CHECK(net::sim::ParseDrop(sixty_four, &ks) && ks.size() == 64);
+  for (const char* bad : {"1,,2", "a", "1,2,", ",1", " 1", "1 ", "-1", "1000000000"}) {
+    std::vector<uint32_t> keep = {42};
+    CHECKF(!net::sim::ParseDrop(bad, &keep) && keep == std::vector<uint32_t>({42}), "ParseDrop accepted \"%s\"", bad);
+  }
+  {
+    std::vector<uint32_t> keep = {42};
+    CHECK(!net::sim::ParseDrop(sixty_five, &keep) && keep.size() == 1);
+  }
+  // Drops only: payloads 3 and 10 of 20 never arrive, nothing else is missing; the log names each with its type byte.
+  {
+    Pair p;
+    net::Config ca = LoopCfg();
+    ca.sim_drop = {10, 3};  // unsorted on purpose: Start sorts it
+    CHECK(p.Start(ca, LoopCfg()));
+    p.a.SetPeer(Loop(p.b.port()), kToken);
+    p.b.SetPeer(Loop(p.a.port()), kToken);
+    std::set<uint32_t> got;
+    for (uint32_t i = 0; i < 20; ++i) CHECK(PushRetry(p.a, Payload(i, 12)));
+    const int64_t until = NowUs() + 1'000'000;
+    while (got.size() < 18 && NowUs() < until) {
+      Bytes b;
+      while (p.b.PopGekko(&b)) got.insert(SeqOf(b));
+      SleepMs(2);
+    }
+    SleepMs(100);
+    Bytes b;
+    while (p.b.PopGekko(&b)) got.insert(SeqOf(b));
+    std::set<uint32_t> want;
+    for (uint32_t i = 0; i < 20; ++i)
+      if (i != 3 && i != 10) want.insert(i);
+    CHECKF(got == want, "delivered %zu payloads; expected all of 0..19 but 3 and 10", got.size());
+    CHECK(p.a.stats().sim_drop_hits == 2);
+    CHECK(p.la.CountExact("[doa4][NET] sim_drop: kGekko datagram 3 dropped (GekkoNet packet type 3)") == 1);
+    CHECK(p.la.CountExact("[doa4][NET] sim_drop: kGekko datagram 10 dropped (GekkoNet packet type 10)") == 1);
+    CHECK(p.a.stats().sim_dropped == 0 && p.a.stats().sim_delayed == 0);  // the random simulator is off
+  }
+  // With the random simulator on: draw d is taken only by the datagrams sim_drop let through.
+  {
+    Pair p;
+    net::Config ca = LoopCfg();
+    ca.sim = "5,0,50";
+    ca.sim_seed = 7;
+    ca.sim_drop = {0, 5};
+    CHECK(p.Start(ca, LoopCfg()));
+    p.a.SetPeer(Loop(p.b.port()), kToken);
+    p.b.SetPeer(Loop(p.a.port()), kToken);
+    net::sim::Params sp;
+    net::sim::Parse("5,0,50", &sp);
+    std::set<uint32_t> want;
+    uint64_t draw = 0;
+    for (uint32_t i = 0; i < 40; ++i) {
+      if (i == 0 || i == 5) continue;
+      if (!net::sim::Decide(sp, 7, draw++).drop) want.insert(i);
+    }
+    for (uint32_t i = 0; i < 40; ++i) CHECK(PushRetry(p.a, Payload(i, 12)));
+    SleepMs(300);
+    std::set<uint32_t> got;
+    Bytes b;
+    while (p.b.PopGekko(&b)) got.insert(SeqOf(b));
+    CHECKF(got == want, "with sim 5,0,50: delivered %zu, expected %zu (draws skip the dropped datagrams)", got.size(), want.size());
+    const net::Stats sa = p.a.stats();
+    CHECKF(sa.sim_drop_hits == 2 && sa.sim_dropped + sa.sim_delayed == 38, "hits %u, sim dropped %u delayed %u", sa.sim_drop_hits,
+           sa.sim_dropped, sa.sim_delayed);
+  }
+}
+
+// Review I-3(a): a binding success is taken only from a configured STUN server. A second socket sends a well-formed
+// success with the CURRENT transaction id (copied from the fake's last request; the refresh is 60 s, so it stays
+// current); it must change nothing and count as kMagic. Positive control: the same bytes from the server's own socket
+// are taken (so the rogue datagram was a valid answer in everything but its source).
+static void TestStunSource() {
+  Group("transport, STUN answers only from a configured server");
+  FakeStun f1, f2;
+  f1.answer = f2.answer = Pub(51234);
+  f1.Begin();
+  f2.Begin();
+  LogSink l;
+  net::Transport t;
+  net::Config c = LoopCfg();
+  c.stun = true;
+  c.stun_servers = {"127.0.0.1:" + std::to_string(f1.sock.port), "127.0.0.1:" + std::to_string(f2.sock.port)};
+  c.stun_refresh_ms = 60000;
+  std::string e;
+  CHECKF(t.Start(c, l.Fn(), &e), "start: %s", e.c_str());
+  for (int i = 0; i < 400 && t.stats().nat != rules::Nat::kCone; ++i) SleepMs(5);
+  SleepMs(50);
+  f1.End();  // its socket is now the test's (no more answers), and the transaction id stays the current one
+  f2.End();
+  const net::Stats before = t.stats();
+  CHECK(before.nat == rules::Nat::kCone && before.mapped && *before.mapped == Pub(51234) && before.stun_answers == 2);
+  const std::array<uint8_t, 12> tid = f1.LastTid();
+  CHECK(tid == f2.LastTid());  // one round, one transaction id
+  const Bytes rogue_answer = StunSuccess(tid.data(), Pub(40404));
+  Udp rogue;
+  rogue.SendTo(t.port(), rogue_answer);
+  SleepMs(150);
+  const net::Stats after = t.stats();
+  CHECKF(after.stun_answers == before.stun_answers, "an answer from a non-server socket was counted (%u -> %u)", before.stun_answers,
+         after.stun_answers);
+  CHECKF(after.nat == rules::Nat::kCone && after.mapped && *after.mapped == Pub(51234), "the rogue answer changed nat %d / mapped",
+         int(after.nat));
+  CHECKF(after.dropped[size_t(wire::Drop::kMagic)] == before.dropped[size_t(wire::Drop::kMagic)] + 1, "kMagic %u -> %u",
+         before.dropped[size_t(wire::Drop::kMagic)], after.dropped[size_t(wire::Drop::kMagic)]);
+  f1.sock.SendTo(t.port(), rogue_answer);  // the positive control: from server 1's own address
+  SleepMs(150);
+  const net::Stats ctl = t.stats();
+  CHECKF(ctl.stun_answers == before.stun_answers + 1 && ctl.nat == rules::Nat::kSymmetric, "control from the server: answers %u, nat %d",
+         ctl.stun_answers, int(ctl.nat));
+  CHECK(ctl.mapped && *ctl.mapped == Pub(40404));  // server 1 is the first configured: its answer is `mapped`
+  t.Stop();
+}
+
+// Review I-3(b): the transport takes its port exclusively (SO_EXCLUSIVEADDRUSE). Without it Windows lets a later
+// socket that sets SO_REUSEADDR bind the same address and port, and that socket then receives the transport's datagrams.
+static SOCKET ReuseBind(uint16_t port, int* err) {
+  SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  BOOL on = TRUE;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on), sizeof on);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  a.sin_port = htons(port);
+  if (bind(s, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+    *err = WSAGetLastError();
+    closesocket(s);
+    return INVALID_SOCKET;
+  }
+  *err = 0;
+  return s;
+}
+
+static void TestExclusiveBind() {
+  Group("transport, the port is taken exclusively");
+  {
+    LogSink l;
+    net::Transport t;
+    std::string e;
+    CHECK(t.Start(LoopCfg(0), l.Fn(), &e));
+    int err = 0;
+    SOCKET hijack = ReuseBind(t.port(), &err);
+    CHECKF(hijack == INVALID_SOCKET, "a SO_REUSEADDR socket bound the transport's 127.0.0.1:%u", t.port());
+    std::printf("info: exclusive: a reusing bind after the transport failed with %d\n", err);
+    if (hijack != INVALID_SOCKET) closesocket(hijack);
+    t.Stop();
+  }
+  {  // the other order: a reusing socket holds the port, an exact-port transport refuses it
+    int err = 0;
+    SOCKET holder = ReuseBind(0, &err);
+    CHECK(holder != INVALID_SOCKET);
+    sockaddr_in a{};
+    int l = sizeof a;
+    getsockname(holder, reinterpret_cast<sockaddr*>(&a), &l);
+    const uint16_t q = ntohs(a.sin_port);
+    LogSink ls;
+    net::Transport t;
+    net::Config c = LoopCfg(q);
+    c.exact_port = true;
+    std::string e;
+    CHECKF(!t.Start(c, ls.Fn(), &e), "an exact-port transport took 127.0.0.1:%u from a socket that holds it", q);
+    std::printf("info: exclusive: exact %u under a reusing holder: \"%s\"\n", q, e.c_str());
+    closesocket(holder);
+  }
+}
+
+// Review I-3(c): PushGekko refused on a full outbound ring counts queue_full. The I/O thread is held inside on_tick
+// (bounded wait) so it cannot drain: 1,024 pushes fit, the 1,025th is refused and counted.
+static void TestOutboundQueueFull() {
+  Group("transport, outbound ring full");
+  LogSink l;
+  HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr), release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::atomic<int> hold{0};
+  net::Transport t;
+  t.on_tick = [&](uint32_t) {
+    if (hold.exchange(0)) {
+      SetEvent(entered);
+      WaitForSingleObject(release, 5000);
+    }
+  };
+  std::string e;
+  CHECK(t.Start(LoopCfg(), l.Fn(), &e));
+  hold = 1;
+  CHECK(WaitForSingleObject(entered, 2000) == WAIT_OBJECT_0);
+  int accepted = 0;
+  for (uint32_t i = 0; i < net::Transport::kGekkoQueue; ++i) accepted += t.PushGekko(Payload(i, 8)) ? 1 : 0;
+  const bool refused = !t.PushGekko(Payload(9999, 8));
+  CHECKF(accepted == int(net::Transport::kGekkoQueue) && refused, "accepted %d of %zu, 1,025th refused %d", accepted,
+         net::Transport::kGekkoQueue, int(refused));
+  CHECKF(t.stats().queue_full == 1, "queue_full %u after one refused PushGekko", t.stats().queue_full);
+  SetEvent(release);
+  t.Stop();
+  CloseHandle(entered);
+  CloseHandle(release);
+}
+
+// Review M-3: the log sink is never called once Stop has returned (a misuse after Stop is counted, not logged).
+static void TestNoLogAfterStop() {
+  Group("transport, no log call after Stop");
+  Udp r;
+  LogSink l;
+  net::Transport t;
+  std::string e;
+  CHECK(t.Start(LoopCfg(), l.Fn(), &e));
+  CHECK(l.WaitPrefix("[doa4][NET] transport started", 1000));
+  t.SendTo(Loop(r.port), Bytes{1});  // control: before Stop the misuse logs its WARN line
+  CHECK(l.CountPrefix("WARN transport:") == 1);
+  t.Stop();
+  size_t lines;
+  {
+    std::lock_guard<std::mutex> lock(l.mu);
+    lines = l.lines.size();
+  }
+  t.SendTo(Loop(r.port), Bytes{2});
+  t.Broadcast(r.port, Bytes{3});
+  size_t lines_after;
+  {
+    std::lock_guard<std::mutex> lock(l.mu);
+    lines_after = l.lines.size();
+  }
+  CHECKF(lines_after == lines, "the sink got %zu lines after Stop returned", lines_after - lines);
+  CHECK(t.stats().wrong_thread == 3);  // still counted
+}
+
+// Wi-Fi media streaming mode (research item 1; DOA2U recomp by Parker Allan, MIT). Off: nothing loads wlanapi.dll and no
+// line is logged. On: Start and Stop succeed and one line gives the number of interfaces set (0 on a PC without Wi-Fi;
+// the mode itself is checked on a Wi-Fi PC at plan 1b's real-world gate). The WLAN handle is closed by Stop, which
+// releases the mode, so the test leaves nothing set.
+static void TestWifi() {
+  Group("transport, Wi-Fi media streaming mode");
+  const bool loaded_before = GetModuleHandleW(L"wlanapi.dll") != nullptr;
+  CHECKF(!loaded_before, "fixture: wlanapi.dll was already loaded, so the off case cannot be told apart");
+  {
+    LogSink l;
+    net::Transport t;
+    std::string e;
+    CHECK(t.Start(LoopCfg(), l.Fn(), &e));
+    CHECK(l.WaitPrefix("[doa4][NET] transport started", 1000));
+    SleepMs(100);
+    CHECK(l.CountPrefix("[doa4][NET] Wi-Fi") == 0);
+    CHECK(t.stats().wifi_interfaces == -1);
+    t.Stop();
+    CHECKF(GetModuleHandleW(L"wlanapi.dll") == nullptr, "flag off, but wlanapi.dll was loaded");
+  }
+  {
+    LogSink l;
+    net::Transport t;
+    net::Config c = LoopCfg();
+    c.wifi_streaming = true;
+    std::string e;
+    CHECK(t.Start(c, l.Fn(), &e));
+    CHECK(l.WaitPrefix("[doa4][NET] Wi-Fi media streaming mode", 3000));
+    CHECK(l.CountPrefix("[doa4][NET] Wi-Fi") == 1);
+    const int32_t n = t.stats().wifi_interfaces;
+    {
+      std::lock_guard<std::mutex> lock(l.mu);
+      for (const std::string& line : l.lines)
+        if (line.rfind("[doa4][NET] Wi-Fi", 0) == 0) std::printf("info: %s\n", line.c_str());
+    }
+    CHECKF(n >= 0, "wifi_interfaces %d with the flag on", n);
+    CHECK(l.CountExact("[doa4][NET] Wi-Fi media streaming mode (background scans off) on " + std::to_string(n) + " interface(s)") == 1);
+    CHECK(GetModuleHandleW(L"wlanapi.dll") != nullptr);
+    const int64_t s0 = NowUs();
+    t.Stop();
+    std::printf("info: Wi-Fi: Stop took %.3f ms\n", (NowUs() - s0) / 1000.0);
+    CHECKF(NowUs() - s0 <= 200'000, "Stop with the WLAN handle took %.1f ms", (NowUs() - s0) / 1000.0);
+  }
+}
+
 // =====================================================================================================
 // Stop
 // =====================================================================================================
@@ -1007,7 +1317,13 @@ int main(int argc, char** argv) {
   TestStun();
   TestSimOracle();
   TestSimTransport();
+  TestSimDrop();
+  TestStunSource();
+  TestExclusiveBind();
+  TestOutboundQueueFull();
+  TestNoLogAfterStop();
   TestStop();
+  TestWifi();  // last: once wlanapi.dll is loaded it stays loaded
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   std::fflush(stdout);
   return g_failures ? 1 : 0;

@@ -1,5 +1,6 @@
 #include "np_gekko.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -7,6 +8,19 @@
 #include "gekkonet.h"
 
 namespace doa4::np::gekko {
+
+// The SyncResponse guard (Task 7 review, question 5, ruling (b')). Once connected, GekkoNet answers every SyncResponse
+// it receives with another one (backend.cpp:955-958 count it, 984-987 send it), and the peer, connected too, answers
+// that: a duplicated or replayed SyncResponse becomes a ping-pong that only a lost datagram ends, and each further one
+// adds another (measured: +1 datagram per frame per side each; a replay every 10 frames grew 5 -> 40 per frame).
+// After this side has seen kStarted, at most one incoming SyncResponse per kSyncResponseGap is passed to GekkoNet; the
+// rest are dropped and counted. Before kStarted nothing is touched, so the handshake is exactly GekkoNet's.
+// The one byte of GekkoNet's wire layout this relies on: a payload starts with the packet header, serialised before
+// the body (backend.cpp:781-782, out(pkt->pkt.header)), whose first member is `PacketType type` (u8), and SyncResponse
+// is 5 in that enum (include/private/net.h:27-33: Inputs = 1, SpectatorInputs, InputAck, SyncRequest, SyncResponse).
+// tests/host/np_exec_host_test.cpp's drip group goes red if a vendor bump moves it.
+constexpr uint8_t kGekkoSyncResponse = 5;
+constexpr auto kSyncResponseGap = std::chrono::milliseconds(200);  // = NetStats::SYNC_MSG_DELAY (net.h:125)
 
 struct SessionImpl {
   GekkoSession* s = nullptr;
@@ -19,6 +33,10 @@ struct SessionImpl {
   uint8_t peer_addr = 1;  // the one peer's address as GekkoNet sees it; the transport never reads it
   std::vector<GekkoNetResult*> results;
   std::vector<SessionEvent> events;
+  bool started = false;                                // this side has seen GekkoSessionStarted
+  bool sync_response_passed = false;                   // a SyncResponse was passed after kStarted ...
+  std::chrono::steady_clock::time_point sync_response_at{};  // ... at this time
+  uint32_t sync_responses_dropped = 0;
 };
 
 namespace {
@@ -54,6 +72,16 @@ GekkoNetResult** AdapterReceive(int* length) {
       // the buffers are freed at :165-167), so this skip changes nothing it could observe; it only avoids building a
       // result for nothing. Not tested for that reason.
       if (buf.empty()) continue;
+      if (c->started && buf[0] == kGekkoSyncResponse) {  // the SyncResponse guard (top of this file)
+        const auto now = std::chrono::steady_clock::now();
+        if (c->sync_response_passed && now - c->sync_response_at < kSyncResponseGap) {
+          ++c->sync_responses_dropped;
+          buf.clear();
+          continue;
+        }
+        c->sync_response_passed = true;
+        c->sync_response_at = now;
+      }
       auto* r = static_cast<GekkoNetResult*>(std::malloc(sizeof(GekkoNetResult)));
       r->addr.size = 1;
       r->addr.data = std::malloc(1);
@@ -131,6 +159,8 @@ void Session::AddLocalInput(const Pad& pad) {
 
 uint32_t Session::local_inputs_added() const { return impl_->added; }
 
+uint32_t Session::sync_responses_dropped() const { return impl_->sync_responses_dropped; }
+
 std::vector<exec::Event> Session::Update() {
   SessionImpl& im = *impl_;
   std::vector<exec::Event> out;
@@ -169,6 +199,7 @@ std::vector<exec::Event> Session::Update() {
     switch (se[i]->type) {
       case GekkoSessionStarted:
         im.events.push_back({SessionEvent::kStarted, 0, 0, 0});
+        im.started = true;  // arms the SyncResponse guard from the next Update's receive on
         break;
       case GekkoDesyncDetected:
         im.events.push_back({SessionEvent::kDesync, se[i]->data.desynced.frame, se[i]->data.desynced.local_checksum,
