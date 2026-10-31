@@ -41,7 +41,7 @@ shot
 600 -
 shot
 random 3306 21 0
-380 -
+440 -
 shot
 60 -
 4 A
