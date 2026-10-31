@@ -10,6 +10,8 @@
 #include "np_exec.h"
 
 namespace doa4::np::gekko {
+// Receive is called at most this many times per Update (Task 7, carry 3a); the rest stay queued for the next Update.
+inline constexpr int kMaxReceivePerUpdate = 256;
 struct Config { int num_players = 2; int local_slot = 0; uint8_t delay = 2; };
 struct SessionEvent { enum Kind : uint8_t { kStarted, kDesync, kDisconnected } kind; int32_t frame = 0; uint32_t local = 0, remote = 0; };
 struct NetStats { float ping_ms = 0, jitter_ms = 0, kb_sent = 0, kb_received = 0; };
@@ -19,7 +21,7 @@ struct SessionImpl;  // np_gekko.cpp: the GekkoNet handle, its adapter and the c
 class Session {
  public:
   using Send = std::function<void(std::span<const uint8_t> payload)>;  // to the one peer
-  using Receive = std::function<bool(std::vector<uint8_t>* payload)>;  // from the peer; false when none queued
+  using Receive = std::function<bool(std::vector<uint8_t>* payload)>;  // from the peer; false when none queued; <= 256 calls per Update
   Session();
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;

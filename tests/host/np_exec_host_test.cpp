@@ -17,10 +17,17 @@
 //  - the first update of a started session also carries a Save of frame -1 (game_session.cpp:11, 619-623), which
 //    the executor accepts and ignores.
 
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>  // GetProcessMemoryInfo (K32GetProcessMemoryInfo in kernel32): the memory watchdog of the duplicating link
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <string>
@@ -509,6 +516,56 @@ static void TestWrapperLifecycle() {
   s.Destroy();  // twice
 }
 
+// Carry 3a (Task 7): one Update reads at most 256 payloads from Receive (GekkoNet asks once per update,
+// game_session.cpp:177 and 666); the rest stay queued for the next Update, so a flood cannot hold the game thread.
+// The payloads are empty (the wrapper skips them before GekkoNet, np_gekko.cpp AdapterReceive), so only the count of
+// reads is observed. The fake Receive stops by itself after 1,000,000 reads or 5 s, so the uncapped wrapper ends with a
+// red count instead of a hang. Predicted RED with the cap removed: 5 failures (endless Receive: 1,000,000 reads, the
+// bound hit, still 1,000,000 after the second Update; 300 queued: all read by the first Update, one more empty read by
+// the second).
+static void TestWrapperDrainCap() {
+  Group("wrapper, at most 256 Receive reads per Update");
+  {
+    gekko::Session s;
+    uint64_t reads = 0;
+    bool bound_hit = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(s.Create(gekko::Config{}, [](std::span<const uint8_t>) {}, [&](Bytes* out) {
+      if (reads >= 1'000'000 || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+        bound_hit = true;
+        return false;
+      }
+      ++reads;
+      out->clear();
+      return true;
+    }));
+    s.Update();
+    CHECKF(reads == 256, "one Update read %llu payloads from a Receive that always has data (expected 256)", (unsigned long long)reads);
+    CHECK(!bound_hit);
+    s.Update();
+    CHECKF(reads == 512, "two Updates read %llu (expected 512)", (unsigned long long)reads);
+  }
+  {
+    gekko::Session s;
+    std::deque<Bytes> q(300);  // 300 queued (empty) payloads
+    int false_returns = 0;
+    CHECK(s.Create(gekko::Config{}, [](std::span<const uint8_t>) {}, [&](Bytes* out) {
+      if (q.empty()) {
+        ++false_returns;
+        return false;
+      }
+      *out = std::move(q.front());
+      q.pop_front();
+      return true;
+    }));
+    s.Update();
+    CHECKF(q.size() == 44 && false_returns == 0, "after one Update %zu of 300 remain, %d empty reads (expected 44, 0)", q.size(),
+           false_returns);
+    s.Update();
+    CHECKF(q.empty() && false_returns == 1, "after two Updates %zu remain, %d empty reads (expected 0, 1)", q.size(), false_returns);
+  }
+}
+
 // ---- real GekkoNet, two sessions in one process ----
 struct Packet {
   int due;
@@ -909,7 +966,150 @@ static void TestRealDeadLink() {
   }
 }
 
+// Carry 3b (Task 7, from the Task 6 review): a link that delivers EVERY datagram twice, each direction through a bounded
+// queue of 1024 (a full queue drops the datagram and counts it), 600 frames. The review grew a test process to 16 GB in
+// 6 minutes on such a link (unbounded queues; GekkoNet answers every SyncResponse while connected, backend.cpp:956), so
+// the group carries its watchdogs from its first run (#0434): it fails and stops after 60 s of wall clock, or when the
+// process working set passes 1 GB, both checked every tick; and a watchdog thread ends the whole run with a FAIL line at
+// 90 s or 1.5 GB, in case one Update never returns. The datagrams GekkoNet sends per frame are printed (maximum and the
+// average over the first and the last 100 frames, per side): traffic that grows without bound shows as a rising count.
+// The same harness with one copy per datagram runs first as the control (a normal link's count).
+// Measured (Task 7): once connected GekkoNet answers every SyncResponse it receives (backend.cpp:955-958, 984-987), so
+// each duplicate becomes a SyncResponse that bounces between the sides for good. Without the 256 cap the queues
+// saturated within the first frames (~1,000 datagrams per frame per side); with it, ~380 per frame (max 768 = 3 Updates
+// x 256), flat from the first 100 frames to the last 100, the working set flat. Bounded, not rising: not the BLOCKED case.
+constexpr int kDupFrames = 600;
+constexpr size_t kDupQueue = 1024;
+constexpr long long kDupTimeLimitMs = 60'000;
+constexpr size_t kDupMemLimit = size_t(1) << 30;  // 1 GB
+
+static size_t WorkingSet() {
+  PROCESS_MEMORY_COUNTERS pmc{};
+  pmc.cb = sizeof pmc;
+  return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? size_t(pmc.WorkingSetSize) : 0;
+}
+
+// copies = 2: the duplicating link; copies = 1: the same harness as a control (a normal link's traffic per frame).
+static void RunBoundedLink(int copies, const char* label) {
+  std::atomic<bool> group_done{false};
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread guard([&] {  // the backstop: an Update that never returns, or memory that grows inside one call
+    while (!group_done.load()) {
+      const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      const size_t ws = WorkingSet();
+      if (ms > 90'000 || ws > (size_t(3) << 29)) {
+        std::printf("FAIL watchdog: %s after %lld ms, working set %zu MB: run ended\n", label, ms, ws >> 20);
+        std::fflush(stdout);
+        std::_Exit(3);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  });
+  PairResult r;
+  std::deque<Bytes> q[2];  // q[s]: what waits for side s
+  size_t q_max[2] = {0, 0};
+  int sent[2] = {0, 0}, delivered[2] = {0, 0}, dropped_full[2] = {0, 0};
+  int cur[2] = {0, 0};
+  std::vector<int> per_frame[2];  // datagrams side s sent during each of its frames
+  for (int s = 0; s < 2; ++s) {
+    gekko::Config cfg;
+    cfg.num_players = 2;
+    cfg.local_slot = s;
+    cfg.delay = kDelay;
+    CHECK(r.side[s].session.Create(
+        cfg,
+        [&, s](std::span<const uint8_t> payload) {
+          ++sent[s];
+          ++cur[s];
+          for (int copy = 0; copy < copies; ++copy) {
+            if (q[1 - s].size() >= kDupQueue) {
+              ++dropped_full[1 - s];
+              continue;
+            }
+            q[1 - s].emplace_back(payload.begin(), payload.end());
+            q_max[1 - s] = std::max(q_max[1 - s], q[1 - s].size());
+          }
+        },
+        [&, s](Bytes* out) {
+          if (q[s].empty()) return false;
+          *out = std::move(q[s].front());
+          q[s].pop_front();
+          ++delivered[s];
+          return true;
+        }));
+  }
+  bool timed_out = false, mem_out = false;
+  size_t ws_max = 0;
+  long long elapsed_ms = 0;
+  for (r.ticks = 0; r.ticks < 200'000; ++r.ticks) {
+    const int before[2] = {r.side[0].advances, r.side[1].advances};
+    StepSide(r, 0, true);
+    StepSide(r, 1, true);
+    for (int s = 0; s < 2; ++s)
+      if (r.side[s].advances > before[s]) {
+        per_frame[s].push_back(cur[s]);
+        cur[s] = 0;
+      }
+    elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const size_t ws = WorkingSet();
+    ws_max = std::max(ws_max, ws);
+    if (elapsed_ms > kDupTimeLimitMs) {
+      timed_out = true;
+      break;
+    }
+    if (ws > kDupMemLimit) {
+      mem_out = true;
+      break;
+    }
+    const bool both_started = r.side[0].started && r.side[1].started;
+    if (both_started && r.side[0].advances >= kDupFrames && r.side[1].advances >= kDupFrames) {
+      ++r.ticks;
+      break;
+    }
+    if (!both_started) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  DrainEvents(r, 0);
+  DrainEvents(r, 1);
+  group_done = true;
+  guard.join();
+  CHECKF(!timed_out, "%s ran past %lld ms (time watchdog)", label, kDupTimeLimitMs);
+  CHECKF(!mem_out, "%s: the working set passed %zu MB (memory watchdog)", label, kDupMemLimit >> 20);
+  std::printf("info: %s: %d ticks, %lld ms, working set max %zu MB\n", label, r.ticks, elapsed_ms, ws_max >> 20);
+  for (int s = 0; s < 2; ++s) {
+    const std::vector<int>& f = per_frame[s];
+    int mx = 0;
+    double last100 = 0;
+    for (int v : f) mx = std::max(mx, v);
+    const size_t n = std::min<size_t>(100, f.size());
+    for (size_t i = f.size() - n; i < f.size(); ++i) last100 += f[i];
+    if (n) last100 /= double(n);
+    double first100 = 0;
+    const size_t m = std::min<size_t>(100, f.size());
+    for (size_t i = 0; i < m; ++i) first100 += f[i];
+    if (m) first100 /= double(m);
+    std::printf("info: %s side %d: %d advances, %d datagrams sent, %d delivered to it, %d dropped (queue full), queue "
+                "max %zu; datagrams per frame: max %d, first-100 average %.2f, last-100 average %.2f\n",
+                label, s, r.side[s].advances, sent[s], delivered[s], dropped_full[s], q_max[s], mx, first100, last100);
+    CHECKF(r.side[s].advances >= kDupFrames, "%s side %d: %d advances (expected %d)", label, s, r.side[s].advances, kDupFrames);
+    CHECKF(r.side[s].desyncs.empty(), "%s side %d: %zu DesyncDetected events", label, s, r.side[s].desyncs.size());
+    CHECKF(!r.side[s].step_ended, "%s side %d: the executor ended the session", label, s);
+    CHECKF(r.side[s].disconnects == 0, "%s side %d: %d kDisconnected events", label, s, r.side[s].disconnects);
+    CHECKF(q_max[s] <= kDupQueue, "%s side %d: queue reached %zu (bound %zu)", label, s, q_max[s], kDupQueue);
+  }
+  // The frames both sides ran carry the same inputs, in order, and the pattern each side added (CommonChecks).
+  r.link.sent[0] = sent[0];
+  r.link.sent[1] = sent[1];
+  if (!timed_out && !mem_out) CommonChecks(r, label);
+}
+
+static void TestRealDuplicatingLink() {
+  Group("real GekkoNet, every datagram delivered twice through bounded queues, 600 frames (and a single-copy control)");
+  RunBoundedLink(1, "single-copy link (control)");
+  RunBoundedLink(2, "duplicating link");
+}
+
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);  // a run ended by a watchdog or a crash still shows how far it got
   for (int i = 1; i < argc; ++i)
     if (std::strcmp(argv[i], "-v") == 0) g_verbose = true;
   TestPlayerInput();
@@ -922,12 +1122,14 @@ int main(int argc, char** argv) {
   TestExecutorDropPending();
   TestFoldChecksum();
   TestWrapperLifecycle();
+  TestWrapperDrainCap();
   TestRealClean();
   TestRealDesync();
   TestRealOrderControl();
   TestRealDelayed();
   TestRealEventsBatched();
   TestRealDeadLink();
+  TestRealDuplicatingLink();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

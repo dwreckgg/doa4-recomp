@@ -39,7 +39,8 @@ void AdapterSend(GekkoNetAddress*, const char* data, int length) {
 }
 
 // GekkoNet frees addr.data, data and the result itself with free_data (three calls per result), so all three come
-// from malloc here.
+// from malloc here. GekkoNet asks once per update (game_session.cpp:177, 666), so the read cap is per Update: a flood
+// cannot hold the game thread, and what is left stays in the transport's ring for the next Update.
 GekkoNetResult** AdapterReceive(int* length) {
   SessionImpl* c = g_current;
   *length = 0;
@@ -47,7 +48,8 @@ GekkoNetResult** AdapterReceive(int* length) {
   c->results.clear();
   if (c->receive) {
     std::vector<uint8_t> buf;
-    while (c->receive(&buf)) {
+    // The cap is tested BEFORE Receive is called: a 257th call would take a payload out of the ring and lose it.
+    for (int reads = 0; reads < kMaxReceivePerUpdate && c->receive(&buf); ++reads) {
       // GekkoNet refuses an empty buffer by itself (backend.cpp:155-158: the deserialise fails and a line is printed;
       // the buffers are freed at :165-167), so this skip changes nothing it could observe; it only avoids building a
       // result for nothing. Not tested for that reason.
