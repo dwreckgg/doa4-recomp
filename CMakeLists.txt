@@ -38,6 +38,8 @@ set(DEADORALIVE4_SOURCES
     src/doa4_setup_win.cpp
     src/doa4_setup_dialog.cpp
     src/net/np_core.cpp
+    src/net/np_exec.cpp
+    src/net/np_gekko.cpp
     src/net/np_session.cpp
     src/net/np_det.cpp
     src/net/np_det_middleware.cpp

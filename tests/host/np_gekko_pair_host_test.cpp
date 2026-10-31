@@ -4,7 +4,10 @@
 // desync detection on, local input delay 2 on both, disconnect timeout off.
 //
 // What it pins (every line cites the vendored source it was read from; the numbers are not copied from a plan):
-//  - the order of the events: every update yields nothing or one Advance followed by its Save, never a Load;
+//  - the order of the events: every update yields nothing or one Advance followed by its Save, never a Load -
+//    except that the first update of a started session begins with one Save of frame -1 (the library's start-up
+//    save, game_session.cpp:11 and 619-623; GekkoNet never reads its checksum, :372-374), so side A sees [Save -1]
+//    and side B [Save -1, Advance 0, Save 0] there;
 //  - one local input per advanced frame: gekko_add_local_input files the input at the session's current frame
 //    plus the delay and accepts only the next sequential frame (input.cpp:50-65, sync.cpp:28-35), so a second
 //    add before the frame advances is dropped, and the first add also fills frames 0..delay-1 with empty input;
