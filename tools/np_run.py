@@ -92,6 +92,25 @@ def lazy_pool_problem(lines):
     return None
 
 
+# Task 15 close-out: the loader-idle hang (np_det_middleware.cpp: "loader: frame N: not idle after 5 s" in np_log) and FIX 13's
+# WARN lines (doa4_app_hooks.cpp: "[doa4][FIX][Loader] ..." at warning level in game.log) mean a run whose loader did not
+# behave; the record judge passed such runs before (debug-loader-idle-report). FIX 13's info line is the healthy case.
+LOADER_IDLE_PREFIX = "loader: frame "
+LOADER_IDLE_TEXT = ": not idle"
+LOADER_FIX_TAG = "[doa4][FIX][Loader]"
+
+
+def loader_problem(np_lines, game_lines):
+    """None if np_log `np_lines` hold no loader-idle line and game.log `game_lines` no FIX 13 WARN line; else the first one."""
+    for l in np_lines or []:
+        if l.startswith(LOADER_IDLE_PREFIX) and LOADER_IDLE_TEXT in l:
+            return "loader idle: " + l.strip()
+    for l in game_lines or []:
+        if LOADER_FIX_TAG in l and "[warning]" in l:
+            return "loader WARN: " + l[l.find(LOADER_FIX_TAG):].strip()
+    return None
+
+
 def selftest_problem(lines):
     """None if the game log `lines` hold the dot-product self-test line and every such line says "on"; else why not."""
     found = []
@@ -140,6 +159,9 @@ def judge(mode, code, timed_out, log_lines, out_dir=None, game_lines=None):
     lazy = lazy_pool_problem(game_lines) if game_lines is not None else None
     if lazy is not None:
         return "failed", f"{lazy} ({quit_line or 'no quit line'})"
+    loader = loader_problem(log_lines, game_lines)
+    if loader is not None:
+        return "failed", f"{loader} ({quit_line or 'no quit line'})"
     reason = quit_line.split(": ", 1)[1] if quit_line and ": " in quit_line else None
     ok = not timed_out and code == 0 and reason in OK_REASONS[mode]
     problem = selftest_problem(game_lines) if ok and game_lines is not None else None

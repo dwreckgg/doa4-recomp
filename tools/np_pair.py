@@ -586,6 +586,10 @@ class Pair:
             for problem in (np_run.selftest_problem(game_lines), np_run.lazy_pool_problem(game_lines)):
                 if problem:
                     self.problems.append(f"{s.name} game.log: {problem}")
+            # Task 15 close-out: the loader-idle line in the session's np_log, or a FIX 13 WARN in game.log
+            loader = np_run.loader_problem(s.np_log(), game_lines)
+            if loader:
+                self.problems.append(f"{s.name} np_log/game.log: {loader}")
         return lines
 
     def judge_session_refused(self, lines, host, joiner):
@@ -642,6 +646,18 @@ class Pair:
         lines.append("host status.txt: " + " ".join(f"{k}={v}" for k, v in sorted(st.items())))
         if st.get("state") != "hosting":
             self.problems.append(f"the host's state is {st.get('state')!r}, expected hosting")
+        # Task 15 close-out (b), the plan's S11 rule, when the host runs STUN (DOA4_NP_STUN=on): status.txt shows a join code
+        # (np_rules.h: 7 symbols, or 9 for a port outside 7200-7215, of the URL-safe base64 alphabet; the plan's "6 symbols"
+        # predates the check symbol), a NAT class other than no_answer, and no mapped address (it belongs in game.log only)
+        if "DOA4_NP_STUN=on" in self.a.env_host:
+            code = st.get("code", "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{7}|[A-Za-z0-9_-]{9}", code):
+                self.problems.append(f"the host's join code is {code!r}: expected 7 or 9 symbols of A-Z a-z 0-9 - _")
+            if st.get("nat", "no_answer") in ("no_answer", ""):
+                self.problems.append(f"the host's NAT class is {st.get('nat')!r}: STUN found no answer")
+            leaked = [f"{k}={v}" for k, v in st.items() if re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", v)]
+            if leaked:
+                self.problems.append(f"a mapped address in status.txt (game.log only): {leaked}")
 
     def judge_refusal(self, lines, by_name):
         a = self.a

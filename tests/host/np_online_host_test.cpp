@@ -1293,7 +1293,8 @@ static void TestSessionSpoof() {
 // =====================================================================================================
 
 static std::map<std::string, std::string> ParseStatus(const std::string& text, bool* ok) {
-  static const char* const kKeys[] = {"state", "port", "peer_port", "ping", "delay", "can_start", "event", "refusal"};
+  // Task 15 close-out (b): code= and nat= before refusal= (refusal stays the last line)
+  static const char* const kKeys[] = {"state", "port", "peer_port", "ping", "delay", "can_start", "event", "code", "nat", "refusal"};
   std::map<std::string, std::string> m;
   *ok = !text.empty() && text.back() == '\n';
   std::istringstream in(text);
@@ -1301,14 +1302,14 @@ static std::map<std::string, std::string> ParseStatus(const std::string& text, b
   size_t i = 0;
   while (std::getline(in, line)) {
     const size_t eq = line.find('=');
-    if (i >= 8 || eq == std::string::npos || line.substr(0, eq) != kKeys[i]) {
+    if (i >= 10 || eq == std::string::npos || line.substr(0, eq) != kKeys[i]) {
       *ok = false;
       break;
     }
     m[line.substr(0, eq)] = line.substr(eq + 1);
     ++i;
   }
-  *ok = *ok && i == 8;
+  *ok = *ok && i == 10;
   return m;
 }
 static void WriteCtl(const fs::path& dir, const std::string& text) {
@@ -1346,6 +1347,17 @@ static void TestRequestFiles() {
     bool p = false;
     const auto m = ParseStatus(ReadText(st), &p);
     CHECK(p && m.at("port") == std::to_string(lobby.status().port) && m.at("can_start") == "0" && m.at("peer_port") == "0");
+  }
+  // Task 15 close-out (b): the share code and the NAT class reach status.txt (code=, nat=), as the lobby's Status has them
+  {
+    bool p = false;
+    const auto m = ParseStatus(ReadText(st), &p);
+    const online::Status now = lobby.status();
+    const char* nat_names[] = {"no_answer", "one_answer", "cone", "symmetric"};
+    CHECKF(p && m.count("code") && m.at("code") == now.my_code, "status.txt code= '%s', Status my_code '%s'",
+           p && m.count("code") ? m.at("code").c_str() : "(none)", now.my_code.c_str());
+    CHECKF(p && m.count("nat") && m.at("nat") == nat_names[int(now.nat)], "status.txt nat= '%s', Status nat %d",
+           p && m.count("nat") ? m.at("nat").c_str() : "(none)", int(now.nat));
   }
   // the refusal key (Task 10's harness reads it): none, then build after a refused Hello, none again after a new host
   CHECK(WaitFor([&] { bool p = false; const auto m = ParseStatus(ReadText(st), &p); return p && m.at("refusal") == "none"; }, 1000));

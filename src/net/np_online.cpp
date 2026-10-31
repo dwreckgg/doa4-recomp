@@ -477,6 +477,17 @@ Status Lobby::Impl::SnapshotLocked() const {
   return s;
 }
 
+// status.txt's nat= value (Task 15 close-out (b), the harness's S11 rule): the NAT class the transport's STUN found.
+static const char* NatKey(rules::Nat nat) {
+  switch (nat) {
+    case rules::Nat::kNoAnswer: return "no_answer";
+    case rules::Nat::kOneAnswer: return "one_answer";
+    case rules::Nat::kCone: return "cone";
+    case rules::Nat::kSymmetric: return "symmetric";
+  }
+  return "other";
+}
+
 void Lobby::Impl::WriteStatus(uint32_t now) {
   const Status s = SnapshotLocked();
   char ping[32];
@@ -484,6 +495,7 @@ void Lobby::Impl::WriteStatus(uint32_t now) {
   const std::string text = "state=" + std::string(StateName(s.state)) + "\nport=" + std::to_string(s.port) +
                            "\npeer_port=" + std::to_string(s.peer_port) + "\nping=" + ping + "\ndelay=" + std::to_string(s.delay) +
                            "\ncan_start=" + (s.can_start ? "1" : "0") + "\nevent=" + Sanitize(s.event, 1000) +
+                           "\ncode=" + Sanitize(s.my_code, 64) + "\nnat=" + NatKey(s.nat) +  // Task 15 close-out (b)
                            "\nrefusal=" + s.refusal + "\n";
   status_dirty = false;
   status_last = now;

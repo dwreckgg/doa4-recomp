@@ -2664,6 +2664,18 @@ def test_pair_host_only(root):
     check(code == 0 and "verdict lobby" in out and "state=hosting" in out, f"np_pair --host-only: exit {code}\n{out}")
     check(not os.path.exists(os.path.join(runs, "ho_joiner")), "np_pair --host-only: no joiner run folder")
     check(leftover_pids(runs, "ho", ("host",)) == [], "np_pair --host-only: the host is ended")
+    # Task 15 close-out (b), the S11 rule when the host runs STUN: a join code (7 or 9 symbols of the URL-safe alphabet,
+    # np_rules.h), a NAT class other than no_answer, and no mapped address anywhere in status.txt
+    stun = ("--host-only", "1", "--expect", "lobby", "--env-host", "DOA4_NP_STUN=on")
+    code, out, runs = np_pair(root, "hs", *stun, "--env-host", "FAKE_ONLINE_CODE=DzsFik2", "--env-host", "FAKE_ONLINE_NAT=cone")
+    check(code == 0 and "verdict lobby" in out, f"np_pair --expect lobby with STUN: code and NAT class: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "hsn", *stun, "--env-host", "FAKE_ONLINE_CODE=DzsFik2", "--env-host", "FAKE_ONLINE_NAT=no_answer")
+    check(code == 1 and "NAT class" in out, f"np_pair --expect lobby with STUN: no answer fails: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "hsc", *stun, "--env-host", "FAKE_ONLINE_CODE=DzsFik", "--env-host", "FAKE_ONLINE_NAT=cone")
+    check(code == 1 and "join code" in out, f"np_pair --expect lobby with STUN: a 6-symbol code fails: exit {code}\n{out}")
+    code, out, runs = np_pair(root, "hsa", *stun, "--env-host", "FAKE_ONLINE_CODE=DzsFik2", "--env-host", "FAKE_ONLINE_NAT=cone",
+                              "--env-host", "FAKE_ONLINE_EVENT_ADDR=1")
+    check(code == 1 and "mapped address" in out, f"np_pair --expect lobby with STUN: an address in status.txt fails: exit {code}\n{out}")
 
 
 def test_pair_lost(root):
@@ -2978,6 +2990,41 @@ def test_lazy_pool_rule(root):
     check(code == 1 and len(named) == 1, f"np_pair, the tag in the joiner's game.log: exit {code}\n{out}")
     check("host game.log" not in out, f"np_pair, the tag on the joiner only: the host is not named\n{out}")
     check("verdict FAILED" in pair_verdict(pruns, "lzj"), "np_pair, the tag: the verdict file says FAILED")
+
+
+def test_loader_rules(root):
+    # Task 15 close-out (a): a run whose np_log holds the loader-idle line, or whose game.log holds a FIX 13 WARN line, is never
+    # a good run (the record judge passed hung runs before: debug-loader-idle-report, #0396). FIX 13's info line is fine.
+    mod = load("np_run")
+    fake = fake_game_module()
+    on = ["x [doa4][LIFE] dot products: canonical NaN on"]
+    log = ["quit at frame 11: quit frame"]
+    check(mod.loader_problem(log, on + [fake.LOADER_FIX_INFO]) is None, "loader_problem: healthy lines and FIX 13's info line")
+    got = mod.loader_problem([fake.LOADER_IDLE_LINE] + log, on)
+    check(got is not None and "not idle" in got, f"loader_problem: the idle line in np_log: {got!r}")
+    got = mod.loader_problem(log, on + [fake.LOADER_FIX_WARN])
+    check(got is not None and "[doa4][FIX][Loader]" in got, f"loader_problem: FIX 13's WARN in game.log: {got!r}")
+    check(mod.loader_problem(["loader: 5 jobs in the last 600 frames"] + log, on) is None, "loader_problem: the loader's job line is fine")
+    status, why = mod.judge("record", 0, False, [fake.LOADER_IDLE_LINE] + log, None, on)
+    check(status == "failed" and "not idle" in why, f"judge: a record run with the idle line fails: {status} {why!r}")
+    status, why = mod.judge("record", 0, False, log, None, on + [fake.LOADER_FIX_WARN])
+    check(status == "failed" and "FIX][Loader]" in why, f"judge: a FIX 13 WARN fails: {status} {why!r}")
+    ud, runs = make_userdata(root), os.path.join(root, "runs")
+
+    def np_run(name, **env):
+        p = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "np_run.py"), "record", name, "--script", SCRIPT,
+                            "--userdata", ud, "--runs", runs, "--exe", FAKE_EXE, "--timeout", "60"],
+                           capture_output=True, text=True, env=stand_in_env(**env), timeout=120)
+        return p.returncode
+    check(np_run("ld_info", FAKE_LOADER_INFO="1") == 0 and result(runs, "ld_info") == REC_OK, "np_run: FIX 13's info line leaves a run good")
+    check(np_run("ld_idle", FAKE_LOADER_IDLE="1") == 1 and "not idle" in (result(runs, "ld_idle") or ""),
+          f"np_run: the idle line fails the run: {result(runs, 'ld_idle')!r}")
+    check(np_run("ld_warn", FAKE_LOADER_WARN="1") == 1 and "FIX][Loader]" in (result(runs, "ld_warn") or ""),
+          f"np_run: FIX 13's WARN fails the run: {result(runs, 'ld_warn')!r}")
+    code, out, pruns = np_pair(root, "ldj", "--env-joiner", "FAKE_LOADER_IDLE=1")
+    check(code == 1 and "joiner" in out and "not idle" in out, f"np_pair: the idle line in the joiner's np_log: exit {code}\n{out}")
+    code, out, pruns = np_pair(root, "ldh", "--env-host", "FAKE_LOADER_WARN=1")
+    check(code == 1 and "host np_log/game.log: loader WARN" in out and "FIX][Loader]" in out, f"np_pair: FIX 13's WARN in the host's game.log: exit {code}\n{out}")
 
 
 DUMP_LO = 0x82B70000

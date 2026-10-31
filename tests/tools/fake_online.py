@@ -232,7 +232,10 @@ class State:
     def write(self):
         atomic_write(os.path.join(self.ctl, "status.txt"),
                      f"state={self.state}\nport={self.port}\npeer_port={self.peer_port}\nping=1\ndelay={self.delay}\n"
-                     f"can_start={self.can_start}\nevent={self.event}\n"
+                     f"can_start={self.can_start}\nevent={self.event}"
+                     + (" (mapped 203.0.113.7:7200)" if os.environ.get("FAKE_ONLINE_EVENT_ADDR") == "1" and self.state == "hosting" else "")
+                     + f"\ncode={os.environ.get('FAKE_ONLINE_CODE', '') if self.state == 'hosting' else ''}"
+                     + f"\nnat={os.environ.get('FAKE_ONLINE_NAT', 'no_answer')}\n"  # Task 15 close-out (b): the game's keys
                      + ("" if os.environ.get("FAKE_ONLINE_NO_REFUSAL_KEY") == "1" else f"refusal={self.refusal}\n"))
 
     def ctls(self):
@@ -456,6 +459,8 @@ def session(ctl):
     log.write(f"session on: online stand-in, {rows} frames, delay {delay}\n")
     if os.environ.get("FAKE_ONLINE_WARN") == "1":
         log.write(fake_game.KEEPALIVE_WARN + "\n")
+    if os.environ.get("FAKE_LOADER_IDLE") == "1":  # the loader-idle hang's np_log line (Task 15 close-out)
+        log.write(fake_game.LOADER_IDLE_LINE + "\n")
     if peer and os.environ.get("FAKE_ONLINE_SKIP_PEER_CHECK") != "1" and peer_stayed_lobby(peer):
         # the real session's session_refused poll (np_session.cpp)
         log.write("the other player's game answered as a lobby: it did not start the session (ending at once)\n")

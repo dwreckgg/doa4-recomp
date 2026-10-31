@@ -218,8 +218,20 @@ def write_game_log_line():
         text = "[info] [core] [doa4][LIFE] dot products: canonical NaN on"
     if os.environ.get("FAKE_LAZY_POOL") == "1":
         text += "\n" + LAZY_POOL_LINE
+    if os.environ.get("FAKE_LOADER_INFO") == "1":  # FIX 13's ordinary line (info): never a problem
+        text += "\n" + LOADER_FIX_INFO
+    if os.environ.get("FAKE_LOADER_WARN") == "1":  # FIX 13's WARN line (Task 15 close-out)
+        text += "\n" + LOADER_FIX_WARN
     with open(path, "a", encoding="utf-8") as f:
         f.write(text + "\n")
+
+
+# The loader-idle hang's np_log line (np_det_middleware.cpp:127) and FIX 13's game.log lines (doa4_app_hooks.cpp:705-713).
+LOADER_IDLE_LINE = "loader: frame 44: not idle after 5 s"
+LOADER_FIX_INFO = ("[2026-10-31 17:00:00.000] [info] [core] [t1] [doa4][FIX][Loader] loader thread starts after the critical "
+                   "section init (82B5E2C0; waited 0.3 ms)")
+LOADER_FIX_WARN = ("[2026-10-31 17:00:10.000] [warning] [core] [t1] [doa4][FIX][Loader] the main loop's init had not returned "
+                   "10 s after the loader thread started; letting it run")
 
 
 # The SDK's failed-move WARN as game.log shows it (sdk-np1 ad1b589, xobject.cpp GetNativeObject; REXSYS_WARN prints
@@ -297,6 +309,8 @@ def main():
     log = list(started)
     if listed(name, "FAKE_GAME_WARN"):
         log.append(KEEPALIVE_WARN)
+    if os.environ.get("FAKE_LOADER_IDLE") == "1":  # the loader-idle hang's line (np_det_middleware.cpp), Task 15 close-out
+        log.append(LOADER_IDLE_LINE)
     if mode == "record":
         with open(os.path.join(out, "rec.d4r"), "w") as f:
             f.write(f"{frames}\n")
