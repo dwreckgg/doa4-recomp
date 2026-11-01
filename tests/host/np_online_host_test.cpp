@@ -1932,7 +1932,8 @@ static void TestRestartFailed() {
          host.status().event.c_str());
   CHECKF(joiner.status().event == "Could not restart into the online session (error 5): still in the lobby.", "joiner event '%s'",
          joiner.status().event.c_str());
-  CHECK(Contains(hs.Events(), "Could not restart into the online session (error 2)"));
+  // the event line reaches the events file after the status changes: wait for it (a slower CI runner showed the gap)
+  CHECK(WaitFor([&] { return Contains(hs.Events(), "Could not restart into the online session (error 2)"); }, 1000));
   FakePeer f;
   const uint32_t T = 0x0F0F1234u;
   f.Send(joiner.status().port, wire::Type::kHello, T, HelloBody(js.build, "dev", "", 1, 2, T));
