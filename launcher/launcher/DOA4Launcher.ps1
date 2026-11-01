@@ -78,7 +78,13 @@ if ($Action) {
                 $where = Set-DOA4GameFiles -Ctx $ctx -Folder $GameFiles
                 Write-DOA4Log $ctx "saved to $where"
             }
-            'Status' { Write-DOA4Log $ctx ('status: ' + (Get-DOA4BuildStatus -Ctx $ctx)) }
+            'Status' {
+                $src = Get-DOA4Source -Ctx $ctx
+                $line = 'status: ' + (Get-DOA4BuildStatus -Ctx $ctx) + '; source: ' + $src
+                $lr = (Get-DOA4Settings $ctx.SettingsPath).lastRelease
+                if ($src -eq 'release' -and $lr -and $lr.tag) { $line += '; release ' + $lr.tag }
+                Write-DOA4Log $ctx $line
+            }
         }
     } catch {
         Write-DOA4Log $ctx ('error: ' + $_.Exception.Message)
@@ -97,7 +103,11 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 $script:job = $null
 $script:iconSet = $false
+$script:syncingSource = $false
 $installSteps = @('Folder', 'Tools', 'Disk space', 'Code', 'Fixes', 'Build', 'Shortcut')
+$updateSteps = @('Folder', 'Tools', 'Sources', 'Local changes', 'Update', 'Build')
+$releaseUpdateSteps = @('Folder', 'Running game', 'Release', 'Download', 'Checksums', 'Swap')
+$releaseInstallSteps = $releaseUpdateSteps + @('Shortcut')
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Dead or Alive 4'
@@ -131,6 +141,23 @@ $bPhotos = New-Button 'Open photos'
 $bSaves = New-Button 'Open saves'
 $bLogs = New-Button 'Open logs'
 
+# Where Install and Update get the game from, saved in settings.json ("source").
+$sourcePanel = New-Object System.Windows.Forms.FlowLayoutPanel
+$sourcePanel.Dock = 'Top'
+$sourcePanel.Height = 30
+$sourcePanel.Padding = New-Object System.Windows.Forms.Padding(8, 4, 4, 0)
+$sourceLabel = New-Object System.Windows.Forms.Label
+$sourceLabel.Text = 'Get the game from:'
+$sourceLabel.AutoSize = $true
+$sourceLabel.Padding = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+$rbRelease = New-Object System.Windows.Forms.RadioButton
+$rbRelease.Text = 'Releases (recommended)'
+$rbRelease.AutoSize = $true
+$rbSource = New-Object System.Windows.Forms.RadioButton
+$rbSource.Text = 'Build from source (advanced)'
+$rbSource.AutoSize = $true
+$sourcePanel.Controls.AddRange(@($sourceLabel, $rbRelease, $rbSource))
+
 $steps = New-Object System.Windows.Forms.ListView
 $steps.View = 'Details'
 $steps.Dock = 'Top'
@@ -151,6 +178,7 @@ $log.Font = New-Object System.Drawing.Font('Consolas', 9)
 $form.Controls.Add($log)
 $form.Controls.Add($steps)
 $form.Controls.Add($buttons)
+$form.Controls.Add($sourcePanel)
 $form.Controls.Add($status)
 
 function Add-LogLine([string]$line) { $log.AppendText($line + [Environment]::NewLine) }
@@ -180,23 +208,57 @@ function Set-StepRow([string]$name, [string]$state, [string]$detail) {
     [void]$steps.Items.Add($item)
 }
 
+function Get-UiSource {
+    return (Get-DOA4Source -Ctx (New-DOA4Context -Root $root -Config $config -Action 'status'))
+}
+
 function Update-Status {
     $ctx = New-DOA4Context -Root $root -Config $config -Action 'status'
+    $src = Get-DOA4Source -Ctx $ctx
     $s = Get-DOA4BuildStatus -Ctx $ctx
-    $setup = ''
-    if (Test-Path -LiteralPath $ctx.GamePath) {
-        if (Test-DOA4HasFirstRunSetup $ctx) { $setup = ' (this build asks for its game files itself)' }
-        else { $setup = ' (game files: ' + $(if ((Get-DOA4Settings $ctx.SettingsPath).gameFiles) { (Get-DOA4Settings $ctx.SettingsPath).gameFiles } else { 'not chosen yet' }) + ')' }
+    if ($src -eq 'release') {
+        $lr = (Get-DOA4Settings $ctx.SettingsPath).lastRelease
+        if ($s -eq 'not built') { $status.Text = 'Game: not installed yet (from the releases)' }
+        elseif ($lr -and $lr.tag) { $status.Text = "Game: release $($lr.tag) (this build asks for its game files itself)" }
+        else { $status.Text = 'Game: a release (this build asks for its game files itself)' }
+        $bUpdate.Text = 'Update'
+    } else {
+        $setup = ''
+        if (Test-Path -LiteralPath $ctx.GamePath) {
+            if (Test-DOA4HasFirstRunSetup $ctx) { $setup = ' (this build asks for its game files itself)' }
+            else { $setup = ' (game files: ' + $(if ((Get-DOA4Settings $ctx.SettingsPath).gameFiles) { (Get-DOA4Settings $ctx.SettingsPath).gameFiles } else { 'not chosen yet' }) + ')' }
+        }
+        $status.Text = "Game: $s$setup"
+        $bUpdate.Text = 'Update && rebuild'
     }
-    $status.Text = "Game: $s$setup"
+    # The radio buttons show the mode in use; setting them here must not save a choice.
+    $script:syncingSource = $true
+    try {
+        $rbRelease.Checked = ($src -eq 'release')
+        $rbSource.Checked = ($src -eq 'source')
+    } finally { $script:syncingSource = $false }
     $bPlay.Enabled = ($s -ne 'not built') -and -not $script:job
     if ($s -ne 'not built' -and -not $script:iconSet) {
-        try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($ctx.ExePath); $script:iconSet = $true } catch { }
+        try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Get-DOA4ExePath -Ctx $ctx)); $script:iconSet = $true } catch { }
     }
 }
 
+function Set-UiSource([string]$source) {
+    if ($script:syncingSource -or $script:job) { return }
+    try {
+        Set-DOA4Source -Ctx (Get-UiContext 'source') -Source $source
+        if ($source -eq 'release') { Add-LogLine 'Install and Update now get the game from the netplay releases.' }
+        else { Add-LogLine 'Install and Update now build the game from source (they install Git, LLVM and the Visual Studio Build Tools when missing).' }
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Dead or Alive 4', 'OK', 'Warning')
+    }
+    Update-Status
+}
+$rbRelease.Add_CheckedChanged({ if ($rbRelease.Checked) { Set-UiSource 'release' } })
+$rbSource.Add_CheckedChanged({ if ($rbSource.Checked) { Set-UiSource 'source' } })
+
 function Set-Busy([bool]$busy) {
-    foreach ($b in @($bInstall, $bUpdate, $bGameFiles)) { $b.Enabled = -not $busy }
+    foreach ($b in @($bInstall, $bUpdate, $bGameFiles, $rbRelease, $rbSource)) { $b.Enabled = -not $busy }
     $bPlay.Enabled = -not $busy
     if (-not $busy) { Update-Status }
 }
@@ -313,11 +375,17 @@ function Invoke-ChangeGameFiles {
 }
 
 $bInstall.Add_Click({
+        if ((Get-UiSource) -eq 'release') {
+            # No tools to install: straight to the download.
+            Show-Steps $releaseInstallSteps
+            Start-Background 'install' @{ Approved = $false; ShortcutFolder = [Environment]::GetFolderPath('Desktop') }
+            return
+        }
         Show-Steps @('Tools')
         Start-Background 'plan' @{ ShortcutFolder = '' }
     })
 $bUpdate.Add_Click({
-        Show-Steps @('Folder', 'Tools', 'Sources', 'Local changes', 'Update', 'Build')
+        if ((Get-UiSource) -eq 'release') { Show-Steps $releaseUpdateSteps } else { Show-Steps $updateSteps }
         Start-Background 'update' @{ ShortcutFolder = '' }
     })
 $bGameFiles.Add_Click({ [void](Invoke-ChangeGameFiles) })
@@ -359,7 +427,11 @@ $form.Add_FormClosing({
 $form.Add_Shown({
         Update-Status
         if ((Get-DOA4BuildStatus -Ctx (New-DOA4Context -Root $root -Config $config -Action 'status')) -eq 'not built') {
-            Add-LogLine 'Not installed yet: press Install. It checks the tools, downloads the sources, builds the game and makes a desktop shortcut.'
+            if ((Get-UiSource) -eq 'release') {
+                Add-LogLine 'Not installed yet: press Install. It downloads the newest netplay release from GitHub, checks every file against the release''s checksums and makes a desktop shortcut.'
+            } else {
+                Add-LogLine 'Not installed yet: press Install. It checks the tools, downloads the sources, builds the game and makes a desktop shortcut.'
+            }
         }
     })
 

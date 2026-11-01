@@ -256,6 +256,69 @@ function New-DOA4CommandTable {
             $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path))
             try { return [int64](New-Object System.IO.DriveInfo($root)).AvailableFreeSpace } catch { return $null }
         }
+        # Release mode. GET Url: the body as Text, or into OutFile when one is given (then Text
+        # is $null on success). Returns @{ Status = <HTTP status; 0 when nothing answered>; Text }.
+        http = {
+            param([string]$Url, [string]$OutFile)
+            Invoke-DOA4Http -Url $Url -OutFile $OutFile
+        }
+        # The executable paths of the running processes with this image name (without .exe). A
+        # process whose path Windows does not give (another user's, an elevated one) is left out.
+        processPaths = {
+            param([string]$Name)
+            @(Get-Process -Name $Name -ErrorAction SilentlyContinue | ForEach-Object { $_.Path } | Where-Object { $_ })
+        }
+        # Renames (moves) a folder; throws when Windows refuses.
+        rename = {
+            param([string]$From, [string]$To)
+            [IO.Directory]::Move($From, $To)
+        }
+    }
+}
+
+# GET over HTTPS (TLS 1.2) with the launcher's User-Agent, following redirects (GitHub's file
+# downloads redirect to its storage host). Never throws: an answer with any status is returned
+# as that status, and no answer at all (no network, a name that does not resolve, a TLS
+# failure) as Status 0 with the reason in Text.
+function Invoke-DOA4Http {
+    param([Parameter(Mandatory = $true)][string]$Url, [string]$OutFile)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $req = [Net.WebRequest]::Create($Url)
+        $req.UserAgent = 'DOA4-launcher'
+        if (-not $OutFile) { $req.Accept = 'application/vnd.github+json' }
+        $req.Timeout = 60000
+        $req.ReadWriteTimeout = 120000
+        $resp = $null
+        try {
+            $resp = $req.GetResponse()
+        } catch {
+            # An HTTP error status arrives as a WebException that carries the response.
+            $e = $_.Exception
+            while ($e -and -not ($e -is [Net.WebException])) { $e = $e.InnerException }
+            if (-not $e -or -not $e.Response) { throw }
+            $resp = $e.Response
+        }
+        try {
+            $status = [int]$resp.StatusCode
+            $stream = $resp.GetResponseStream()
+            if ($OutFile -and $status -ge 200 -and $status -lt 300) {
+                $fs = [IO.File]::Create($OutFile)
+                try { $stream.CopyTo($fs) } finally { $fs.Dispose() }
+                return @{ Status = $status; Text = $null }
+            }
+            $reader = New-Object System.IO.StreamReader($stream, $script:Utf8NoBom)
+            try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            return @{ Status = $status; Text = $text }
+        } finally {
+            $resp.Close()
+        }
+    } catch {
+        $e = $_.Exception
+        $web = $e
+        while ($web -and -not ($web -is [Net.WebException])) { $web = $web.InnerException }
+        if ($web) { $e = $web } else { while ($e.InnerException) { $e = $e.InnerException } }
+        return @{ Status = 0; Text = $e.Message }
     }
 }
 
@@ -968,7 +1031,8 @@ function Get-DOA4TomlString {
 
 function Get-DOA4Settings {
     param([Parameter(Mandatory = $true)][string]$Path)
-    $s = @{ gameFiles = ''; lastBuild = $null }
+    # source: 'release', 'source' or '' (not chosen); lastRelease: the release installed in release\.
+    $s = @{ gameFiles = ''; lastBuild = $null; source = ''; lastRelease = $null }
     if (-not (Test-Path -LiteralPath $Path)) { return $s }
     try {
         $o = (Read-DOA4TextFile $Path).Text | ConvertFrom-Json
@@ -978,6 +1042,13 @@ function Get-DOA4Settings {
     if ($o.PSObject.Properties['gameFiles']) { $s.gameFiles = [string]$o.gameFiles }
     if ($o.PSObject.Properties['lastBuild'] -and $o.lastBuild) {
         $s.lastBuild = @{ game = [string]$o.lastBuild.game; sdk = [string]$o.lastBuild.sdk; time = [string]$o.lastBuild.time }
+    }
+    if ($o.PSObject.Properties['source'] -and $o.source) { $s.source = [string]$o.source }
+    if ($o.PSObject.Properties['lastRelease'] -and $o.lastRelease) {
+        $lr = $o.lastRelease
+        $s.lastRelease = @{ tag = ''; time = '' }
+        if ($lr.PSObject.Properties['tag']) { $s.lastRelease.tag = [string]$lr.tag }
+        if ($lr.PSObject.Properties['time']) { $s.lastRelease.time = [string]$lr.time }
     }
     return $s
 }
@@ -1119,6 +1190,9 @@ function New-DOA4Context {
         SettingsPath = (Join-Path $launcherDir 'settings.json')
         GamePath = $game; SdkPath = (Join-Path $root 'rexglue-sdk'); UserData = (Join-Path $root 'userdata')
         BuildDir = $buildDir; ExePath = (Join-Path $buildDir $script:ExeName); TomlPath = (Join-Path $buildDir $script:TomlName)
+        # Release mode: the installed release, the download being checked, the previous release
+        # during the swap (Install-DOA4Release).
+        ReleaseDir = (Join-Path $root 'release'); ReleaseNewDir = (Join-Path $root 'release_new'); ReleaseOldDir = (Join-Path $root 'release_old')
     }
 }
 
@@ -1143,7 +1217,46 @@ function Get-DOA4LogSink {
 
 function Test-DOA4HasFirstRunSetup {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    # A release is built from the netplay branch, which has the first-run setup.
+    if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') { return $true }
     return (Test-Path -LiteralPath (Join-Path $Ctx.GamePath 'src\doa4_setup_dialog.cpp'))
+}
+
+# Where this DOA4 folder gets the game from: 'release' or 'source'. The choice saved in
+# settings.json (the window's "Get the game from") wins; else a folder that already holds a
+# doa4-recomp clone builds from source (installs made before release mode keep working);
+# else config.ps1's DefaultSource. A config.ps1 without DefaultSource predates release mode
+# and means 'source'.
+function Get-DOA4Source {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    $saved = ([string](Get-DOA4Settings $Ctx.SettingsPath).source).Trim().ToLowerInvariant()
+    if ($saved -eq 'release' -or $saved -eq 'source') { return $saved }
+    if (Test-Path -LiteralPath (Join-Path $Ctx.GamePath '.git')) { return 'source' }
+    $c = $Ctx.Config
+    if (-not $c.ContainsKey('DefaultSource') -or -not $c['DefaultSource']) { return 'source' }
+    $d = ([string]$c['DefaultSource']).Trim().ToLowerInvariant()
+    if ($d -eq 'release' -or $d -eq 'source') { return $d }
+    throw ("config.ps1: DefaultSource must be 'release' or 'source', not '{0}'." -f $c['DefaultSource'])
+}
+
+# Saves the window's choice in settings.json, keeping every other setting.
+function Set-DOA4Source {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx, [Parameter(Mandatory = $true)][ValidateSet('release', 'source')][string]$Source)
+    $s = Get-DOA4Settings $Ctx.SettingsPath
+    $s.source = $Source.ToLowerInvariant()
+    Save-DOA4Settings -Path $Ctx.SettingsPath -Settings $s
+}
+
+# The folder the game runs from: release\ in release mode, the build folder from source.
+function Get-DOA4GameDir {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') { return $Ctx.ReleaseDir }
+    return $Ctx.BuildDir
+}
+
+function Get-DOA4ExePath {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    return (Join-Path (Get-DOA4GameDir -Ctx $Ctx) $script:ExeName)
 }
 
 function Get-DOA4Head {
@@ -1157,6 +1270,12 @@ function Get-DOA4Head {
 # 'not built', 'out of date' (a repository HEAD moved since the last successful build) or 'built'.
 function Get-DOA4BuildStatus {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    # Release mode: the same words (the window and -Action Status read them); a release is
+    # 'built' once its exe is in release\ (whether a newer one exists is Update's question).
+    if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') {
+        if (Test-Path -LiteralPath (Join-Path $Ctx.ReleaseDir $script:ExeName)) { return 'built' }
+        return 'not built'
+    }
     if (-not (Test-Path -LiteralPath $Ctx.ExePath)) { return 'not built' }
     $s = Get-DOA4Settings $Ctx.SettingsPath
     if (-not $s.lastBuild) { return 'out of date' }
@@ -1234,6 +1353,13 @@ function Write-DOA4DryRun {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [string[]]$AssumeMissing = @())
     $p = Get-DOA4InstallPlan -Ctx $Ctx -AssumeMissing $AssumeMissing
     Write-DOA4Log $Ctx 'Dry run: nothing is installed, cloned or built.'
+    if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') {
+        $rc = Get-DOA4ReleaseConfig $Ctx.Config
+        $which = "the newest $($rc.Channel) release"
+        if ($rc.Tag) { $which = "the release $($rc.Tag) (ReleaseTag in config.ps1)" }
+        Write-DOA4Log $Ctx ('Get the game from: Releases. Install downloads {0} of github.com/{1} ({2} and SHA256SUMS.txt) into {3}, checks every file, and makes the desktop shortcut; it needs none of the tools below.' -f $which, $rc.Repo, ($rc.Assets -join ', '), $Ctx.ReleaseDir)
+        Write-DOA4Log $Ctx 'What building from source (the advanced choice) would install and do:'
+    }
     foreach ($t in $p.Status) { Write-DOA4Log $Ctx ('  {0}: {1}' -f $t.Name, $t.Detail) }
     if ($p.Plan.Blocked) { Write-DOA4Log $Ctx $p.Plan.Blocked }
     if ($p.Plan.Items.Count -eq 0) {
@@ -1252,6 +1378,7 @@ function Write-DOA4DryRun {
 # Tools are installed only with -ToolsApproved (the window's one confirmation).
 function Invoke-DOA4Install {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [switch]$ToolsApproved)
+    if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') { return Invoke-DOA4ReleaseAction -Ctx $Ctx -Kind 'install' }
     $c = $Ctx.Config
     $step = 'Folder'
     $problem = Get-DOA4RootProblem $Ctx.Root
@@ -1425,6 +1552,7 @@ function Update-DOA4RepoToRef {
 # taken out before the pull and put back afterwards (also when the pull fails).
 function Invoke-DOA4Update {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') { return Invoke-DOA4ReleaseAction -Ctx $Ctx -Kind 'update' }
     $c = $Ctx.Config
     $step = 'Folder'
     $problem = Get-DOA4RootProblem $Ctx.Root
@@ -1515,6 +1643,379 @@ function Invoke-DOA4Update {
     }
 }
 
+# ------------------------------------------------------------------------------------------
+# Release mode: Install and Update from the GitHub releases
+# ------------------------------------------------------------------------------------------
+
+$script:SumsName = 'SHA256SUMS.txt'
+# Left behind by the in-game updater's swap (the files it replaced); never carried over.
+$script:OldPattern = '*.old'
+
+# What an update carries from the old release\ into the new one: every entry that is not a
+# release file (the ReleaseAssets, SHA256SUMS.txt) and not *.old - the game's toml and logs\,
+# imgui.ini, anything the player added. Returns @{ Carry; Drop } (entry names).
+function Get-DOA4CarryOver {
+    param([Parameter(Mandatory = $true)][string]$Dir, [Parameter(Mandatory = $true)][string[]]$ReleaseFiles)
+    $carry = New-Object System.Collections.Generic.List[string]
+    $drop = New-Object System.Collections.Generic.List[string]
+    foreach ($e in @(Get-ChildItem -LiteralPath $Dir -Force)) {
+        if ($ReleaseFiles -contains $e.Name) { continue }
+        if ($e.Name -like $script:OldPattern) { $drop.Add($e.Name) } else { $carry.Add($e.Name) }
+    }
+    [pscustomobject]@{ Carry = $carry.ToArray(); Drop = $drop.ToArray() }
+}
+
+# Why release\ does not hold an intact copy of its release, or $null: every ReleaseAsset must
+# be there with the SHA-256 the SHA256SUMS.txt kept beside it names (exactly one line each).
+function Get-DOA4ReleaseDamage {
+    param([Parameter(Mandatory = $true)][string]$Dir, [Parameter(Mandatory = $true)][string[]]$Assets)
+    $sumsPath = Join-Path $Dir $script:SumsName
+    if (-not (Test-Path -LiteralPath $sumsPath -PathType Leaf)) { return "the release folder has no $($script:SumsName) to check against" }
+    $sums = Read-DOA4Sums $sumsPath
+    foreach ($n in $Assets) {
+        $p = Join-Path $Dir $n
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return "$n is missing" }
+        if (-not $sums.Count.ContainsKey($n) -or $sums.Count[$n] -ne 1) { return "$n has no single line in $($script:SumsName)" }
+        $got = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -cne $sums.Hex[$n]) { return "$n does not match $($script:SumsName) (a damaged file)" }
+    }
+    return $null
+}
+
+# config.ps1's release keys; throws a readable message when one is missing.
+function Get-DOA4ReleaseConfig {
+    param([Parameter(Mandatory = $true)][hashtable]$Config)
+    foreach ($k in @('ReleaseRepo', 'ReleaseChannel', 'ReleaseAssets')) {
+        if (-not $Config.ContainsKey($k) -or -not $Config[$k]) {
+            throw "config.ps1 has no $k. Release mode needs ReleaseRepo, ReleaseChannel and ReleaseAssets (the launcher's own config.ps1 has them)."
+        }
+    }
+    $tag = ''
+    if ($Config.ContainsKey('ReleaseTag') -and $Config['ReleaseTag']) { $tag = ([string]$Config['ReleaseTag']).Trim() }
+    [pscustomobject]@{
+        Repo = [string]$Config['ReleaseRepo']; Channel = [string]$Config['ReleaseChannel']
+        Assets = [string[]]@($Config['ReleaseAssets']); Tag = $tag
+    }
+}
+
+# The version of a tag as the game's rules::ParseVersion reads it (src/net/np_rules.cpp): the
+# text after the last '-', an optional 'v', then three numbers of 1 to 9 digits separated by
+# dots, nothing else. $null when the tag is not a version.
+function ConvertTo-DOA4Version {
+    param([string]$Tag)
+    if (-not $Tag) { return $null }
+    $m = [regex]::Match($Tag.Substring($Tag.LastIndexOf('-') + 1), '^v?([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})\z')
+    if (-not $m.Success) { return $null }
+    return , [int[]]@([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value)
+}
+
+function Compare-DOA4Version {
+    param([int[]]$A, [int[]]$B)
+    for ($i = 0; $i -lt 3; $i++) {
+        if ($A[$i] -lt $B[$i]) { return -1 }
+        if ($A[$i] -gt $B[$i]) { return 1 }
+    }
+    return 0
+}
+
+function Get-DOA4JsonValue {
+    param($Object, [string]$Name)
+    if ($null -eq $Object -or $Object -is [string] -or $Object -is [ValueType]) { return $null }
+    if ($Object.PSObject.Properties[$Name]) { return $Object.$Name }
+    return $null
+}
+
+# The release to install, from GitHub's list of the repository's releases (the newest 30):
+# @{ Tag; Assets = @{ <name> = <browser_download_url> } } with exactly the ReleaseAssets and
+# SHA256SUMS.txt. Without a pin, the rule of the game's rules::PickRelease: the highest
+# version among the non-draft releases tagged '<channel>-v<a.b.c>' that have every one of those
+# files (exact names; pre-releases count). With a pin (-Tag, else ReleaseTag in config.ps1):
+# the release with exactly that tag, non-draft, with every file. Throws a readable message
+# when GitHub cannot be read or no release fits.
+function Get-DOA4Release {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx, [string]$Tag)
+    $rc = Get-DOA4ReleaseConfig $Ctx.Config
+    if (-not $PSBoundParameters.ContainsKey('Tag')) { $Tag = $rc.Tag }
+    $required = @($rc.Assets) + @($script:SumsName)
+    $url = 'https://api.github.com/repos/{0}/releases?per_page=30' -f $rc.Repo
+    $where = "the releases of github.com/$($rc.Repo)"
+    $r = & $Ctx.Cmd.http $url ''
+    if ($r.Status -eq 0) { throw ('Could not reach GitHub to read {0}: {1}' -f $where, $r.Text) }
+    if ($r.Status -ne 200) {
+        $detail = ([string]$r.Text).Trim()
+        try {
+            $o = ConvertFrom-Json -InputObject ([string]$r.Text)
+            $m = Get-DOA4JsonValue $o 'message'
+            if ($m) { $detail = [string]$m }
+        } catch { }
+        if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) + '...' }
+        throw ('GitHub answered HTTP {0} when asked for {1}: {2}' -f $r.Status, $where, $detail)
+    }
+    try { $list = ConvertFrom-Json -InputObject ([string]$r.Text) } catch { throw "GitHub's answer for $where could not be read (not JSON)." }
+    if (-not ($list -is [array])) { throw "GitHub's answer for $where is not a list of releases." }
+
+    $best = $null
+    $bestVersion = $null
+    $pinNote = 'it is not among the newest 30 releases'
+    foreach ($rel in $list) {
+        $tagName = [string](Get-DOA4JsonValue $rel 'tag_name')
+        if (-not $tagName) { continue }
+        $version = $null
+        if ($Tag) {
+            if ($tagName -cne $Tag) { continue }
+        } else {
+            if (-not $tagName.StartsWith($rc.Channel + '-v', [StringComparison]::Ordinal)) { continue }
+            $version = ConvertTo-DOA4Version $tagName
+            if ($null -eq $version) { continue }
+        }
+        if ((Get-DOA4JsonValue $rel 'draft') -eq $true) { $pinNote = 'it is a draft'; continue }
+        $urls = @{}
+        foreach ($a in @(Get-DOA4JsonValue $rel 'assets')) {
+            $name = [string](Get-DOA4JsonValue $a 'name')
+            $link = [string](Get-DOA4JsonValue $a 'browser_download_url')
+            if ($name -and $link -and $required -ccontains $name -and -not $urls.ContainsKey($name)) { $urls[$name] = $link }
+        }
+        $lacking = @($required | Where-Object { -not $urls.ContainsKey($_) })
+        if ($lacking.Count -gt 0) { $pinNote = 'it has no ' + ($lacking -join ', '); continue }
+        if ($Tag) {
+            if (-not $best) { $best = @{ Tag = $tagName; Assets = $urls } }
+            continue
+        }
+        if (-not $best -or (Compare-DOA4Version $version $bestVersion) -gt 0) {
+            $best = @{ Tag = $tagName; Assets = $urls }
+            $bestVersion = $version
+        }
+    }
+    if ($best) { return $best }
+    if ($Tag) { throw ('The pinned release {0} (ReleaseTag in config.ps1) cannot be installed from {1}: {2}.' -f $Tag, $where, $pinNote) }
+    throw ('No {0} release with all its files ({1}) was found among {2}. Try again later, or choose Build from source.' -f $rc.Channel, ($required -join ', '), $where)
+}
+
+# SHA256SUMS.txt as the in-game updater reads it (ParseSums, src/doa4_updater.cpp): lines
+# "<64 hex digits> <' ' or '*'><name>", a BOM and trailing CRs ignored, other lines skipped.
+# Hex holds each name's lower-case hash, Count how many lines named it (exact names).
+function Read-DOA4Sums {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $hex = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    $count = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    foreach ($line in ((Read-DOA4TextFile $Path).Text -split "`n")) {
+        $l = $line.TrimEnd([char]13)
+        if ($l.Length -lt 67 -or $l[64] -ne [char]' ' -or ($l[65] -ne [char]' ' -and $l[65] -ne [char]'*')) { continue }
+        $h = $l.Substring(0, 64)
+        if ($h -notmatch '^[0-9A-Fa-f]{64}$') { continue }
+        $name = $l.Substring(66)
+        $hex[$name] = $h.ToLowerInvariant()
+        if ($count.ContainsKey($name)) { $count[$name] = $count[$name] + 1 } else { $count[$name] = 1 }
+    }
+    [pscustomobject]@{ Hex = $hex; Count = $count }
+}
+
+# The path of a running dead_or_alive_4.exe started from release\, or $null.
+function Get-DOA4RunningRelease {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    $want = ConvertTo-DOA4PathKey (Join-Path $Ctx.ReleaseDir $script:ExeName)
+    foreach ($p in @(& $Ctx.Cmd.processPaths ([IO.Path]::GetFileNameWithoutExtension($script:ExeName)))) {
+        if (-not $p) { continue }
+        $key = $null
+        try { $key = ConvertTo-DOA4PathKey ([string]$p) } catch { continue }
+        if ($key -eq $want) { return [string]$p }
+    }
+    return $null
+}
+
+# Install and Update in release mode. Refuses while the game runs from release\. Puts back what
+# an earlier run that was cut off left (release_old\ without release\ is the last good release;
+# release_new\ is an unchecked download). Asks GitHub for the release (Get-DOA4Release); when
+# settings.json's lastRelease is that tag and every file in release\ still matches the
+# SHA256SUMS.txt kept there: "nothing new" (else the same tag is reinstalled, the log says
+# why). Else downloads every file and SHA256SUMS.txt into release_new\, checks each file's
+# SHA-256 (a file without exactly one line, or another hash: release_new\ is deleted, release\
+# untouched), copies everything else in release\ but *.old (Get-DOA4CarryOver) into
+# release_new\, then renames release -> release_old and
+# release_new -> release (when the second rename fails, release_old goes back), deletes
+# release_old and records source and lastRelease in settings.json.
+# Returns @{ Tag; Changed; Message }; throws on failure, the step in the exception's
+# Data['DOA4Step'].
+function Install-DOA4Release {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx)
+    $rel = $Ctx.ReleaseDir
+    $new = $Ctx.ReleaseNewDir
+    $old = $Ctx.ReleaseOldDir
+    $step = 'Running game'
+    try {
+        $rc = Get-DOA4ReleaseConfig $Ctx.Config
+        $required = @($rc.Assets) + @($script:SumsName)
+        Set-DOA4Step $Ctx $step 'running'
+        $running = Get-DOA4RunningRelease $Ctx
+        if ($running) { throw ('The game is running from {0}: close it, then try again (its files cannot be replaced while it runs).' -f $running) }
+        Set-DOA4Step $Ctx $step 'done' 'not running from the release folder'
+
+        if (Test-Path -LiteralPath $old) {
+            if (Test-Path -LiteralPath $rel) {
+                Remove-Item -LiteralPath $old -Recurse -Force
+                Write-DOA4Log $Ctx "  deleted $old (left by an earlier update)"
+            } else {
+                & $Ctx.Cmd.rename $old $rel
+                Write-DOA4Log $Ctx "  put the previous release back from $old (an earlier update was cut off)"
+            }
+        }
+        if (Test-Path -LiteralPath $new) {
+            Remove-Item -LiteralPath $new -Recurse -Force
+            Write-DOA4Log $Ctx "  deleted $new (an unfinished download)"
+        }
+
+        $step = 'Release'
+        Set-DOA4Step $Ctx $step 'running' ("asking github.com/{0} for its releases" -f $rc.Repo)
+        $pick = Get-DOA4Release -Ctx $Ctx
+        $s = Get-DOA4Settings $Ctx.SettingsPath
+        $installed = ''
+        if ($s.lastRelease) { $installed = [string]$s.lastRelease.tag }
+        if ($installed -ceq $pick.Tag) {
+            # The same release: nothing new only while every installed file still matches.
+            $damage = Get-DOA4ReleaseDamage -Dir $rel -Assets $rc.Assets
+            if (-not $damage) {
+                $msg = "nothing new: $($pick.Tag) is installed"
+                Set-DOA4Step $Ctx $step 'done' $msg
+                return [pscustomobject]@{ Tag = $pick.Tag; Changed = $false; Message = $msg }
+            }
+            Write-DOA4Log $Ctx ("  reinstalling {0}: {1}" -f $pick.Tag, $damage)
+        }
+        $from = 'nothing installed'
+        if ($installed) { $from = "installed: $installed" }
+        Set-DOA4Step $Ctx $step 'done' ("{0} ({1})" -f $pick.Tag, $from)
+
+        $step = 'Download'
+        Set-DOA4Step $Ctx $step 'running' ("{0} files of {1}" -f $required.Count, $pick.Tag)
+        [void](New-Item -ItemType Directory -Path $new)
+        try {
+            foreach ($n in $required) {
+                $out = Join-Path $new $n
+                $r = & $Ctx.Cmd.http $pick.Assets[$n] $out
+                if ($r.Status -eq 0) { throw ('Downloading {0} of {1} failed (no answer: {2}). Nothing was installed.' -f $n, $pick.Tag, $r.Text) }
+                if ($r.Status -lt 200 -or $r.Status -ge 300) { throw ('Downloading {0} of {1} failed (HTTP {2}). Nothing was installed.' -f $n, $pick.Tag, $r.Status) }
+                if (-not (Test-Path -LiteralPath $out -PathType Leaf)) { throw ('Downloading {0} of {1} left no file. Nothing was installed.' -f $n, $pick.Tag) }
+                Write-DOA4Log $Ctx ('  {0}: {1} bytes' -f $n, (Get-Item -LiteralPath $out).Length)
+            }
+            Set-DOA4Step $Ctx $step 'done'
+
+            $step = 'Checksums'
+            Set-DOA4Step $Ctx $step 'running'
+            $sums = Read-DOA4Sums (Join-Path $new $script:SumsName)
+            foreach ($n in $rc.Assets) {
+                if (-not $sums.Count.ContainsKey($n)) { throw ('{0} has no line in SHA256SUMS.txt of {1}. Nothing was installed.' -f $n, $pick.Tag) }
+                if ($sums.Count[$n] -ne 1) { throw ('{0} has {1} lines in SHA256SUMS.txt of {2}. Nothing was installed.' -f $n, $sums.Count[$n], $pick.Tag) }
+                $got = (Get-FileHash -LiteralPath (Join-Path $new $n) -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($got -cne $sums.Hex[$n]) {
+                    throw ('The downloaded {0} does not match SHA256SUMS.txt of {1} (a broken download, or something on the way changed it). Nothing was installed.' -f $n, $pick.Tag)
+                }
+            }
+            Set-DOA4Step $Ctx $step 'done' 'every file matches SHA256SUMS.txt'
+
+            $step = 'Swap'
+            Set-DOA4Step $Ctx $step 'running'
+            if (Test-Path -LiteralPath $rel) {
+                $co = Get-DOA4CarryOver -Dir $rel -ReleaseFiles $required
+                foreach ($n in $co.Carry) {
+                    Copy-Item -LiteralPath (Join-Path $rel $n) -Destination (Join-Path $new $n) -Recurse -Force
+                }
+                if ($co.Carry.Count -gt 0) { Write-DOA4Log $Ctx ('  carried over from the old release folder: ' + ($co.Carry -join ', ')) }
+                if ($co.Drop.Count -gt 0) { Write-DOA4Log $Ctx ('  not carried over (the in-game updater''s old files): ' + ($co.Drop -join ', ')) }
+            }
+        } catch {
+            Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue
+            throw
+        }
+
+        $hadOld = Test-Path -LiteralPath $rel
+        if ($hadOld) {
+            try {
+                & $Ctx.Cmd.rename $rel $old
+            } catch {
+                $why = $_.Exception.Message
+                Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue
+                throw ('Could not move the installed release aside ({0}). Is a file in {1} open? Nothing was changed.' -f $why, $rel)
+            }
+        }
+        try {
+            & $Ctx.Cmd.rename $new $rel
+        } catch {
+            $why = $_.Exception.Message
+            if ($hadOld) {
+                try {
+                    & $Ctx.Cmd.rename $old $rel
+                } catch {
+                    throw ('Could not move the new release into place ({0}), and the previous release could not be put back ({1}): it is in {2}; the next Install or Update puts it back.' -f $why, $_.Exception.Message, $old)
+                }
+            }
+            Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue
+            if ($hadOld) { throw ('Could not move the new release into place ({0}); the previous release is back in place.' -f $why) }
+            throw ('Could not move the new release into place ({0}).' -f $why)
+        }
+        if ($hadOld) {
+            try {
+                Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop
+            } catch {
+                Write-DOA4Log $Ctx ('  could not delete {0} ({1}); the next Install or Update deletes it' -f $old, $_.Exception.Message)
+            }
+        }
+        $s = Get-DOA4Settings $Ctx.SettingsPath
+        $s.source = 'release'
+        $s.lastRelease = @{ tag = $pick.Tag; time = (Get-Date).ToString('s') }
+        Save-DOA4Settings -Path $Ctx.SettingsPath -Settings $s
+        Set-DOA4Step $Ctx $step 'done' ("{0} is in {1}" -f $pick.Tag, $rel)
+        return [pscustomobject]@{ Tag = $pick.Tag; Changed = $true; Message = "installed $($pick.Tag)" }
+    } catch {
+        $msg = $_.Exception.Message
+        Set-DOA4Step $Ctx $step 'failed' $msg
+        $ex = New-Object System.Exception($msg, $_.Exception)
+        $ex.Data['DOA4Step'] = $step
+        throw $ex
+    }
+}
+
+# Invoke-DOA4Install / Invoke-DOA4Update in release mode: the folder rule, then
+# Install-DOA4Release; Install also makes the desktop shortcut. Update refuses a folder with no
+# release installed, as the source path does.
+function Invoke-DOA4ReleaseAction {
+    param([Parameter(Mandatory = $true)][hashtable]$Ctx, [Parameter(Mandatory = $true)][ValidateSet('install', 'update')][string]$Kind)
+    $step = 'Folder'
+    $problem = Get-DOA4RootProblem $Ctx.Root
+    if ($problem) { Set-DOA4Step $Ctx $step 'failed' $problem; return New-DOA4StepResult $false $step $problem $Ctx }
+    Set-DOA4Step $Ctx $step 'done' $Ctx.Root
+    if ($Kind -eq 'update' -and -not (Test-Path -LiteralPath (Join-Path $Ctx.ReleaseDir $script:ExeName)) -and
+        -not (Test-Path -LiteralPath (Join-Path $Ctx.ReleaseOldDir $script:ExeName))) {
+        $step = 'Release'
+        $msg = 'Not installed yet: run Install first.'
+        Set-DOA4Step $Ctx $step 'failed' $msg
+        return New-DOA4StepResult $false $step $msg $Ctx
+    }
+    try {
+        $r = Install-DOA4Release -Ctx $Ctx
+    } catch {
+        $failed = 'Release'
+        if ($_.Exception.Data.Contains('DOA4Step')) { $failed = [string]$_.Exception.Data['DOA4Step'] }
+        return New-DOA4StepResult $false $failed $_.Exception.Message $Ctx
+    }
+    if ($Kind -eq 'install') {
+        $step = 'Shortcut'
+        try {
+            if ($Ctx.ShortcutFolder) {
+                $made = New-DOA4Shortcut -Folder $Ctx.ShortcutFolder -LauncherScript $Ctx.LauncherScript -IconPath (Join-Path $Ctx.ReleaseDir $script:ExeName)
+                Set-DOA4Step $Ctx $step 'done' $made
+            } else {
+                Set-DOA4Step $Ctx $step 'skipped' 'no shortcut folder given'
+            }
+        } catch {
+            $msg = $_.Exception.Message
+            Set-DOA4Step $Ctx $step 'failed' $msg
+            return New-DOA4StepResult $false $step $msg $Ctx
+        }
+    }
+    if (-not $r.Changed) { return New-DOA4StepResult $true '' $r.Message $Ctx }
+    if ($Kind -eq 'install') { return New-DOA4StepResult $true '' ("Installed {0}." -f $r.Tag) $Ctx }
+    return New-DOA4StepResult $true '' ("Updated to {0}." -f $r.Tag) $Ctx
+}
+
 # Play: a build with the first-run setup gets no game path (it asks for its files itself);
 # any other build gets the launcher's Game files setting as --game_data_root.
 function Get-DOA4PlayArguments {
@@ -1534,9 +2035,10 @@ function Get-DOA4PlayArguments {
 function Get-DOA4GameStartInfo {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [string]$GameFiles)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Ctx.ExePath
+    # The release's exe in release mode, the built one from source (Get-DOA4GameDir).
+    $psi.FileName = Get-DOA4ExePath -Ctx $Ctx
     $psi.Arguments = ConvertTo-DOA4ArgumentString (Get-DOA4PlayArguments -Ctx $Ctx -GameFiles $GameFiles)
-    $psi.WorkingDirectory = $Ctx.BuildDir
+    $psi.WorkingDirectory = Get-DOA4GameDir -Ctx $Ctx
     # Through the shell: the game must not inherit the launcher's console or output pipe
     # (a caller capturing the launcher's output would otherwise wait for the game to exit).
     $psi.UseShellExecute = $true
@@ -1547,7 +2049,11 @@ function Start-DOA4Game {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx, [string]$GameFiles)
     $problem = Get-DOA4RootProblem $Ctx.Root
     if ($problem) { throw $problem }
-    if (-not (Test-Path -LiteralPath $Ctx.ExePath)) { throw 'The game is not built yet: run Install.' }
+    $exe = Get-DOA4ExePath -Ctx $Ctx
+    if (-not (Test-Path -LiteralPath $exe)) {
+        if ((Get-DOA4Source -Ctx $Ctx) -eq 'release') { throw 'The game is not installed yet: run Install.' }
+        throw 'The game is not built yet: run Install.'
+    }
     $a = Get-DOA4PlayArguments -Ctx $Ctx -GameFiles $GameFiles
     if (-not (Test-DOA4HasFirstRunSetup $Ctx)) {
         $gf = ($a | Where-Object { $_.StartsWith('--game_data_root=') }).Substring(17)
@@ -1556,7 +2062,7 @@ function Start-DOA4Game {
     }
     if (-not (Test-Path -LiteralPath $Ctx.UserData)) { [void](New-Item -ItemType Directory -Path $Ctx.UserData) }
     $psi = Get-DOA4GameStartInfo -Ctx $Ctx -GameFiles $GameFiles
-    Write-DOA4Log $Ctx ('Play: {0} {1}' -f $Ctx.ExePath, $psi.Arguments)
+    Write-DOA4Log $Ctx ('Play: {0} {1}' -f $psi.FileName, $psi.Arguments)
     return [System.Diagnostics.Process]::Start($psi)
 }
 
@@ -1570,9 +2076,12 @@ function Set-DOA4GameFiles {
     if (-not $check.Ok) { throw $check.Message }
     $full = [IO.Path]::GetFullPath($Folder)
     if (Test-DOA4HasFirstRunSetup $Ctx) {
-        if (-not (Test-Path -LiteralPath $Ctx.BuildDir)) { throw 'The game is not built yet: run Install first.' }
-        $r = Set-DOA4TomlString -Path $Ctx.TomlPath -Key 'doa4_game_files' -Value ($full.Replace('\', '/'))
-        Write-DOA4Log $Ctx "Game files: $full (doa4_game_files in $($Ctx.TomlPath), $r; used from the next start)"
+        # The toml beside the exe the game runs: release\ in release mode, the build folder from source.
+        $dir = Get-DOA4GameDir -Ctx $Ctx
+        if (-not (Test-Path -LiteralPath $dir)) { throw 'The game is not built yet: run Install first.' }
+        $toml = Join-Path $dir $script:TomlName
+        $r = Set-DOA4TomlString -Path $toml -Key 'doa4_game_files' -Value ($full.Replace('\', '/'))
+        Write-DOA4Log $Ctx "Game files: $full (doa4_game_files in $toml, $r; used from the next start)"
         return 'toml'
     }
     $s = Get-DOA4Settings $Ctx.SettingsPath
@@ -1584,9 +2093,10 @@ function Set-DOA4GameFiles {
 
 function Get-DOA4FolderTargets {
     param([Parameter(Mandatory = $true)][hashtable]$Ctx)
-    $photos = Get-DOA4TomlString -Path $Ctx.TomlPath -Key 'doa4_photo_dir'
+    $dir = Get-DOA4GameDir -Ctx $Ctx
+    $photos = Get-DOA4TomlString -Path (Join-Path $dir $script:TomlName) -Key 'doa4_photo_dir'
     if (-not $photos) { $photos = Join-Path ([Environment]::GetFolderPath('MyPictures')) 'DOA4' }
-    @{ Photos = $photos; Saves = $Ctx.UserData; Logs = (Join-Path $Ctx.BuildDir 'logs') }
+    @{ Photos = $photos; Saves = $Ctx.UserData; Logs = (Join-Path $dir 'logs') }
 }
 
 Export-ModuleMember -Function *-DOA4*

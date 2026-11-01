@@ -28,4 +28,19 @@
     # Measured 2026-10-28: about 2.0 GB after a full upstream build (sources, submodules and
     # build folders); twice that leaves room for rebuilds and logs.
     RequiredFreeGB = 4
+
+    # Where the game comes from in a new DOA4 folder: 'release' (Install and Update download
+    # the newest release's files from GitHub, check each against the release's SHA256SUMS.txt
+    # and swap the release folder whole) or 'source' (clone and build, everything above).
+    # The window's choice, saved in launcher\settings.json, wins; a DOA4 folder that already
+    # holds a doa4-recomp clone keeps building from source.
+    DefaultSource  = 'release'
+
+    # The releases: GitHub repository, tag channel (tags '<channel>-v<a.b.c>') and the files
+    # a release must have (besides SHA256SUMS.txt). Empty ReleaseTag: the newest release; a
+    # tag (for example 'netplay-v1.0.7') pins that release.
+    ReleaseRepo    = 'Dwreckgg/doa4-recomp'
+    ReleaseChannel = 'netplay'
+    ReleaseAssets  = @('dead_or_alive_4.exe', 'rexruntime.dll', 'TracyClient.dll')
+    ReleaseTag     = ''
 }
