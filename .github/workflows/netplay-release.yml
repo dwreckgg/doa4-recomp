@@ -88,6 +88,8 @@ jobs:
         # Windows PowerShell 5.1 ships Pester 3.4, the version the launcher's tests are written for
         shell: powershell
         run: |
+          # the runner image also has a newer Pester whose syntax the 3.4 tests do not use: load the inbox 3.4.0 explicitly
+          Import-Module Pester -RequiredVersion 3.4.0 -Force
           $r = Invoke-Pester -Path doa4-recomp/launcher/tests -PassThru
           Write-Host "Pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.PendingCount) pending, $($r.SkippedCount) skipped"
           if ($r.FailedCount -gt 0 -or $r.PassedCount -lt 1) { throw 'launcher tests failed' }
@@ -96,14 +98,14 @@ jobs:
         run: |
           set "DOA4_CI=1"
           cd doa4-recomp
-          py -3 -I tests/tools/test_release_tools.py
+          python -I tests/tools/test_release_tools.py
           if errorlevel 1 exit /b 1
       - name: Netplay tool tests
         shell: cmd
         run: |
           set "DOA4_CI=1"
           cd doa4-recomp
-          py -3 -I tests/tools/test_np_tools.py
+          python -I tests/tools/test_np_tools.py
           if errorlevel 1 exit /b 1
       - name: Launcher zip
         shell: pwsh
