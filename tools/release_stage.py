@@ -8,7 +8,8 @@ download and, when given, the launcher zip. The release workflow publishes every
   dead_or_alive_4.exe, rexruntime.dll, TracyClient.dll   byte copies from --build (picked by name: nothing else there
                                                           is ever staged)
   SHA256SUMS.txt                                          "<sha256 lower hex>  <name>" per game file, LF, in that order
-  DOA4-<tag>-win64.zip                                    the three, SHA256SUMS.txt and README-netplay.txt
+  THIRD_PARTY_NOTICES.md                                  a byte copy of the repository's file (the BSD notice duty)
+  DOA4-<tag>-win64.zip                                    the three, SHA256SUMS.txt, THIRD_PARTY_NOTICES.md and README-netplay.txt
   DOA4-launcher.zip                                       a copy of --launcher-zip (only when given)
 Never game data. Refused (exit 1, the message names the file; nothing is staged): a missing game file; a name under
 a folder or matching *.xex, *.afs, *.sfd, *.dat (game data); a name that is not one of the three; a name given
@@ -26,6 +27,8 @@ import zipfile
 GAME_FILES = ("dead_or_alive_4.exe", "rexruntime.dll", "TracyClient.dll")
 SUMS = "SHA256SUMS.txt"
 README = "README-netplay.txt"
+NOTICES = "THIRD_PARTY_NOTICES.md"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAUNCHER = "DOA4-launcher.zip"
 GAME_DATA = re.compile(r".*\.(xex|afs|sfd|dat)", re.IGNORECASE)
 TAG = re.compile(r"[a-z0-9]+-v\d+\.\d+\.\d+")
@@ -65,8 +68,13 @@ def readme_text(tag, port_commit, sdk_commit):
         "SHA256SUMS.txt holds the SHA-256 of the three files.",
         "",
         "Needs Windows 10/11 64-bit, a CPU with AVX2 and at least two cores, and the Microsoft Visual C++ 2015-2022 x64",
-        "runtime. Online play: Esc menu, Online tab (Host, or Join with the other player's code). The first time you",
-        "host, Windows may ask whether to allow the game through the firewall: allow it.",
+        "runtime. Online play: Esc menu, Online tab (Host, or Join with the other player's code).",
+        "",
+        "Firewall: the first time you host or join, Windows asks whether to allow the game through the firewall. This",
+        "happens on both players' PCs. Tick both Private and Public networks (Public is unticked by default, and a",
+        "Public network then blocks the connection), then Allow. The prompt can hide behind the fullscreen game: press",
+        "Alt+Tab. If the other player still cannot connect, turn on UPnP in the host's router, or forward UDP 7200 to",
+        "the host PC.",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -93,6 +101,8 @@ def check_args(a):
     for name in GAME_FILES:
         if not os.path.isfile(os.path.join(a.build, name)):
             raise Refused(f"{name}: missing in {a.build}")
+    if not os.path.isfile(os.path.join(REPO, NOTICES)):
+        raise Refused(f"{NOTICES}: missing in {REPO}")
     if a.launcher_zip is not None and not os.path.isfile(a.launcher_zip):
         raise Refused(f"{a.launcher_zip}: the launcher zip is missing")
     if os.path.exists(a.out) and (not os.path.isdir(a.out) or os.listdir(a.out)):
@@ -103,6 +113,7 @@ def stage(a):
     os.makedirs(a.out, exist_ok=True)
     for name in GAME_FILES:
         shutil.copyfile(os.path.join(a.build, name), os.path.join(a.out, name))
+    shutil.copyfile(os.path.join(REPO, NOTICES), os.path.join(a.out, NOTICES))
     # the checksums are of the staged copies, the bytes that are published
     sums = "".join(f"{sha256(os.path.join(a.out, name))}  {name}\n" for name in GAME_FILES)
     with open(os.path.join(a.out, SUMS), "w", encoding="ascii", newline="\n") as f:
@@ -111,8 +122,9 @@ def stage(a):
     with zipfile.ZipFile(os.path.join(a.out, zip_name), "w", zipfile.ZIP_DEFLATED) as z:
         for name in GAME_FILES + (SUMS,):
             z.write(os.path.join(a.out, name), arcname=name)
+        z.write(os.path.join(a.out, NOTICES), arcname=NOTICES)
         z.writestr(README, readme_text(a.tag, a.port_commit, a.sdk_commit))
-    expected = set(GAME_FILES) | {SUMS, zip_name}
+    expected = set(GAME_FILES) | {SUMS, NOTICES, zip_name}
     if a.launcher_zip is not None:
         shutil.copyfile(a.launcher_zip, os.path.join(a.out, LAUNCHER))
         expected.add(LAUNCHER)

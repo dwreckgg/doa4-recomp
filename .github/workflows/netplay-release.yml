@@ -1,13 +1,16 @@
 name: Netplay release
 # Builds the netplay branch and publishes a pre-release netplay-v<major>.<minor>.<run> that both online players
-# download: the online handshake compares the compiled code, so players need the same exe. Only code changes
-# publish (paths). A tag netplay-publish-<n> publishes the same code again (a new run number).
+# download: the online handshake compares the compiled code, so players need the same exe.
+# PUBLISH RULE (the user's decision): a push to netplay publishes a release only when the GAME changes, so the paths
+# below are the game's inputs only (src, generated, third_party, the CMake files, hints, the manifest, the SDK pin).
+# A change to the launcher, the tests, the tools, the README or this workflow publishes nothing, so players are not
+# made to update for it. Such a change reaches players only by pushing a tag netplay-publish-<n> (after the user's
+# yes), which also publishes the same code again under a new run number.
 on:
   push:
     branches: [netplay]
-    paths: ['src/**', 'generated/**', 'third_party/**', 'tests/host/**', 'tools/release_stage.py',
-            'tools/run_host_tests.py', 'CMakeLists.txt', 'CMakePresets.json', 'hints.toml',
-            'dead_or_alive_4_manifest.toml', 'netplay_sdk.txt', 'launcher/**', '.github/workflows/netplay-release.yml']
+    paths: ['src/**', 'generated/**', 'third_party/**', 'CMakeLists.txt', 'CMakePresets.json', 'hints.toml',
+            'dead_or_alive_4_manifest.toml', 'netplay_sdk.txt']
     tags: ['netplay-publish-*']
 permissions:
   contents: write
@@ -81,6 +84,27 @@ jobs:
           set "DOA4_CI=1"
           python -I tools/run_host_tests.py
           if errorlevel 1 exit /b 1
+      - name: Launcher tests (Pester)
+        # Windows PowerShell 5.1 ships Pester 3.4, the version the launcher's tests are written for
+        shell: powershell
+        run: |
+          $r = Invoke-Pester -Path doa4-recomp/launcher/tests -PassThru
+          Write-Host "Pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.PendingCount) pending, $($r.SkippedCount) skipped"
+          if ($r.FailedCount -gt 0 -or $r.PassedCount -lt 1) { throw 'launcher tests failed' }
+      - name: Release tool tests
+        shell: cmd
+        run: |
+          set "DOA4_CI=1"
+          cd doa4-recomp
+          py -3 -I tests/tools/test_release_tools.py
+          if errorlevel 1 exit /b 1
+      - name: Netplay tool tests
+        shell: cmd
+        run: |
+          set "DOA4_CI=1"
+          cd doa4-recomp
+          py -3 -I tests/tools/test_np_tools.py
+          if errorlevel 1 exit /b 1
       - name: Launcher zip
         shell: pwsh
         run: ./doa4-recomp/launcher/make_zip.ps1 -Destination launcher_pkg -ZipPath DOA4-launcher.zip
@@ -104,7 +128,7 @@ jobs:
 
           Both players need this same release. Download the zip (or use the DOA4 launcher, or Check for Updates in the game's Online tab). No game data is included: you need your own Dead or Alive 4 (USA, Europe) (Rev 1) files.
           Needs Windows 10/11 64-bit, a CPU with AVX2 and at least two cores, and the Microsoft Visual C++ 2015-2022 x64 runtime.
-          The first time you host, Windows may ask whether to allow the game through the firewall: allow it.
+          Firewall: the first time you host or join, Windows asks whether to allow the game through the firewall, on both players' PCs. Tick both Private and Public networks (Public is unticked by default, and a Public network then blocks the connection), then Allow. The prompt can hide behind the fullscreen game: press Alt+Tab. If the other player still cannot connect, turn on UPnP in the host's router, or forward UDP 7200 to the host PC.
           "@
           Set-Content notes.md $notes -Encoding utf8
           gh release create ${{ steps.version.outputs.tag }} (Get-ChildItem staging).FullName --repo $env:GITHUB_REPOSITORY `

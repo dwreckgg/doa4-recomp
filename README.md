@@ -14,15 +14,26 @@ branch has been pushed anywhere; a fresh clone from GitHub gives the upstream ve
 
 ## Quick start: the one-click launcher
 
-The launcher installs what the build needs, downloads the sources, builds the game and makes a
-desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folder (`setup.bat` and a
+The launcher gets the game, either by downloading the newest netplay release (the default) or by
+building it from source, and makes a desktop shortcut; afterwards it plays and updates. It is a small folder (`setup.bat` and a
 `launcher` folder) made from this repository by `launcher\make_zip.ps1` (it writes
 `DOA4-launcher.zip`, or `-Destination <folder>` writes the folder directly).
 
 1. Put the `DOA4` folder somewhere whose path has only plain letters, digits and spaces (for
    example `C:\Games\DOA4`; the game cannot start from a path with accented or non-Latin letters).
-   Everything the launcher downloads and builds stays inside it (about 4 GB).
-2. Double-click `setup.bat` and press **Install**:
+   Everything the launcher downloads and builds stays inside it (about 4 GB when building from
+   source; a release download is far smaller).
+2. Double-click `setup.bat`. **Get the game from:** chooses what Install and Update do, and the
+   choice is saved:
+   - **Releases (recommended)** is the default for a new `DOA4` folder. Install and Update download
+     the newest netplay release's three files, check each against the release's `SHA256SUMS.txt` and
+     swap the `release` folder in whole. **No build tools are installed** (no Git, LLVM or Visual
+     Studio) and nothing is built; the steps are Folder, Running game, Release, Download, Checksums,
+     Swap and Shortcut. Use this to play online: both players need the same release.
+   - **Build from source (advanced)** is what the rest of this section describes. A `DOA4` folder
+     that already holds a `doa4-recomp` clone stays on it.
+
+   Then press **Install**. In source mode it does:
    - **Tools:** it checks for Git, LLVM 23.1.4 and Visual Studio 2026 Build Tools with the C++
      workload, lists any that are missing with their size, and installs them with winget after
      one confirmation (Visual Studio shows its own installer and asks for administrator rights).
@@ -33,7 +44,15 @@ desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folde
 3. Press **Play**. On the first start the game asks for your disc image or extracted folder
    ([step 5](#5-the-game-files)).
 4. Later: **Update & rebuild** fetches new commits and rebuilds ("nothing new" when there are none);
+   in release mode **Update** downloads the newest release instead.
    **Change game files**, **Open photos**, **Open saves** and **Open logs** do what they say.
+
+**Where the saves are:** the launcher always starts the game with its save folder set to
+`<DOA4 folder>\userdata`, so launcher installs keep their saves (and the shader cache) there. The zip
+route (below) starts the game by itself, and the game's default is `Documents\dead_or_alive_4` (the
+**Game** tab shows the folder in use). The two routes therefore see **different saves**: a save made
+with one does not appear in the other until you copy it across (**Open saves** in the launcher and the
+Game tab open the folders).
 
 ![The launcher before Install](docs/images/launcher.png)
 
@@ -62,7 +81,9 @@ and the Microsoft Visual C++ 2015-2022 x64 runtime.
   `dead_or_alive_4.exe`. On the first start it asks for your disc image or extracted folder.
   `SHA256SUMS.txt` (in the zip and on the page) holds the SHA-256 of the three files.
 - **Launcher:** `DOA4-launcher.zip` (on the same page) installs and updates the newest release
-  instead of building from source.
+  instead of building from source. A push that changes only the launcher (or the tests, tools or
+  README) publishes no release; such a change reaches players when a `netplay-publish-<n>` tag is
+  pushed, which publishes a new release.
 - **In the game:** **Check for Updates** in the Esc menu's **Online** tab downloads the newest
   release's three files, checks each against its `SHA256SUMS.txt` and swaps them in; restart the
   game afterwards. It is off while you are online.
@@ -79,7 +100,11 @@ and the Microsoft Visual C++ 2015-2022 x64 runtime.
    unlocked; neither player's own save is written. **F9** shows the ping and input delay over the game.
 4. **Leave online session** ends it; both games restart offline.
 
-The first time you host, Windows may ask whether to allow the game through the firewall: allow it.
+**Firewall (both players):** the first time you **Host or Join**, Windows asks whether to allow the game
+through the firewall. Tick **both Private and Public networks**: Public is unticked by default, and a
+Public network then blocks the connection. The prompt can hide behind the fullscreen game: press
+**Alt+Tab**. If the other player still cannot connect, turn on UPnP in the host's router, or forward
+UDP 7200 to the host PC.
 
 **What the messages mean:**
 
@@ -95,7 +120,9 @@ The first time you host, Windows may ask whether to allow the game through the f
 **When the code does not connect:** the host's game asks the router to open its port (UPnP). If the
 router does not, the host's tab offers **Strict router?** ("If the other player cannot connect, type
 the code they show and press Reach out."); failing that, forward UDP port 7200 (DOA4 uses 7200-7215:
-7200 unless another program holds it) on the host's router to the host PC.
+7200 unless another program holds it) on the host's router to the host PC. Some routers refuse a
+mapping that expires after an hour; the game then asks for a permanent one. A permanent mapping stays
+until the router restarts or you remove it in the router's own settings.
 
 **Session logs:** **Open session logs** in the Online tab opens `<saves folder>\netplay\sessions`
 (the saves folder is the one the Game tab shows, [step 7](#7-run)). After a desync, send the newest
@@ -284,7 +311,7 @@ can lock files the game is writing). The Esc menu's Game tab shows the folder in
 ![The Esc menu's Game tab: the game files folder (with Change... and Open folder) and the saves folder](docs/images/game-tab.png)
 
 - Settings live in `dead_or_alive_4.toml` next to the exe; the **Esc** menu edits them (tabs
-  Video, Controls, Photo, Extras, Game).
+  Video, Controls, Photo, Extras, Game, Online).
 - **F6** shows a diagnostics overlay.
 
 ### Photos
