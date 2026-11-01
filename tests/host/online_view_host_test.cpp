@@ -100,6 +100,11 @@ static void TestConnectedHost() {
   CHECK(!v.show_reach_out);
   CHECK(v.delay_enabled);
   CHECK(Has(v.status_line, "42 ms"));
+  // final review R2-I3: the Connected line names the peer's address (so the host can tell its friend from a stranger)
+  in.lobby.peer_address = "198.51.100.7:7200";
+  CHECK_EQ(Describe(in).status_line, "Connected to the other player at 198.51.100.7:7200 (ping 42 ms)");
+  in.lobby.peer_address.clear();
+  CHECK_EQ(Describe(in).status_line, "Connected to the other player (ping 42 ms)");  // no address known: as before
   in.lobby.ping_samples = 4;
   in.lobby.can_start = true;
   v = Describe(in);

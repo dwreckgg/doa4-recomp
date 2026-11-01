@@ -39,7 +39,7 @@ std::string JoinCodeTextOf(uint64_t packed, int symbols);
 bool ParseJoinCode(std::string_view text, Endpoint* out, uint16_t default_port = kPortBase);
 // The entry field's text when ParseJoinCode refuses, exactly (ASCII apostrophe and hyphen).
 inline constexpr const char* kBadCodeText = "That code doesn't look right - check it (capital letters matter)";
-std::string EndpointText(const Endpoint& ep);              // "a.b.c.d:port" (logs only; never shown on screen)
+std::string EndpointText(const Endpoint& ep);              // "a.b.c.d:port" (logs; and the peer in the Connected line, R2-I3)
 
 // ---- STUN (RFC 5389 binding) ----
 std::array<uint8_t, 20> StunRequest(const std::array<uint8_t, 12>& transaction);
@@ -58,11 +58,18 @@ Nat ClassifyNat(std::span<const Endpoint> answers);  // mapped endpoints, one pe
 //   kCone      "Public address found"
 //   kSymmetric "Your network changes ports per destination (symmetric NAT): players outside it may not reach you"
 const char* NatNote(Nat nat);
-// The connect-timeout text (spec 7: "Symmetric NAT on both sides / punch fails"), shown after EVERY timeout:
-//   "A direct connection is not possible between your networks; relay arrives with lobbies."
-//   " Also check the code you entered (capital letters matter)."
-// with " (Your network changes ports per destination.)" appended after both when this side is kSymmetric.
-std::string ConnectTimeoutText(Nat nat);
+// The connect-timeout text (spec 7), shown after EVERY timeout. Final review R2-I2: the likely causes come first, then
+// the ask to check the code (fix round 1), then the relay sentence (port = the port of the code the joiner typed):
+//   "Could not reach the host. Check that the host allows the game in Windows Firewall (Private AND Public networks)
+//    and has UPnP on the router, or forward UDP <port> to the host's PC. Also check the code you entered (capital
+//    letters matter). If all of that is in place, a direct connection is not possible between your networks; relay
+//    arrives with lobbies."
+// with " (Your network changes ports per destination.)" appended when this side is kSymmetric.
+std::string ConnectTimeoutText(Nat nat, uint16_t port);
+// The host's hint while it waits for a joiner (final review R2-I2), port = the lobby's own:
+//   "Give the other player your code; they join with it. If they cannot connect: allow the game in Windows Firewall
+//    (Private AND Public networks), and use UPnP on the router, or forward UDP <port> to this PC."
+std::string HostWaitingHint(uint16_t port);
 
 // ---- Input delay and pacing (spec 5) ----
 // retail (notes/research/doa4_own_online.md:81): no QoS -> 10; <= 33 ms -> 2; >= 266 ms -> 10; else

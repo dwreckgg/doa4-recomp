@@ -88,7 +88,9 @@ View Describe(const In& in) {
         v.show_disconnect = true;
         break;
       case State::kConnected:
-        v.status_line = "Connected to the other player (" +
+        // final review R2-I3: the peer's address, so a player can tell the friend from a stranger holding the slot
+        v.status_line = "Connected to the other player" +
+                        (st.peer_address.empty() ? std::string() : " at " + st.peer_address) + " (" +
                         (st.ping_samples > 0 ? "ping " + PingText(st.ping_ms) : std::string("measuring the ping...")) +
                         ")";
         v.show_disconnect = true;
