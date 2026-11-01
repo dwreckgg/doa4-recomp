@@ -159,6 +159,11 @@ class Lobby {
   void ReachOut(std::string code);   // the host sends punches to the joiner's code (strict routers)
   void Disconnect();
   void StartSession();               // host only, when can_start
+  // Final review R2-M3 (part 1: only the harness's lobby-only peer calls it): the restart into the session did not
+  // happen: a lobby in kRestarting becomes a lobby again (the host Hosting, the joiner Offline) with the event "Could not
+  // restart into the online session (<why>): still in the lobby."; in any other state nothing changes. As a lobby it
+  // answers the other game's session Hello with kSession again, so that session process gives up after its grace.
+  void RestartFailed(std::string why);
   void SetDelay(bool automatic, int frames);
   Status status() const;             // a snapshot under a mutex
 

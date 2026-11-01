@@ -1914,6 +1914,41 @@ static void TestTentativePeer() {
   CHECKF(joiner.status().peer_address == Addr(hp), "joiner's peer address '%s'", joiner.status().peer_address.c_str());
 }
 
+// Final review R2-M3 (part 1: the harness's lobby-only peer): the restart into the session did not happen: the lobby is a
+// lobby again (the host hosting, the joiner Offline) with an event line, and answers a session Hello with kSession again.
+// Outside kRestarting it does nothing.
+static void TestRestartFailed() {
+  if (!Group("fix R2-M3: a lobby whose restart did not happen is a lobby again and answers kSession")) return;
+  Side hs("rfail_host"), js("rfail_join"), cs("rfail_ctl");
+  online::Lobby host, joiner, ctl;
+  if (!StartLobby(host, hs) || !StartLobby(joiner, js) || !StartLobby(ctl, cs)) return;
+  CHECK(ConnectPair(host, joiner) && WaitCanStart(host));
+  host.StartSession();
+  CHECK(WaitFor([&] { return hs.restarts.load() == 1 && js.restarts.load() == 1; }, 3000));
+  host.RestartFailed("error 2");
+  joiner.RestartFailed("error 5");
+  CHECK(WaitFor([&] { return host.status().state == State::kHosting && joiner.status().state == State::kOffline; }, 1000));
+  CHECKF(host.status().event == "Could not restart into the online session (error 2): still in the lobby.", "host event '%s'",
+         host.status().event.c_str());
+  CHECKF(joiner.status().event == "Could not restart into the online session (error 5): still in the lobby.", "joiner event '%s'",
+         joiner.status().event.c_str());
+  CHECK(Contains(hs.Events(), "Could not restart into the online session (error 2)"));
+  FakePeer f;
+  const uint32_t T = 0x0F0F1234u;
+  f.Send(joiner.status().port, wire::Type::kHello, T, HelloBody(js.build, "dev", "", 1, 2, T));
+  Rx w;
+  CHECK(f.Wait(wire::Type::kWelcome, 1000, &w));
+  wire::Welcome m;
+  CHECK(wire::DecodeWelcome(w.body, &m) && m.refusal == wire::Refusal::kSession);
+  CHECK(WaitFor([&] { return joiner.status().refusal == "session"; }, 1000));
+  ctl.Host(0);
+  CHECK(WaitState(ctl, State::kHosting, 1000));
+  const std::string ev = ctl.status().event;
+  ctl.RestartFailed("error 9");
+  SleepMs(200);
+  CHECK(ctl.status().state == State::kHosting && ctl.status().event == ev);
+}
+
 // Final review R1-1 / R2-M4: a lobby that is restarting into a session (either role) stays silent to a session Hello -
 // the other game's session process may already be up, and a kSession answer from this lobby (about to become its peer)
 // would end that session at its start. A lobby that is not starting anything still answers (positive control).
@@ -2351,6 +2386,7 @@ int main(int argc, char** argv) {
   TestSessionRefused();
   TestRestartingSilent();
   TestTentativePeer();
+  TestRestartFailed();
   TestUpdateRequest();
   TestUpdateGate();
   TestStrangerEvents();

@@ -235,7 +235,7 @@ std::string ProtoAdvice(uint8_t theirs) {
                                 : "the other player has the older game - they need to press Check for Updates.");
 }
 
-enum class Cmd : uint8_t { kHost, kJoin, kReach, kDisconnect, kStart, kDelay, kLeave };
+enum class Cmd : uint8_t { kHost, kJoin, kReach, kDisconnect, kStart, kDelay, kLeave, kRestartFailed };
 struct Command {
   Cmd cmd = Cmd::kHost;
   uint16_t port = 0;
@@ -1336,6 +1336,18 @@ void Lobby::Impl::Apply(const Command& c, uint32_t now) {
       leave_out = c.leave;
       leave_repeat = 3;
       return;
+    case Cmd::kRestartFailed: {
+      if (session || state != State::kRestarting) return;
+      const bool host = is_host;
+      GoOffline();
+      if (host) {
+        is_host = true;
+        state = State::kHosting;
+      }
+      Log("[doa4][NET] the relaunch into the session failed (" + Sanitize(c.text) + "): back in the lobby");
+      SetEvent("Could not restart into the online session (" + Sanitize(c.text) + "): still in the lobby.");
+      return;
+    }
   }
 }
 
@@ -1587,6 +1599,12 @@ void Lobby::Disconnect() {
 void Lobby::StartSession() {
   Command c;
   c.cmd = Cmd::kStart;
+  Push(*impl_, c);
+}
+void Lobby::RestartFailed(std::string why) {
+  Command c;
+  c.cmd = Cmd::kRestartFailed;
+  c.text = std::move(why);
   Push(*impl_, c);
 }
 void Lobby::SetDelay(bool automatic, int frames) {
