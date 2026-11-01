@@ -421,11 +421,21 @@ const char* NatNote(Nat nat) {
   return "";
 }
 
-std::string ConnectTimeoutText(Nat nat) {
-  std::string text = "A direct connection is not possible between your networks; relay arrives with lobbies.";
+std::string ConnectTimeoutText(Nat nat, uint16_t port) {
+  // final review R2-I2: a blocked inbound datagram at the host (its firewall prompt answered for one network kind only,
+  // or a router that does not forward) is far likelier than two symmetric NATs, so those causes come first
+  std::string text =
+      "Could not reach the host. Check that the host allows the game in Windows Firewall (Private AND Public networks) "
+      "and has UPnP on the router, or forward UDP " + std::to_string(port) + " to the host's PC.";
   text += " Also check the code you entered (capital letters matter).";  // a mistyped code can still be someone's code
+  text += " If all of that is in place, a direct connection is not possible between your networks; relay arrives with lobbies.";
   if (nat == Nat::kSymmetric) text += " (Your network changes ports per destination.)";
   return text;
+}
+
+std::string HostWaitingHint(uint16_t port) {
+  return "Give the other player your code; they join with it. If they cannot connect: allow the game in Windows Firewall "
+         "(Private AND Public networks), and use UPnP on the router, or forward UDP " + std::to_string(port) + " to this PC.";
 }
 
 // =====================================================================================================

@@ -102,6 +102,8 @@ static std::string Addr(uint16_t port) { return "127.0.0.1:" + std::to_string(po
 // may reach them; the run asserts every call was made there (the router is the user's) ----
 static std::atomic<int> g_upnp_map{0}, g_upnp_get{0}, g_upnp_unmap{0}, g_upnp_shutdown{0};
 static std::atomic<uint16_t> g_upnp_port{0};
+static std::mutex g_upnp_mu;
+static doa4::np::upnp::Result g_upnp_result;  // what Get returns (the UPnP group sets a give-up)
 static int UpnpCalls() { return g_upnp_map + g_upnp_get + g_upnp_unmap + g_upnp_shutdown; }
 static int g_upnp_expected = 0;  // the calls the UPnP group made
 namespace doa4::np::upnp {
@@ -111,7 +113,8 @@ void MapAsync(uint16_t port) {
 }
 Result Get() {
   ++g_upnp_get;
-  return {};
+  std::lock_guard<std::mutex> lock(g_upnp_mu);
+  return g_upnp_result;
 }
 void Unmap() { ++g_upnp_unmap; }
 void Shutdown(uint32_t) { ++g_upnp_shutdown; }
@@ -723,6 +726,8 @@ static void TestBusy() {
   online::Lobby host, joiner, third;
   if (!StartLobby(host, hs) || !StartLobby(joiner, js) || !StartLobby(third, ts)) return;
   CHECK(ConnectPair(host, joiner));
+  // final review R2-I3: the slot is held against a newcomer once the peer is confirmed (its first authenticated Pong)
+  CHECK(WaitFor([&] { return host.status().ping_samples >= 1; }, 1500));
   const int samples = host.status().ping_samples;
   third.Join(Addr(host.status().port));
   CHECK(WaitFor([&] { return third.status().state == State::kOffline && !third.status().event.empty(); }, 2000));
@@ -1524,15 +1529,17 @@ static void TestConnectTimeout() {
     rules::Endpoint ep;
     CHECK(rules::ParseJoinCode(joiner.status().my_code, &ep) && ep == Pub(51234));  // the code carries the mapped address
     const int64_t t0 = NowUs();
-    joiner.Join(Addr(DeadPort()));
+    const uint16_t dead = DeadPort();
+    joiner.Join(Addr(dead));
     CHECK(WaitState(joiner, State::kConnecting, 200));
     CHECK(WaitFor([&] { return joiner.status().state != State::kConnecting; }, 3000));
     const int64_t ms = (NowUs() - t0) / 1000;
     std::printf("info: connect timeout (nat %d): Offline after %lld ms\n", int(want), (long long)ms);
     CHECKF(ms >= 2000 && ms < 2500, "Offline after %lld ms (2000 <= t < 2500)", (long long)ms);
     CHECK(joiner.status().state == State::kOffline);
-    CHECKF(joiner.status().event == rules::ConnectTimeoutText(want), "event '%s'", joiner.status().event.c_str());
-    if (want == rules::Nat::kSymmetric) CHECK(joiner.status().event != rules::ConnectTimeoutText(rules::Nat::kCone));
+    // final review R2-I2: the text names the port the joiner tried (the code's)
+    CHECKF(joiner.status().event == rules::ConnectTimeoutText(want, dead), "event '%s'", joiner.status().event.c_str());
+    if (want == rules::Nat::kSymmetric) CHECK(joiner.status().event != rules::ConnectTimeoutText(rules::Nat::kCone, dead));
   }
 }
 
@@ -1736,21 +1743,21 @@ static void TestLateYesBySessionHello() {
   SleepMs(300);
   CHECKF(a.status().state == State::kStarting && as.restarts == 0, "after the acks: %s, restarts %d",
          online::StateName(a.status().state), as.restarts.load());
-  // (1) another token (the boot's ^ 1) from the peer: answered kSession, no restart
+  // (1) another token (the boot's ^ 1) from the peer: no restart, and (final review R1-1) no answer either: a lobby that
+  // is starting a session stays silent to a session Hello, so it can never end the other side's session at its start
   fa.Clear();
+  const uint32_t drops0 = Drops(a.status(), wire::Drop::kToken);
   const uint32_t wrong = ha.session_token ^ 1u;
   fa.Send(ap, wire::Type::kHello, wrong, HelloBody(as.build, "dev", "", 1, 2, wrong));
   Rx w;
-  CHECK(fa.Wait(wire::Type::kWelcome, 1000, &w));
-  wire::Welcome m;
-  CHECK(wire::DecodeWelcome(w.body, &m) && m.refusal == wire::Refusal::kSession);
-  // (2) the right token from another address: answered kSession, no restart
+  CHECK(!fa.Wait(wire::Type::kWelcome, 500, &w));
+  // (2) the right token from another address: silent too, no restart
   FakePeer other;
   other.Send(ap, wire::Type::kHello, ha.session_token, HelloBody(as.build, "dev", "", 1, 2, ha.session_token));
   Rx w2;
-  CHECK(other.Wait(wire::Type::kWelcome, 1000, &w2));
-  wire::Welcome m2;
-  CHECK(wire::DecodeWelcome(w2.body, &m2) && m2.refusal == wire::Refusal::kSession);
+  CHECK(!other.Wait(wire::Type::kWelcome, 500, &w2));
+  CHECKF(Drops(a.status(), wire::Drop::kToken) == drops0 + 2, "kToken %u -> %u (both counted, not answered)", drops0,
+         Drops(a.status(), wire::Drop::kToken));
   SleepMs(200);
   CHECKF(a.status().state == State::kStarting && as.restarts == 0 && !fs::exists(as.HandoffPath()),
          "a wrong session Hello moved the host: %s, restarts %d", online::StateName(a.status().state), as.restarts.load());
@@ -1789,7 +1796,7 @@ static handoff::Handoff SessionHandoff(uint16_t peer_port, uint32_t token) {
 // I-1a: the restarted side's session Hello reaches a game that did NOT restart (a lobby): the lobby answers kSession and
 // the session process gives up at once (Status::session_refused), well before np_live's frame-0 limit.
 static void TestSessionRefused() {
-  if (!Group("fix I-1a: a lobby answers a session Hello with kSession; the session process gives up within 1 s")) return;
+  if (!Group("fix I-1a: a lobby answers a session Hello with kSession; the session process gives up after its 3 s grace")) return;
   Side hs("sref_host"), ss("sref_sess");
   online::Lobby host;
   if (!StartLobby(host, hs)) return;
@@ -1802,9 +1809,20 @@ static void TestSessionRefused() {
   CHECKF(sess.StartInSession(ss.P(), LoopCfg(), SessionHandoff(host.status().port, 0x5E55BEEFu),
                              [&](int32_t, wire::LeaveReason) { ++left; }, &e),
          "StartInSession: %s", e.c_str());
-  CHECKF(WaitFor([&] { return sess.status().session_refused; }, 1000), "the session process did not give up within 1 s (state %s)",
+  // final review R1-1: kSession is final only after online::kSessionRefusalGraceMs (3 s) from the first one, with the
+  // Hello still going meanwhile (the other game may still be on its way into the session)
+  CHECK(WaitFor([&] { return Drops(host.status(), wire::Drop::kToken) >= 1; }, 1000));  // the first kSession answer
+  SleepMs(2000);
+  CHECKF(!sess.status().session_refused && sess.status().state == State::kConnecting,
+         "gave up inside the grace: refused %d, state %s, %lld ms", int(sess.status().session_refused),
+         online::StateName(sess.status().state), (long long)((NowUs() - t0) / 1000));
+  const uint32_t hellos_in_grace = Drops(host.status(), wire::Drop::kToken);  // each session Hello is one kToken drop
+  CHECKF(hellos_in_grace >= 5, "the session Hello stopped during the grace (%u reached the lobby)", hellos_in_grace);
+  CHECKF(WaitFor([&] { return sess.status().session_refused; }, 2500), "the session process did not give up by 4.5 s (state %s)",
          online::StateName(sess.status().state));
-  std::printf("info: session refused %lld ms after StartInSession\n", (long long)((NowUs() - t0) / 1000));
+  const int64_t refused_ms = (NowUs() - t0) / 1000;
+  std::printf("info: session refused %lld ms after StartInSession\n", (long long)refused_ms);
+  CHECKF(refused_ms >= int64_t(online::kSessionRefusalGraceMs), "refused after %lld ms", (long long)refused_ms);
   const online::Status s = sess.status();
   CHECK(s.state == State::kOffline);
   CHECKF(Contains(s.event, "did not start the session"), "event '%s'", s.event.c_str());
@@ -1823,7 +1841,150 @@ static void TestSessionRefused() {
   CHECK(!q.status().session_refused && q.status().state == State::kConnecting);
   CHECK(Drops(q.status(), wire::Drop::kSource) >= 1);
   quiet.sock.SendTo(q.status().port, wire::Encode(wire::Type::kWelcome, 0, ks));  // from the peer: taken
-  CHECK(WaitFor([&] { return q.status().session_refused; }, 1000));
+  CHECK(WaitFor([&] { return q.status().session_refused; }, 4000));
+  // the grace's purpose: a kSession answer, then the other game's session Hello within the 3 s: the session runs
+  FakePeer back;
+  Side bs("sref_back");
+  online::Lobby b;
+  std::atomic<int> back_left{0};
+  CHECK(b.StartInSession(bs.P(), LoopCfg(), SessionHandoff(back.sock.port, 0x0BAC0BACu),
+                         [&](int32_t, wire::LeaveReason) { ++back_left; }, &e));
+  CHECK(back.Wait(wire::Type::kHello, 1000));
+  back.sock.SendTo(b.status().port, wire::Encode(wire::Type::kWelcome, 0, ks));
+  SleepMs(1000);
+  CHECK(!b.status().session_refused && b.status().state == State::kConnecting);
+  back.Send(b.status().port, wire::Type::kHello, 0x0BAC0BACu, HelloBody(0x0DA4000000000001ull, "dev", "", 1, 2, 0x0BAC0BACu));
+  CHECK(WaitState(b, State::kInSession, 1000));
+  SleepMs(3000);  // past the grace of the earlier kSession
+  CHECKF(!b.status().session_refused && b.status().state == State::kInSession && back_left == 0,
+         "a kSession answer the other game outran ended the session: refused %d state %s", int(b.status().session_refused),
+         online::StateName(b.status().state));
+}
+
+// Final review R2-I3: the first valid Hello makes a TENTATIVE peer until its first authenticated Pong; a newer valid Hello
+// from another address replaces a tentative peer (a stranger, or a Hello spoofed from an address that never answers,
+// cannot keep the real friend out), never a confirmed one (that newcomer is refused kBusy).
+static void TestTentativePeer() {
+  if (!Group("fix R2-I3: a tentative peer is replaced by a newer valid Hello; a confirmed one is not")) return;
+  Side hs("tent_host"), js("tent_join"), ts("tent_third");
+  online::Lobby host, joiner, third;
+  if (!StartLobby(host, hs) || !StartLobby(joiner, js) || !StartLobby(third, ts)) return;
+  host.Host(0);
+  CHECK(WaitState(host, State::kHosting, 1000));
+  const uint16_t hp = host.status().port;
+  CHECKF(host.status().hint == rules::HostWaitingHint(hp), "hosting hint '%s'", host.status().hint.c_str());
+  // the spoofed holder: a valid Hello from an address that never answers a Ping (pong_token stays 0)
+  FakePeer spoof;
+  spoof.Send(hp, wire::Type::kHello, 0, HelloBody(hs.build, "dev", kFilesText));
+  CHECK(spoof.Wait(wire::Type::kWelcome, 1000));
+  CHECK(WaitFor([&] { return host.status().state == State::kConnected && host.status().peer_port == spoof.sock.port; }, 1000));
+  CHECKF(host.status().peer_address == Addr(spoof.sock.port), "peer address '%s'", host.status().peer_address.c_str());
+  CHECK(spoof.Wait(wire::Type::kPing, 1000));  // pinged, never answered
+  // an INVALID Hello (another build) from a third address does not replace the tentative peer
+  FakePeer bad;
+  bad.Send(hp, wire::Type::kHello, 0, HelloBody(hs.build + 1, "dev", kFilesText));
+  Rx bw;
+  CHECK(bad.Wait(wire::Type::kWelcome, 1000, &bw));
+  wire::Welcome bm;
+  CHECK(wire::DecodeWelcome(bw.body, &bm) && bm.refusal == wire::Refusal::kBuild);
+  CHECK(host.status().peer_port == spoof.sock.port);
+  // the real friend joins: it replaces the tentative holder and is confirmed by its first Pong
+  joiner.Join(Addr(hp));
+  CHECKF(WaitState(joiner, State::kConnected, 3000), "the friend did not get in: %s '%s'", online::StateName(joiner.status().state),
+         joiner.status().event.c_str());
+  CHECK(WaitFor([&] { return host.status().peer_port == joiner.status().port && host.status().ping_samples >= 1; }, 2000));
+  CHECKF(host.status().peer_address == Addr(joiner.status().port), "peer address '%s'", host.status().peer_address.c_str());
+  CHECKF(hs.log.Count("replaces the tentative peer") == 1, "replacement log lines %d", hs.log.Count("replaces the tentative peer"));
+  // the old holder's packets are now a stranger's
+  const uint32_t src0 = Drops(host.status(), wire::Drop::kSource);
+  Rx sw;
+  CHECK(spoof.Wait(wire::Type::kWelcome, 100, &sw));
+  wire::Welcome sm;
+  CHECK(wire::DecodeWelcome(sw.body, &sm));
+  spoof.Send(hp, wire::Type::kPong, sm.session_token, wire::EncodePing(wire::Ping{1}));
+  CHECK(WaitFor([&] { return Drops(host.status(), wire::Drop::kSource) == src0 + 1; }, 1000));
+  // the confirmed peer keeps the slot: a newcomer (a real lobby with a valid Hello) is refused kBusy
+  third.Join(Addr(hp));
+  CHECK(WaitFor([&] { return third.status().state == State::kOffline && !third.status().event.empty(); }, 2000));
+  CHECKF(third.status().refusal == "busy", "third's refusal %s ('%s')", third.status().refusal.c_str(), third.status().event.c_str());
+  SleepMs(300);
+  CHECK(host.status().state == State::kConnected && joiner.status().state == State::kConnected &&
+        host.status().peer_port == joiner.status().port);
+  // the joiner shows the host's address too
+  CHECKF(joiner.status().peer_address == Addr(hp), "joiner's peer address '%s'", joiner.status().peer_address.c_str());
+}
+
+// Final review R2-M3 (part 1: the harness's lobby-only peer): the restart into the session did not happen: the lobby is a
+// lobby again (the host hosting, the joiner Offline) with an event line, and answers a session Hello with kSession again.
+// Outside kRestarting it does nothing.
+static void TestRestartFailed() {
+  if (!Group("fix R2-M3: a lobby whose restart did not happen is a lobby again and answers kSession")) return;
+  Side hs("rfail_host"), js("rfail_join"), cs("rfail_ctl");
+  online::Lobby host, joiner, ctl;
+  if (!StartLobby(host, hs) || !StartLobby(joiner, js) || !StartLobby(ctl, cs)) return;
+  CHECK(ConnectPair(host, joiner) && WaitCanStart(host));
+  host.StartSession();
+  CHECK(WaitFor([&] { return hs.restarts.load() == 1 && js.restarts.load() == 1; }, 3000));
+  host.RestartFailed("error 2");
+  joiner.RestartFailed("error 5");
+  CHECK(WaitFor([&] { return host.status().state == State::kHosting && joiner.status().state == State::kOffline; }, 1000));
+  CHECKF(host.status().event == "Could not restart into the online session (error 2): still in the lobby.", "host event '%s'",
+         host.status().event.c_str());
+  CHECKF(joiner.status().event == "Could not restart into the online session (error 5): still in the lobby.", "joiner event '%s'",
+         joiner.status().event.c_str());
+  CHECK(Contains(hs.Events(), "Could not restart into the online session (error 2)"));
+  FakePeer f;
+  const uint32_t T = 0x0F0F1234u;
+  f.Send(joiner.status().port, wire::Type::kHello, T, HelloBody(js.build, "dev", "", 1, 2, T));
+  Rx w;
+  CHECK(f.Wait(wire::Type::kWelcome, 1000, &w));
+  wire::Welcome m;
+  CHECK(wire::DecodeWelcome(w.body, &m) && m.refusal == wire::Refusal::kSession);
+  CHECK(WaitFor([&] { return joiner.status().refusal == "session"; }, 1000));
+  ctl.Host(0);
+  CHECK(WaitState(ctl, State::kHosting, 1000));
+  const std::string ev = ctl.status().event;
+  ctl.RestartFailed("error 9");
+  SleepMs(200);
+  CHECK(ctl.status().state == State::kHosting && ctl.status().event == ev);
+}
+
+// Final review R1-1 / R2-M4: a lobby that is restarting into a session (either role) stays silent to a session Hello -
+// the other game's session process may already be up, and a kSession answer from this lobby (about to become its peer)
+// would end that session at its start. A lobby that is not starting anything still answers (positive control).
+static void TestRestartingSilent() {
+  if (!Group("fix R1-1: a lobby in kRestarting (host and joiner) is silent to a session Hello; a hosting one answers")) return;
+  Side hs("rsil_host"), js("rsil_join"), cs("rsil_ctl");
+  online::Lobby host, joiner, ctl;
+  if (!StartLobby(host, hs) || !StartLobby(joiner, js) || !StartLobby(ctl, cs)) return;
+  CHECK(ConnectPair(host, joiner) && WaitCanStart(host));
+  host.StartSession();
+  // the restart callbacks only count: both lobbies stay in kRestarting
+  CHECK(WaitFor([&] { return hs.restarts.load() == 1 && js.restarts.load() == 1; }, 3000));
+  CHECKF(host.status().state == State::kRestarting && joiner.status().state == State::kRestarting, "states %s / %s",
+         online::StateName(host.status().state), online::StateName(joiner.status().state));
+  ctl.Host(0);
+  CHECK(WaitState(ctl, State::kHosting, 1000));
+  FakePeer f;
+  const uint32_t T = 0x51E7F00Du;
+  const uint32_t hk = Drops(host.status(), wire::Drop::kToken), jk = Drops(joiner.status(), wire::Drop::kToken);
+  for (int i = 0; i < 3; ++i) {
+    f.Send(host.status().port, wire::Type::kHello, T, HelloBody(hs.build, "dev", "", 1, 2, T));
+    f.Send(joiner.status().port, wire::Type::kHello, T, HelloBody(js.build, "dev", "", 1, 2, T));
+    SleepMs(100);
+  }
+  f.Send(ctl.status().port, wire::Type::kHello, T, HelloBody(cs.build, "dev", "", 1, 2, T));
+  Rx w;
+  CHECK(f.Wait(wire::Type::kWelcome, 1000, &w));  // the control answers
+  SleepMs(300);
+  int from_pair = 0;
+  for (const Rx& r : f.Of(wire::Type::kWelcome)) from_pair += (r.from == host.status().port || r.from == joiner.status().port) ? 1 : 0;
+  CHECKF(from_pair == 0, "%d Welcome(s) from a restarting lobby", from_pair);
+  CHECKF(w.from == ctl.status().port, "the Welcome came from port %u", w.from);
+  CHECKF(Drops(host.status(), wire::Drop::kToken) == hk + 3 && Drops(joiner.status(), wire::Drop::kToken) == jk + 3,
+         "kToken host %u -> %u, joiner %u -> %u", hk, Drops(host.status(), wire::Drop::kToken), jk,
+         Drops(joiner.status(), wire::Drop::kToken));
+  CHECK(host.status().state == State::kRestarting && joiner.status().state == State::kRestarting);
 }
 
 // Plan 1b Task 4: the "update" request is the Online tab's Check for Updates: started only when the lobby is Offline and
@@ -1886,7 +2047,7 @@ static void TestUpdateRequest() {
   std::string e;
   CHECKF(sess.StartInSession(ss.P(), LoopCfg(), SessionHandoff(host.status().port, 0x5E55BEEFu), nullptr, &e),
          "StartInSession: %s", e.c_str());
-  CHECK(WaitFor([&] { return sess.status().session_refused; }, 1000));
+  CHECK(WaitFor([&] { return sess.status().session_refused; }, 4500));  // after the 3 s grace (final review R1-1)
   CHECK(sess.status().state == State::kOffline);
   WriteCtl(ss.test_dir, "update\n");
   CHECKF(WaitFor([&] { return ss.upd.refusals == 1; }, 1000), "%d refusals", ss.upd.refusals.load());
@@ -2025,6 +2186,29 @@ static void TestUpnpCalls() {
            g_upnp_map.load() - m0, g_upnp_port.load(), h.local_port);
     l.Stop();
     CHECK(g_upnp_unmap.load() == u0 + 1);
+  }
+  {
+    // final review R2-I1: a renewal that gave up (the lease ran out) is an event line of the lobby, once per give-up
+    Side s("upnp_lost");
+    online::Lobby l;
+    if (!StartLobby(l, s, c)) return;
+    l.Host(0);
+    CHECK(WaitState(l, State::kHosting, 1000));
+    SleepMs(1200);  // the lobby has polled the unchanged result at least once
+    CHECK(!Contains(l.status().event, "could not be renewed"));
+    {
+      std::lock_guard<std::mutex> lock(g_upnp_mu);
+      g_upnp_result.message = "The router's mapping of UDP 7200 ran out and could not be renewed (test).";
+      g_upnp_result.lost = 1;
+    }
+    CHECKF(WaitFor([&] { return l.status().event == "The router's mapping of UDP 7200 ran out and could not be renewed (test)."; }, 2500),
+           "event '%s'", l.status().event.c_str());
+    CHECK(s.log.Count("[doa4][NET] UPnP: The router's mapping") == 1 && s.log.Count("event: The router's mapping") == 1);
+    SleepMs(1200);  // the same give-up is one event, not one per poll
+    CHECK(s.log.Count("[doa4][NET] UPnP: The router's mapping") == 1 && s.log.Count("event: The router's mapping") == 1);
+    l.Stop();
+    std::lock_guard<std::mutex> lock(g_upnp_mu);
+    g_upnp_result = {};
   }
   g_upnp_expected += UpnpCalls() - before;
 }
@@ -2200,6 +2384,9 @@ int main(int argc, char** argv) {
   TestLateBootReply();
   TestLateYesBySessionHello();
   TestSessionRefused();
+  TestRestartingSilent();
+  TestTentativePeer();
+  TestRestartFailed();
   TestUpdateRequest();
   TestUpdateGate();
   TestStrangerEvents();

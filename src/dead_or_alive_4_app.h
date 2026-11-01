@@ -604,6 +604,9 @@ class DeadOrAlive4App : public rex::ReXApp {
           REXLOG_INFO("[doa4][NET] test: DOA4_NP_TEST_NO_RESTART=1: not restarting into the session (staying a lobby)");
           std::error_code ec;
           std::filesystem::remove(h, ec);
+          // final review R1-1: a lobby in kRestarting stays silent to a session Hello, so this lobby leaves that state
+          // to answer as the lobby it stays (kSession), as the gate expects
+          if (lobby_) lobby_->RestartFailed("DOA4_NP_TEST_NO_RESTART");
           return;
         }
         if (!doa4::np::restart::Relaunch(&h, false, &e)) {

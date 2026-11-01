@@ -235,7 +235,7 @@ std::string ProtoAdvice(uint8_t theirs) {
                                 : "the other player has the older game - they need to press Check for Updates.");
 }
 
-enum class Cmd : uint8_t { kHost, kJoin, kReach, kDisconnect, kStart, kDelay, kLeave };
+enum class Cmd : uint8_t { kHost, kJoin, kReach, kDisconnect, kStart, kDelay, kLeave, kRestartFailed };
 struct Command {
   Cmd cmd = Cmd::kHost;
   uint16_t port = 0;
@@ -273,6 +273,7 @@ struct Lobby::Impl {
   std::string events_written;  // the last event appended to events.txt
   // the peer (lobby: after the Welcome; session: the hand-off's)
   bool has_peer = false;
+  bool peer_confirmed = false;  // R2-I3: the peer answered a Ping (an authenticated Pong); until then it is tentative
   rules::Endpoint peer;
   uint32_t token = 0;
   std::string peer_release;
@@ -288,6 +289,8 @@ struct Lobby::Impl {
   uint32_t punch_sent = 0;
   bool punch_ever = false;
   bool upnp_started = false;
+  uint32_t upnp_polled = 0;     // R2-I1: when upnp::Get() was last read
+  uint32_t upnp_lost_seen = 0;  // the Result::lost already turned into an event
   // pings
   uint32_t ping_sent = 0;
   bool ping_ever = false;
@@ -328,6 +331,8 @@ struct Lobby::Impl {
   wire::Leave leave_out;
   uint32_t session_reply_sent = 0;
   bool session_reply_ever = false, wrong_source_logged = false;
+  bool session_refusal_seen = false;  // R1-1: a kSession answer came from the peer; final after kSessionRefusalGraceMs
+  uint32_t session_refusal_t0 = 0;
   // request files
   uint32_t ctl_last = 0, status_last = 0;
   bool status_dirty = true, status_ever = false;
@@ -474,10 +479,11 @@ Status Lobby::Impl::SnapshotLocked() const {
                              state == State::kInSession)
                     ? peer.port
                     : 0;
+  s.peer_address = s.peer_port ? rules::EndpointText(peer) : "";  // R2-I3: the Connected line names the peer
   s.can_start = is_host && state == State::kConnected && rtt_n >= 4;
   switch (state) {
     case State::kOffline: s.hint = ""; break;
-    case State::kHosting: s.hint = "Give the other player your code; they join with it."; break;
+    case State::kHosting: s.hint = rules::HostWaitingHint(s.port); break;  // R2-I2: the likely causes if nobody gets in
     case State::kConnecting: s.hint = session ? "Waiting for the other player's game to come back." : "Waiting for the host to answer."; break;
     case State::kConnected:
       s.hint = is_host ? (s.can_start ? "Press Start online session (both games restart)." : "Measuring the ping...")
@@ -606,6 +612,7 @@ void Lobby::Impl::GoOffline() {
   state = State::kOffline;
   is_host = false;
   has_peer = false;
+  peer_confirmed = false;
   token = 0;
   peer_release.clear();
   punching = false;
@@ -674,6 +681,7 @@ bool Lobby::Impl::ReplyWelcome(const rules::Endpoint& to, wire::Welcome w, size_
 
 void Lobby::Impl::Connected(const rules::Endpoint& from, uint32_t tok, const std::string& release, uint32_t now) {
   has_peer = true;
+  peer_confirmed = false;  // R2-I3: tentative until its first authenticated Pong
   peer = from;  // carry 2c: the address the socket saw, never the code typed
   token = tok;
   peer_release = Sanitize(release);
@@ -789,6 +797,7 @@ void Lobby::Impl::HandlePacket(const rules::Endpoint& from, const wire::Packet& 
       if (r > 60000) return;  // not one of ours
       rtt = rtt_n ? rtt * 0.8f + float(r) * 0.2f : float(r);
       ++rtt_n;
+      peer_confirmed = true;  // R2-I3: the peer answers from the address it holds, with its token
       status_dirty = true;
       return;
     }
@@ -897,9 +906,13 @@ void Lobby::Impl::HandleHello(const rules::Endpoint& from, const wire::Packet& p
     return;
   }
   if (pk.token != 0 || hl.session_token != 0) {
-    // I-1a: a session process's Hello (the other game restarted into a session this one never started): say so, so it
-    // gives up at once instead of waiting for np_live's frame-0 limit. A stranger reply like any other (size, budget).
     Drop(wire::Drop::kToken);
+    // Final review R1-1 / R2-M4: a lobby starting a session, or restarting into one (either role), stays silent - it is
+    // about to become that session's peer (its own session process answers soon), and a kSession answer would end the
+    // other side's session at its start.
+    if (state == State::kStarting || state == State::kRestarting || booting) return;
+    // I-1a: a session process's Hello (the other game restarted into a session this one never started): say so, so it
+    // gives up (after its grace) instead of waiting for np_live's frame-0 limit. A stranger reply like any other.
     wire::Welcome w;
     w.refusal = wire::Refusal::kSession;
     w.build = Build();  // no release: a kSession answer must fit any Hello (2d size rule)
@@ -920,10 +933,15 @@ void Lobby::Impl::HandleHello(const rules::Endpoint& from, const wire::Packet& p
     return;
   }
   if (!files_ready) return;  // the joiner repeats its Hello every 400 ms
+  // R2-I3: a tentative peer (Connected, no authenticated Pong yet) does not hold the slot against a newer valid Hello
+  const bool tentative = has_peer && !peer_confirmed && state == State::kConnected;
   const rules::Identity host_id{w.build, p.release, files_text}, joiner_id{hl.build, hl.release, hl.files};
-  const rules::Verdict v = rules::Judge(host_id, joiner_id, has_peer);
+  const rules::Verdict v = rules::Judge(host_id, joiner_id, has_peer && !tentative);
   const size_t trigger = pk.body.size() + wire::kHeaderBytes;
   if (v.refusal == wire::Refusal::kNone) {
+    if (tentative)
+      Log("[doa4][NET] a valid Hello from " + rules::EndpointText(from) + " replaces the tentative peer " + rules::EndpointText(peer) +
+          " (it never answered a ping)");
     Connected(from, RandomToken(), hl.release, now);
     w.session_token = token;
     Log("[doa4][NET] joiner connected: release " + peer_release + ", delay preference " +
@@ -1046,10 +1064,13 @@ void Lobby::Impl::HandleSessionWelcome(const rules::Endpoint& from, const wire::
     return;
   }
   if (w.refusal != wire::Refusal::kSession || state != State::kConnecting) return;
-  state = State::kOffline;
-  session_refused = true;
-  Log("[doa4][NET] the hand-off's peer answered as a lobby: the other game did not start the session; giving up");
-  SetEvent("The other player's game did not start the session.", "session");
+  // R1-1: final only after the grace (Tick); the Hello keeps going meanwhile, so a game still on its way into the session
+  // (whose old lobby answered) is met when it comes back
+  if (session_refusal_seen) return;
+  session_refusal_seen = true;
+  session_refusal_t0 = Now();
+  Log("[doa4][NET] the hand-off's peer answered as a lobby: waiting " + std::to_string(kSessionRefusalGraceMs / 1000) +
+      " s for its game to come back into the session");
 }
 
 // =====================================================================================================
@@ -1315,6 +1336,18 @@ void Lobby::Impl::Apply(const Command& c, uint32_t now) {
       leave_out = c.leave;
       leave_repeat = 3;
       return;
+    case Cmd::kRestartFailed: {
+      if (session || state != State::kRestarting) return;
+      const bool host = is_host;
+      GoOffline();
+      if (host) {
+        is_host = true;
+        state = State::kHosting;
+      }
+      Log("[doa4][NET] the relaunch into the session failed (" + Sanitize(c.text) + "): back in the lobby");
+      SetEvent("Could not restart into the online session (" + Sanitize(c.text) + "): still in the lobby.");
+      return;
+    }
   }
 }
 
@@ -1345,7 +1378,23 @@ void Lobby::Impl::Tick(uint32_t now) {
     have_completed = false;
     Log("[doa4][NET] a partial transfer had no chunk for 5 s: reset");
   }
+  if (cfg.upnp && upnp_started && now - upnp_polled >= kUpnpPollMs) {  // R2-I1: a renewal that gave up is an event
+    upnp_polled = now;
+    const upnp::Result r = upnp::Get();
+    if (r.lost != upnp_lost_seen) {
+      upnp_lost_seen = r.lost;
+      Log("[doa4][NET] UPnP: " + Sanitize(r.message, 1000));
+      SetEvent(r.message);
+    }
+  }
   if (session) {
+    if (state == State::kConnecting && session_refusal_seen && now - session_refusal_t0 >= kSessionRefusalGraceMs) {
+      state = State::kOffline;  // R1-1: the grace is over and the peer's session Hello never came
+      session_refused = true;
+      Log("[doa4][NET] the hand-off's peer answered as a lobby: the other game did not start the session; giving up");
+      SetEvent("The other player's game did not start the session.", "session");
+      return;
+    }
     if (state == State::kConnecting && (!hello_ever || now - hello_sent >= kHelloMs)) {
       hello_ever = true;
       hello_sent = now;
@@ -1386,7 +1435,7 @@ void Lobby::Impl::Tick(uint32_t now) {
       if (now - connect_t0 >= p.connect_timeout_ms) {
         const rules::Nat nat = t.stats().nat;
         GoOffline();
-        SetEvent(rules::ConnectTimeoutText(nat));
+        SetEvent(rules::ConnectTimeoutText(nat, target.port));  // R2-I2: the port of the code typed
       }
       break;
     case State::kConnected:
@@ -1550,6 +1599,12 @@ void Lobby::Disconnect() {
 void Lobby::StartSession() {
   Command c;
   c.cmd = Cmd::kStart;
+  Push(*impl_, c);
+}
+void Lobby::RestartFailed(std::string why) {
+  Command c;
+  c.cmd = Cmd::kRestartFailed;
+  c.text = std::move(why);
   Push(*impl_, c);
 }
 void Lobby::SetDelay(bool automatic, int frames) {

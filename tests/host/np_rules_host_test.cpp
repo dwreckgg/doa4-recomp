@@ -803,13 +803,29 @@ static void TestNat() {
   CHECK(std::string(rules::NatNote(rules::Nat::kSymmetric)) ==
         "Your network changes ports per destination (symmetric NAT): players outside it may not reach you");
   {
-    // the brief's sentence, then the ask to check the code (fix round 1), then the symmetric-NAT note when it applies
-    const std::string base = "A direct connection is not possible between your networks; relay arrives with lobbies."
-                             " Also check the code you entered (capital letters matter).";
-    CHECK(rules::ConnectTimeoutText(rules::Nat::kCone) == base);
-    CHECK(rules::ConnectTimeoutText(rules::Nat::kSymmetric) == base + " (Your network changes ports per destination.)");
-    CHECK(rules::ConnectTimeoutText(rules::Nat::kNoAnswer) == base);   // the suffix is for a symmetric NAT only
-    CHECK(rules::ConnectTimeoutText(rules::Nat::kOneAnswer) == base);
+    // final review R2-I2: the likely causes first (the host's firewall for both network kinds, then UPnP or a forward
+    // of the port the code names), then the ask to check the code (fix round 1), then the relay sentence, then the
+    // symmetric-NAT note when it applies
+    const std::string base =
+        "Could not reach the host. Check that the host allows the game in Windows Firewall (Private AND Public networks)"
+        " and has UPnP on the router, or forward UDP 7200 to the host's PC. Also check the code you entered (capital "
+        "letters matter). If all of that is in place, a direct connection is not possible between your networks; relay "
+        "arrives with lobbies.";
+    CHECK(rules::ConnectTimeoutText(rules::Nat::kCone, 7200) == base);
+    CHECK(rules::ConnectTimeoutText(rules::Nat::kSymmetric, 7200) == base + " (Your network changes ports per destination.)");
+    CHECK(rules::ConnectTimeoutText(rules::Nat::kNoAnswer, 7200) == base);   // the suffix is for a symmetric NAT only
+    CHECK(rules::ConnectTimeoutText(rules::Nat::kOneAnswer, 7200) == base);
+    // the port named is the one the code carries (a code outside 7200-7215 names its own)
+    const std::string other = rules::ConnectTimeoutText(rules::Nat::kCone, 40123);
+    CHECK(other.find("forward UDP 40123 to the host's PC") != std::string::npos && other.find("7200") == std::string::npos);
+    // the order the brief asks for: firewall, UPnP/forward, the code, the relay
+    const size_t fw = base.find("Windows Firewall"), up = base.find("UPnP"), code = base.find("check the code"),
+                 relay = base.find("relay arrives");
+    CHECK(fw != std::string::npos && fw < up && up < code && code < relay);
+    // the host's waiting hint names the same causes, for this PC and its port
+    CHECK(rules::HostWaitingHint(7203) ==
+          "Give the other player your code; they join with it. If they cannot connect: allow the game in Windows "
+          "Firewall (Private AND Public networks), and use UPnP on the router, or forward UDP 7203 to this PC.");
   }
 }
 
