@@ -229,7 +229,7 @@ void Renew(Shared& s) {
     return;
   }
   s.retrying = true;
-  s.retry_due = std::min(now + std::chrono::milliseconds(s.timing.retry_ms), s.lease_end);
+  s.retry_due = (std::min)(now + std::chrono::milliseconds(s.timing.retry_ms), s.lease_end);
 }
 
 void Worker() {
