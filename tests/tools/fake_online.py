@@ -59,7 +59,7 @@ The game's own test switch DOA4_NP_TEST_NO_RESTART=1 (Task 15 carry f) is honour
 stays a lobby (state=restarting, refusal=session); the host's session then ends at frame 0 with `internal: the other player's
 game did not start the session` and relaunches offline.
 status.txt carries `refusal=<none|build|files|busy|proto|session|other>` (Task 9's contract): the kind of the join's refusal.
-The event texts are the REAL ones (np_rules.cpp of wt-np1 66ba37d), so a harness judging by keywords fails here as on the game.
+The event texts are the REAL ones (np_rules.cpp of wt-np1 a9f639d), so a harness judging by keywords fails here as on the game.
 A host refuses a join with `refuse build` (build ids differ: BUILD_ID, +1 with DOA4_NP_TEST_BUILD_SALT=1), `refuse files <group>`
 (DOA4_NP_TEST_FILES_SALT differs) or `refuse busy` (it already has a peer).
 """

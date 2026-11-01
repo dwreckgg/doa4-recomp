@@ -126,14 +126,16 @@ static void TestSaveKeepsFileLoadable() {
 // The game-files folder saved by the first-run setup: written with
 // TomlString(Utf8(path)), read back by toml++ (as the SDK does) and turned
 // into a path with PathFromUtf8 - the same folder, backslashes and non-ANSI
-// names included.
+// names included. The folders are fictitious (only stored and compared, never
+// opened); the first keeps \U, \f, \d, \x and \D, each of which a TOML basic
+// string rejects or decodes as an escape unless the backslash is escaped.
 static void TestGameFilesPathRoundTrip() {
   auto dir = std::filesystem::temp_directory_path() / "doa4_toml_upsert_test_data";
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
   auto path = dir / "dead_or_alive_4.toml";
   const std::filesystem::path folders[] = {
-      std::filesystem::path(L"C:\\Users\\fsop1\\doa4\\xex\\DOA4"),
+      std::filesystem::path(L"C:\\Users\\fred\\doa4\\xex\\DOA4"),
       std::filesystem::path(u8"D:\\\u30b2\u30fc\u30e0\\DOA4 \"copy\""),
   };
   for (const auto& folder : folders) {
@@ -163,7 +165,7 @@ static void TestGameFilesPathRoundTrip() {
 // must parse back to the same folder.
 static void TestGameFilesSurvivesTheSdkWriter() {
   const std::filesystem::path folders[] = {
-      std::filesystem::path(L"C:\\Users\\fsop1\\doa4\\xex\\DOA4"),
+      std::filesystem::path(L"C:\\Users\\fred\\doa4\\xex\\DOA4"),
       std::filesystem::path(u8"D:\\\u30b2\u30fc\u30e0\\DOA4"),
   };
   for (const auto& folder : folders) {

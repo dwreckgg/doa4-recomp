@@ -1,6 +1,7 @@
 """Cross-PC check of the phase-0 bundle's results (the friend's PC) against this PC's runs.
 
-  py -3 -I tools/np_crosscheck.py RESULTS --local C:/Users/fsop1/doa4/np_runs [--expect NAME,NAME]
+  py -3 -I tools/np_crosscheck.py RESULTS --local <DOA4_ROOT>/np_runs [--expect NAME,NAME]
+  (DOA4_ROOT: the folder that holds the worktrees and np_runs, see np_run.py)
 
 RESULTS is the unzipped results.zip of the bundle's run_check.bat (tools/np_bundle.py, README.txt in the bundle):
   out/<recording>/   a run folder as np_run.py makes one (out/ with np_log.txt, digest.d4d, sweep.d4s, counters.d4k,

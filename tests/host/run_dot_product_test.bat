@@ -1,11 +1,11 @@
 @echo off
 rem Builds and runs the dot-product NaN redirect host test with clang-cl at the game's CPU level (no CMake).
-rem It includes <rex/ppc.h> from the SDK the netplay build uses (REXSDK_DIR, default sdk-np0) the way the
+rem It includes <rex/ppc.h> from the SDK the netplay build uses (REXSDK_DIR, default sdk-np0 beside this worktree) the way the
 rem generated code does, so the include paths are the SDK's include folder and simde.
 rem Prints "PASSED: N checks, 0 failures" (or FAILED) as its last line. Optional first argument: an
 rem extra include folder searched BEFORE the SDK's (the mutation probe puts its header copies there).
 setlocal
-if "%REXSDK_DIR%"=="" set "REXSDK_DIR=C:\Users\fsop1\doa4\sdk-np0"
+if "%REXSDK_DIR%"=="" set "REXSDK_DIR=%~dp0..\..\..\sdk-np0"
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
 set "PATH=C:\Program Files\LLVM\bin;%PATH%"
 if "%OUT%"=="" set "OUT=%TEMP%\doa4_dot_product_test"

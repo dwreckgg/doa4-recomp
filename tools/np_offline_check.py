@@ -20,12 +20,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # py -3 -I does not put the script's folder on the path
 sys.dont_write_bytecode = True
-import np_run  # noqa: E402  (hidden_startupinfo)
+import np_run  # noqa: E402  (hidden_startupinfo, DOA4_ROOT, GAME_DIR)
 
-RUNS = r"C:/Users/fsop1/doa4/np_runs"
-PRISTINE = r"C:/Users/fsop1/doa4/np_phase0/ud_pristine"
-CACHE = r"C:/Users/fsop1/doa4/np_runs/cache_shared"
-GAME = r"C:\Users\fsop1\doa4\xex\DOA4"
+# Under DOA4_ROOT (np_run.py: the environment variable, by default this repository's parent folder).
+RUNS = os.path.join(np_run.DOA4_ROOT, "np_runs")
+PRISTINE = os.path.join(np_run.DOA4_ROOT, "np_phase0", "ud_pristine")
+CACHE = os.path.join(RUNS, "cache_shared")
+GAME = np_run.GAME_DIR
 RUN_SECONDS = 95  # how long the game runs before this script ends it (the tools test shortens it)
 
 # The runtime opens the host's game controllers through SDL even without a session, and a game running

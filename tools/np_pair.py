@@ -961,7 +961,7 @@ def main(argv=None):
     ap.add_argument("--exe", required=True)
     ap.add_argument("--joiner-exe")
     ap.add_argument("--cache")
-    ap.add_argument("--game", default=r"C:\Users\fsop1\doa4\xex\DOA4")
+    ap.add_argument("--game", default=np_run.GAME_DIR)
     ap.add_argument("--joiner-affinity", help="logical CPU mask for the joiner, e.g. 0x3")
     ap.add_argument("--sim", help="DOA4_NP_SIM on both sides: delay_ms,jitter_ms,loss_pct")
     ap.add_argument("--delay", type=int)

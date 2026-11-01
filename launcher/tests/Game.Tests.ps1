@@ -2,6 +2,11 @@
 
 $script:Py = (Get-Command py.exe -ErrorAction SilentlyContinue)
 
+# The real extracted game, for the read-only checks that run only where it exists: <DOA4_ROOT>\xex\DOA4 (DOA4_ROOT:
+# the environment variable, by default the parent folder of this repository, as tools/np_run.py derives it).
+$script:RealXex = if ($env:DOA4_ROOT) { Join-Path $env:DOA4_ROOT 'xex\DOA4' } else { Join-Path $PSScriptRoot '..\..\..\xex\DOA4' }
+$script:RealXex = [IO.Path]::GetFullPath($script:RealXex)
+
 # Parses a TOML file with Python's tomllib (an independent TOML 1.0 reader; the game's own
 # reader, toml++, is exercised by the end-to-end run). Returns $null when it does not parse.
 function Read-TToml {
@@ -46,7 +51,7 @@ Describe 'Test-DOA4GameFolder' {
         (Test-DOA4PathFitsCodePage -Path ('C:\' + [char]0x0101) -CodePage 1252) | Should Be $false
         (Test-DOA4PathFitsCodePage -Path ('C:\' + [char]0x65E5) -CodePage 65001) | Should Be $true
     }
-    $realXex = 'C:\Users\fsop1\doa4\xex\DOA4'
+    $realXex = $script:RealXex
     if (Test-Path -LiteralPath (Join-Path $realXex 'default.xex')) {
         It 'accepts the real extracted game on this PC (read only)' {
             (Test-DOA4GameFolder -Path $realXex).Verdict | Should Be 'Ok'
@@ -165,7 +170,7 @@ Describe 'Play and Change game files' {
         { Set-DOA4GameFiles -Ctx $ctx -Folder $xexDir } | Should Throw 'not the supported version'
         Test-Path -LiteralPath $ctx.SettingsPath | Should Be $false
     }
-    $realXex = 'C:\Users\fsop1\doa4\xex\DOA4'
+    $realXex = $script:RealXex
     if (Test-Path -LiteralPath (Join-Path $realXex 'default.xex')) {
         It 'Change game files (real game folder, read only): upstream -> settings.json' {
             $ctx = New-TGameCtx 'c2'
@@ -177,7 +182,7 @@ Describe 'Play and Change game files' {
             $ctx = New-TGameCtx 'c3' -WithSetup
             Write-TFile $ctx.TomlPath "fullscreen = true`n"
             Set-DOA4GameFiles -Ctx $ctx -Folder $realXex | Should Be 'toml'
-            (Read-TToml $ctx.TomlPath).doa4_game_files | Should BeExactly 'C:/Users/fsop1/doa4/xex/DOA4'
+            (Read-TToml $ctx.TomlPath).doa4_game_files | Should BeExactly $realXex.Replace('\', '/')
             Test-Path -LiteralPath $ctx.SettingsPath | Should Be $false
         }
     }

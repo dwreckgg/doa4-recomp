@@ -1,6 +1,8 @@
 // Host test for src/net/np_files.cpp (the game-files fingerprint: one group per KNOWN top-level entry of the disc).
-// Built and run by run_np_files_test.bat. Temp trees live under C:/Users/fsop1/doa4/np_runs/t8_<pid>_<tick>/ and
-// are removed at the end. "np_files_host_test.exe -v" prints each group before it runs.
+// Built and run by run_np_files_test.bat. Temp trees live under <DOA4_ROOT>/np_runs/t8_<pid>_<tick>/ (Doa4Root():
+// the environment variable DOA4_ROOT, by default the parent folder of the repository this file is in) and are
+// removed at the end; the first output line names the folder. "np_files_host_test.exe -v" prints each group before
+// it runs.
 //
 // Expected values are derived independently of the code under test: the golden group hashes below come from
 // DOA2U's own netplay_files.c (doa2u-release 6c35c7b) compiled with a small driver and run on one-entry trees
@@ -54,6 +56,15 @@ static const char* g_group = "";
   } while (0)
 
 static fs::path g_root;
+
+// The folder that holds the worktrees and np_runs: DOA4_ROOT, by default the parent folder of the repository this
+// source file is in (tests/host/ -> tests/ -> the repository -> its parent), as tools/np_run.py derives it. The bat
+// compiles this file by its full path, so __FILE__ is absolute.
+static fs::path Doa4Root() {
+  const char* env = std::getenv("DOA4_ROOT");
+  if (env && *env) return fs::absolute(fs::path(env));
+  return fs::absolute(fs::path(__FILE__)).parent_path().parent_path().parent_path().parent_path();
+}
 
 static const char* const kKnown[] = {"anm.afs", "avt.afs",  "chrone.afs", "chrthree.afs", "chrtwo.afs",
                                      "cmn.afs", "default.xex", "dic",       "mot.afs",      "snd.afs",
@@ -456,8 +467,9 @@ static void TestRealData() {
 int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i)
     if (std::strcmp(argv[i], "-v") == 0) g_verbose = true;
-  g_root = fs::path("C:/Users/fsop1/doa4/np_runs") /
+  g_root = Doa4Root() / "np_runs" /
            ("t8_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64()));
+  std::printf("temp root: %s\n", reinterpret_cast<const char*>(g_root.u8string().c_str()));
   std::error_code ec;
   fs::create_directories(g_root, ec);
   TestStandardTree();

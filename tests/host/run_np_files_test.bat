@@ -1,7 +1,8 @@
 @echo off
 rem Builds and runs the netplay game-files fingerprint host test with clang-cl (no CMake): np_files.cpp (Windows file
 rem API) plus np_rules.cpp and np_wire.cpp (the test judges groups with rules::DifferingGroups). Temp trees live under
-rem C:\Users\fsop1\doa4\np_runs\t8_<pid>_<tick>\ and are removed at the end. Set DOA4_NP_GAME_DIR to the real game
+rem <DOA4_ROOT>\np_runs\t8_<pid>_<tick>\ (DOA4_ROOT: the environment variable, by default the parent folder of this
+rem repository; the test prints the folder) and are removed at the end. Set DOA4_NP_GAME_DIR to the real game
 rem folder (read only) to run the real-data section; without it that section prints SKIPPED and the summary says
 rem UNMEASURED. Pass -v to print each check group before it runs.
 setlocal

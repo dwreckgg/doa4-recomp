@@ -4,10 +4,10 @@ rem The exe (%TEMP%\doa4_dpps_test\dpps_host_test.exe) needs no install: copy it
 rem and run it there to compare the "DPPS combined hash" line (raw DPPS) and the
 rem "DPPS canonical hash" line (every NaN lane made 0xFFC00000 by the SDK's own function).
 rem The test includes <rex/ppc/dot_product.h> from the SDK the netplay build uses (REXSDK_DIR,
-rem default sdk-np0), so the include paths are that SDK's include folder and simde.
+rem default sdk-np0 beside this worktree), so the include paths are that SDK's include folder and simde.
 rem Optional first argument: an include folder searched BEFORE the SDK's (the mutation probe's copies).
 setlocal
-if "%REXSDK_DIR%"=="" set "REXSDK_DIR=C:\Users\fsop1\doa4\sdk-np0"
+if "%REXSDK_DIR%"=="" set "REXSDK_DIR=%~dp0..\..\..\sdk-np0"
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
 set "PATH=C:\Program Files\LLVM\bin;%PATH%"
 if "%OUT%"=="" set "OUT=%TEMP%\doa4_dpps_test"

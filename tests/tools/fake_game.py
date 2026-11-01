@@ -234,7 +234,7 @@ LOADER_FIX_WARN = ("[2026-10-31 17:00:10.000] [warning] [core] [t1] [doa4][FIX][
                    "10 s after the loader thread started; letting it run")
 
 
-# The SDK's failed-move WARN as game.log shows it (sdk-np1 ad1b589, xobject.cpp GetNativeObject; REXSYS_WARN prints
+# The SDK's failed-move WARN as game.log shows it (sdk-np1 7c52ae8, xobject.cpp GetNativeObject; REXSYS_WARN prints
 # "[warning] [sys]"). Every SDK line of this kind starts with the tag "[netplay-lazy-pool]" (Task 15 carry a).
 LAZY_POOL_LINE = ("[2026-10-31 10:40:49.001] [warning] [sys] [t4242] [netplay-lazy-pool] GetNativeObject: the lazy object for "
                   "header 82B747D0 (type 3) keeps the low handle F8000054 (MoveToHighSlot status C0000001): later guest "

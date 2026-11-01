@@ -276,7 +276,7 @@ One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all 
 |---|---|
 | Compile errors in `thirdparty/libmspack/...` or `thirdparty/o1heap/...` | Symlink stubs: run `tools/fix_git_symlinks.py` (step 4). |
 | Errors about SSSE3 / AVX intrinsics (`_mm_...` functions) | Configure was run without the `-march=x86-64-v3` flags. Delete `out\build\win-amd64-release` and configure again. |
-| `imgui.h` or `rex/version.h` not found | The two include directories at the end of the `CMakeLists.txt` target setup are missing: they are local fixes in commit `6b95afc` on `perf-pacing`. |
+| `imgui.h` or `rex/version.h` not found | The two include directories at the end of the `CMakeLists.txt` target setup are missing: they are local fixes in commit `5caf963` (in this branch's history). |
 | `clang` not found / CMake picks the wrong compiler | LLVM's `bin` folder is not first on `PATH` in that window. |
 | CMake warning `no v* tag reachable from HEAD` | Harmless; the build is not affected. |
 | `no XDVDFS volume found` from the extractor | The file is not an Xbox / Xbox 360 game image (or is damaged). |

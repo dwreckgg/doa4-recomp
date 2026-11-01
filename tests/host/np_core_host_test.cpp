@@ -598,7 +598,7 @@ static void TestMtSeeds() {
 // np_log "determinism fixes: ..." and rec.d4r's "fixes=" line): the eleven fixes before keepalive and reader.
 static const std::string kT11Fixes = "seed,clock,sdkclock,xam,audio,movie,loader,cri,crijob,workers,notify";
 
-// Task 13: the fix set the Task 12 builds (p1t12d, netplay-p1 0e1ad01) logged and wrote into every recording's meta.
+// Task 13: the fix set the Task 12 builds (p1t12d, netplay-p1 6b9b0b2) logged and wrote into every recording's meta.
 static const std::string kT12Fixes = kT11Fixes + ",keepalive,reader";
 
 static void TestFixSets() {

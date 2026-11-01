@@ -7,7 +7,7 @@ timeout.
 
   py -3 tools/np_run.py record NAME --script boot.txt [--quit 4000] [--shots 100,200]
   py -3 tools/np_run.py replay NAME --rec runs/NAME0/out/rec.d4r
-Options: --exe, --game, --userdata (the pristine source), --runs (where run folders go),
+Options: --exe, --game (default GAME_DIR: <DOA4_ROOT>/xex/DOA4), --userdata (the pristine source), --runs (where run folders go),
 --cache (shared shader cache), --sweep N|all, --dump f,f, --shot-every N,
 --env KEY=VALUE (repeatable: extra environment, e.g. DOA4_NP_FIX=none), --timeout seconds,
 --affinity MASK (logical CPU mask, e.g. 0x3: the game is started suspended, limited to those CPUs
@@ -35,6 +35,12 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+
+# The folder that holds the worktrees, the extracted game (xex/DOA4) and the runs (np_runs): the environment variable
+# DOA4_ROOT, by default the parent folder of this repository (every worktree sits in that folder). The other np_ tools
+# take their default paths from here.
+DOA4_ROOT = os.path.abspath(os.environ.get("DOA4_ROOT") or os.path.dirname(REPO))
+GAME_DIR = os.path.join(DOA4_ROOT, "xex", "DOA4")
 
 # The quit reasons that end a good run (np_session.cpp Quit(): "quit at frame N: <reason>").
 OK_REASONS = {"record": ("quit frame",), "replay": ("end of the recording",)}
@@ -76,7 +82,7 @@ def hidden_startupinfo():
     return si
 
 
-# The tag of the SDK's two lazy-pool WARN lines (sdk-np1 ad1b589: object_table.cpp FindFreeSlot "an ordinary object took slot N
+# The tag of the SDK's two lazy-pool WARN lines (sdk-np1 7c52ae8: object_table.cpp FindFreeSlot "an ordinary object took slot N
 # of the lazy pool", xobject.cpp GetNativeObject "keeps the low handle ... later guest handles are shifted"): either means the
 # run's guest handles may depend on host timing (debug 82B70000). game.log prints them as "[warning] [sys] [tN] <tag> ...", which
 # the np_log WARN_PREFIX rule never sees, so a run's own game.log is searched for the tag (Task 15 carry a).
@@ -210,7 +216,7 @@ def main():
     ap.add_argument("mode", choices=["record", "replay"])
     ap.add_argument("name")
     ap.add_argument("--exe", default=os.path.join(REPO, "out", "build", "win-amd64-release", "dead_or_alive_4.exe"))
-    ap.add_argument("--game", default=r"C:\Users\fsop1\doa4\xex\DOA4")
+    ap.add_argument("--game", default=GAME_DIR)
     ap.add_argument("--userdata", required=True, help="pristine user data folder (copied, never written)")
     ap.add_argument("--runs", required=True, help="folder for run folders")
     ap.add_argument("--cache", default=None, help="shared shader cache folder")

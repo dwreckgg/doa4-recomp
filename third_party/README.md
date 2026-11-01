@@ -3,8 +3,9 @@
 Code taken from other projects and kept unmodified. Licence texts and credits: `THIRD_PARTY_NOTICES.md` at the
 repository root.
 
-Origin of everything here: the DOA2U netplay tree, `C:/Users/fsop1/doa2u-release` (branch `netplay-release`),
-commit `6c35c7b`, folder `doa2u/third_party/`. Each copy was checked byte for byte against that tree (`diff -r`).
+Origin of everything here: the DOA2U recompilation's netplay tree (https://github.com/parkerallan/doa2u-recomp,
+branch `netplay`), commit `6c35c7b`, folder `doa2u/third_party/`. Each copy was checked byte for byte against that
+tree (`diff -r`).
 
 | Folder | What | Licence | Upstream |
 |---|---|---|---|

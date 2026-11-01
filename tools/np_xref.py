@@ -2,16 +2,24 @@
 data range. Reads the cross-reference table (function, instruction, operands, address) built from
 the generated code.
 
-  py -3 -I tools/np_xref.py LO HI [--max 60] [--table C:/Users/fsop1/doa4/np_phase0/xref/xref2.tsv]
+  py -3 -I tools/np_xref.py LO HI [--max 60] [--table <DOA4_ROOT>/np_phase0/xref/xref2.tsv]
+
+DOA4_ROOT: np_run.py (the environment variable, by default this repository's parent folder).
 """
 import argparse
 import collections
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # py -3 -I does not put the script's folder on the path
+sys.dont_write_bytecode = True
+import np_run  # noqa: E402  (DOA4_ROOT)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("lo")
 ap.add_argument("hi")
 ap.add_argument("--max", type=int, default=60)
-ap.add_argument("--table", default=r"C:/Users/fsop1/doa4/np_phase0/xref/xref2.tsv")
+ap.add_argument("--table", default=os.path.join(np_run.DOA4_ROOT, "np_phase0", "xref", "xref2.tsv"))
 a = ap.parse_args()
 lo, hi = int(a.lo, 16), int(a.hi, 16)
 hits = collections.defaultdict(list)
