@@ -87,6 +87,12 @@ jobs:
       - name: Launcher tests (Pester)
         # Windows PowerShell 5.1 ships Pester 3.4, the version the launcher's tests are written for
         shell: powershell
+        # A player's Windows (no Developer Mode) checks symlinks out as small stub files, which the launcher repairs;
+        # the runner can create real symlinks, so every git call in these tests is told what a player's git does.
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.symlinks
+          GIT_CONFIG_VALUE_0: 'false'
         run: |
           # the runner image also has a newer Pester whose syntax the 3.4 tests do not use: load the inbox 3.4.0 explicitly
           Import-Module Pester -RequiredVersion 3.4.0 -Force
