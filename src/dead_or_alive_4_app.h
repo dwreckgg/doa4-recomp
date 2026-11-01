@@ -379,8 +379,9 @@ class DeadOrAlive4App : public rex::ReXApp {
     (void)config;
     doa4_wait_for_previous_instance();  // after "Restart now" in the menu
     // Plan 1b Task 4: the game files Check for Updates renamed away (<name>.old) are no longer in use once the instance
-    // that ran from them has exited; one still in use (another instance) stays for the next start.
-    doa4::updater::DeleteOldFiles(doa4::updater::ExeDir());
+    // that ran from them has exited; one still in use (another instance) stays for the next start. An interrupted
+    // check's update_new goes too (fix round M-2); a self-built game's .dev files stay.
+    doa4::updater::CleanUpAtStart(doa4::updater::ExeDir());
   }
   // void OnLoadXexImage(std::string& xex_image) override {}
   void OnPostSetup() override {
@@ -519,6 +520,7 @@ class DeadOrAlive4App : public rex::ReXApp {
     doa4::np::net::Config cfg = NetConfig();
     cfg.wifi_streaming = true;
     lobby_ = std::make_unique<doa4::np::online::Lobby>();
+    lobby_live_.store(lobby_.get(), std::memory_order_release);
     doa4::np::online::Providers p = LobbyProviders(/*session=*/true);
     if (!lobby_->StartInSession(std::move(p), cfg, h,
                                 [](int32_t frame, doa4::np::wire::LeaveReason reason) { doa4::np::PeerLeft(frame, reason); },
@@ -624,7 +626,29 @@ class DeadOrAlive4App : public rex::ReXApp {
     } else {
       p.log = [](const std::string& line) { REXLOG_INFO("{}", line); };
     }
+    // Plan 1b Task 4 (fix round I-1/I-3): the in-game updater behind the lobby's seam
+    p.updater.start = [this](bool confirm) { return doa4::updater::Start(UpdateRequest(confirm)); };
+    p.updater.refuse = [](const std::string& why) { doa4::updater::Refuse(why); };
+    p.updater.message = [] { return doa4::updater::Message(); };
+    p.updater.busy = [] { return doa4::updater::Busy(); };
+    p.updater.restart_pending = [] { return doa4::updater::RestartPending(); };
     return p;
+  }
+
+  // A Check for Updates request (the Online tab's button, or np_ctl.on "update"): its log lines go to game.log, and just
+  // before the swap the updater asks again whether this game is still offline (fix round I-1). The question runs on the
+  // updater's thread: it reads the lobby through lobby_live_ (set once, when the lobby is created) and its thread-safe
+  // status(); OnShutdown stops the updater first, so the question is never asked after the lobby is gone.
+  doa4::updater::Request UpdateRequest(bool confirm) {
+    doa4::updater::Request r;
+    r.log = [](const std::string& line) { REXLOG_INFO("{}", line); };
+    r.may_swap = [this] {
+      if (InOnlineSession()) return false;
+      const doa4::np::online::Lobby* l = lobby_live_.load(std::memory_order_acquire);
+      return !l || l->status().state == doa4::np::online::State::kOffline;
+    };
+    r.confirm = confirm;
+    return r;
   }
 
   // The host's save: every file below <U>/B13EBABEBABEBABE/544307D1/, named from <U> with '/' separators.
@@ -683,6 +707,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   void EnsureLobby() {
     if (lobby_ || session_) return;
     lobby_ = std::make_unique<doa4::np::online::Lobby>();
+    lobby_live_.store(lobby_.get(), std::memory_order_release);  // the updater's may_swap question reads it
     std::string error;
     if (!lobby_->Start(LobbyProviders(false), NetConfig(), &error)) {
       REXLOG_WARN("[doa4][NET] the lobby could not start: {}", error);
@@ -725,6 +750,8 @@ class DeadOrAlive4App : public rex::ReXApp {
     }
     in.build = net_build_id_;
     in.show_stats = rex::cvar::Query<bool>("netplay_show_stats");
+    in.update_busy = doa4::updater::Busy();  // fix round I-1: Join, Host and the button follow the updater
+    in.restart_pending = doa4::updater::RestartPending();
     return in;
   }
 
@@ -813,6 +840,10 @@ class DeadOrAlive4App : public rex::ReXApp {
   }
   void OnShutdown() override {
     doa4_arm_shutdown_watchdog();
+    // the very first step (plan 1b Task 4, fix round M-1): no further download or swap; a swap in progress (milliseconds
+    // of renames) gets at most 1 s to finish, so the process never ends between two of its renames by our own exit; the
+    // updater's may_swap question reads the lobby, which is stopped below
+    doa4::updater::Shutdown(1000);
     // first of all (fix round M5): the menu timer posts to the UI thread and reads the lobby; <= 25 ms to join, before
     // the lobby stop and the UPnP removal spend the 5 s watchdog's budget
     menu_tick_stop_.store(true, std::memory_order_release);
@@ -1156,6 +1187,8 @@ class DeadOrAlive4App : public rex::ReXApp {
       if (lobby_) lobby_->SetDelay(automatic, frames);
     };
     host.online.shown_changed = [this] { UpdateNetOverlay(); };
+    // Check for Updates: a press while a self-built game has been offered a release is the confirming second press
+    host.online.check_updates = [this] { doa4::updater::Start(UpdateRequest(doa4::updater::OfferPending())); };
     host.game_files = game_files_;
     host.game_files_from_command_line = game_files_from_command_line_;
     host.user_data = UserData();
@@ -1225,6 +1258,7 @@ class DeadOrAlive4App : public rex::ReXApp {
   std::optional<doa4::np::handoff::Handoff> session_;             // this process was started for a session
   std::filesystem::path session_user_data_;                       // <U>/netplay/session once the runtime is redirected
   std::unique_ptr<doa4::np::online::Lobby> lobby_;                // the lobby, or the session lobby
+  std::atomic<const doa4::np::online::Lobby*> lobby_live_{nullptr};  // lobby_.get() for the updater's thread (set once)
   std::thread lobby_watch_;                                       // test dir: waits for the first np_ctl.on
   std::atomic<bool> lobby_watch_stop_{false};
   std::string toml_snapshot_;

@@ -38,7 +38,6 @@
 #include "../../src/net/np_transport.h"
 #include "../../src/net/np_upnp.h"
 #include "../../src/net/np_wire.h"
-#include "../../src/doa4_updater.h"
 
 using namespace doa4::np;
 namespace fs = std::filesystem;
@@ -118,32 +117,23 @@ void Unmap() { ++g_upnp_unmap; }
 void Shutdown(uint32_t) { ++g_upnp_shutdown; }
 }  // namespace doa4::np::upnp
 
-// ---- doa4_updater is not linked (plan 1b Task 4): these stand-ins count the calls the lobby's "update" request makes
-// and hold the message status.txt shows; nothing reaches the network ----
-static std::atomic<int> g_upd_starts{0}, g_upd_refusals{0}, g_upd_start_log{0};
-static std::mutex g_upd_mu;
-static std::string g_upd_msg;
-static void SetUpdMsg(const std::string& m) {
-  std::lock_guard<std::mutex> lock(g_upd_mu);
-  g_upd_msg = m;
-}
-namespace doa4::updater {
-bool Start(std::function<void(const std::string&)> log) {
-  ++g_upd_starts;
-  if (log) ++g_upd_start_log;
-  SetUpdMsg("Checking for updates...");
-  return true;
-}
-void Refuse(std::string_view why) {
-  ++g_upd_refusals;
-  SetUpdMsg(std::string(why));
-}
-bool Busy() { return false; }
-std::string Message() {
-  std::lock_guard<std::mutex> lock(g_upd_mu);
-  return g_upd_msg;
-}
-}  // namespace doa4::updater
+// ---- the updater seam (plan 1b Task 4, fix round I-1/I-3): a fake behind Providers::updater, one per Side. It counts
+// the calls the lobby makes, holds the message status.txt shows, and its busy / restart_pending answers are set by the
+// test; nothing reaches the network ----
+struct FakeUpdater {
+  std::atomic<int> starts{0}, confirms{0}, refusals{0};
+  std::atomic<bool> busy{false}, pending{false};
+  std::mutex mu;
+  std::string msg;
+  void Set(const std::string& m) {
+    std::lock_guard<std::mutex> lock(mu);
+    msg = m;
+  }
+  std::string Get() {
+    std::lock_guard<std::mutex> lock(mu);
+    return msg;
+  }
+};
 
 // ---- per-run folder ----
 static fs::path g_root;
@@ -390,8 +380,22 @@ struct Side {
     p.test_dir = test_dir;
     p.test = test;
     p.log = log.Fn();
+    p.updater.start = [this](bool confirm) {
+      ++upd.starts;
+      if (confirm) ++upd.confirms;
+      upd.Set("Checking for updates...");
+      return true;
+    };
+    p.updater.refuse = [this](const std::string& why) {
+      ++upd.refusals;
+      upd.Set(why);
+    };
+    p.updater.message = [this] { return upd.Get(); };
+    p.updater.busy = [this] { return upd.busy.load(); };
+    p.updater.restart_pending = [this] { return upd.pending.load(); };
     return p;
   }
+  FakeUpdater upd;
   fs::path HandoffPath() const { return dir / "netplay" / "handoff.d4h"; }
   std::string Events() const { return ReadText(dir / "netplay" / "events.txt"); }
 };
@@ -1823,12 +1827,11 @@ static void TestSessionRefused() {
 }
 
 // Plan 1b Task 4: the "update" request is the Online tab's Check for Updates: started only when the lobby is Offline and
-// this is not a session process, refused (updater::Refuse(kOnlineText)) otherwise; status.txt's update= is the
-// updater's message, read again at every rewrite (it moves on by itself while a check runs).
+// this is not a session process, refused (Providers::updater.refuse(kOnlineText)) otherwise; "update confirm" is the
+// second press over a self-built game (fix round I-2); status.txt's update= is the updater's message, read again at
+// every rewrite (it moves on by itself while a check runs).
 static void TestUpdateRequest() {
   if (!Group("request files: update starts Check for Updates only offline; status.txt update= follows the updater")) return;
-  SetUpdMsg("");
-  const int s0 = g_upd_starts, r0 = g_upd_refusals, l0 = g_upd_start_log;
   Side s("upd");
   s.test_dir = s.dir / "ctl";
   fs::create_directories(s.test_dir);
@@ -1837,23 +1840,27 @@ static void TestUpdateRequest() {
   const fs::path st = s.test_dir / "status.txt";
   CHECKF(WaitFor([&] { return StatusKey(st, "state") == "offline"; }, 1500), "status.txt: '%s'", ReadText(st).c_str());
   CHECKF(StatusKey(st, "update").empty(), "update= before any request: '%s'", StatusKey(st, "update").c_str());
-  // a lobby that never hosted is Offline: the check starts, once, with the lobby's log
+  // a lobby that never hosted is Offline: the check starts, once, without confirm
   WriteCtl(s.test_dir, "update\n");
-  CHECKF(WaitFor([&] { return g_upd_starts == s0 + 1; }, 1000), "%d starts", g_upd_starts - s0);
-  CHECK(g_upd_refusals == r0 && g_upd_start_log == l0 + 1);
+  CHECKF(WaitFor([&] { return s.upd.starts == 1; }, 1000), "%d starts", s.upd.starts.load());
+  CHECK(s.upd.refusals == 0 && s.upd.confirms == 0);
   CHECKF(WaitFor([&] { return StatusKey(st, "update") == "Checking for updates..."; }, 1500), "update= '%s'",
          StatusKey(st, "update").c_str());
   CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] update: Check for Updates started") == 1; }, 1000));
   // the updater's message moves on without a request: status.txt follows within its 1 s rewrite
-  SetUpdMsg("Updated to netplay-v9.9.9. Restart the game to use it.");
+  s.upd.Set("Updated to netplay-v9.9.9. Restart the game to use it.");
   CHECKF(WaitFor([&] { return StatusKey(st, "update") == "Updated to netplay-v9.9.9. Restart the game to use it."; }, 2500),
          "update= '%s'", StatusKey(st, "update").c_str());
+  // the second press over a self-built game
+  WriteCtl(s.test_dir, "update confirm\n");
+  CHECKF(WaitFor([&] { return s.upd.starts == 2; }, 1000), "%d starts", s.upd.starts.load());
+  CHECK(s.upd.confirms == 1);
   // hosting: refused, nothing starts, the lobby stays as it was
   WriteCtl(s.test_dir, "host 0\n");
   CHECK(WaitState(lobby, State::kHosting, 1000));
   WriteCtl(s.test_dir, "update\n");
-  CHECKF(WaitFor([&] { return g_upd_refusals == r0 + 1; }, 1000), "%d refusals", g_upd_refusals - r0);
-  CHECK(g_upd_starts == s0 + 1);
+  CHECKF(WaitFor([&] { return s.upd.refusals == 1; }, 1000), "%d refusals", s.upd.refusals.load());
+  CHECK(s.upd.starts == 2);
   CHECKF(WaitFor([&] { return StatusKey(st, "update") == "Disconnect from online play first."; }, 1500), "update= '%s'",
          StatusKey(st, "update").c_str());
   CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] update refused") == 1; }, 1000));
@@ -1862,11 +1869,11 @@ static void TestUpdateRequest() {
   WriteCtl(s.test_dir, "disconnect\n");
   CHECK(WaitState(lobby, State::kOffline, 1000));
   WriteCtl(s.test_dir, "update\n");
-  CHECKF(WaitFor([&] { return g_upd_starts == s0 + 2; }, 1000), "%d starts", g_upd_starts - s0);
-  // "update" takes no argument: an unknown request, nothing starts
+  CHECKF(WaitFor([&] { return s.upd.starts == 3; }, 1000), "%d starts", s.upd.starts.load());
+  // any other argument: an unknown request, nothing starts
   WriteCtl(s.test_dir, "update now\n");
   CHECK(WaitFor([&] { return s.log.Count("unknown request 'update now'") == 1; }, 1000));
-  CHECK(g_upd_starts == s0 + 2 && g_upd_refusals == r0 + 1);
+  CHECK(s.upd.starts == 3 && s.upd.refusals == 1);
   // a session process: refused even once its lobby is Offline (the host answered the session Hello as a lobby, I-1a)
   Side hs("upd_host"), ss("upd_sess");
   ss.test_dir = ss.dir / "ctl";
@@ -1882,9 +1889,54 @@ static void TestUpdateRequest() {
   CHECK(WaitFor([&] { return sess.status().session_refused; }, 1000));
   CHECK(sess.status().state == State::kOffline);
   WriteCtl(ss.test_dir, "update\n");
-  CHECKF(WaitFor([&] { return g_upd_refusals == r0 + 2; }, 1000), "%d refusals", g_upd_refusals - r0);
-  CHECK(g_upd_starts == s0 + 2);
+  CHECKF(WaitFor([&] { return ss.upd.refusals == 1; }, 1000), "%d refusals", ss.upd.refusals.load());
+  CHECK(ss.upd.starts == 0);
   CHECK(WaitFor([&] { return ss.log.Count("[doa4][NET] update refused") == 1; }, 1000));
+  // a lobby without an updater (empty Providers::updater): the request is refused by the lobby itself, nothing throws
+  Side ns("upd_none");
+  ns.test_dir = ns.dir / "ctl";
+  fs::create_directories(ns.test_dir);
+  online::Providers np = ns.P();
+  np.updater = {};
+  online::Lobby none;
+  CHECK(none.Start(np, LoopCfg(), &e));
+  WriteCtl(ns.test_dir, "update\n");
+  CHECK(WaitFor([&] { return ns.log.Count("[doa4][NET] update: this game has no updater") == 1; }, 1000));
+  CHECK(WaitFor([&] { return StatusKey(ns.test_dir / "status.txt", "state") == "offline"; }, 1500));
+  CHECK(StatusKey(ns.test_dir / "status.txt", "update").empty());
+}
+
+// Fix round I-1: while a check downloads, and once it swapped files in this process, Host and Join are refused (by the
+// public calls and by the request file alike), with the reason as the event line; the lobby stays Offline. Allowed again
+// once neither holds.
+static void TestUpdateGate() {
+  if (!Group("update gate: Host and Join refused while a check runs or after a swap (fix round I-1)")) return;
+  Side s("ugate");
+  s.test_dir = s.dir / "ctl";
+  fs::create_directories(s.test_dir);
+  online::Lobby lobby;
+  if (!StartLobby(lobby, s)) return;
+  s.upd.busy = true;
+  lobby.Host(0);
+  CHECKF(WaitFor([&] { return lobby.status().event == "An update is downloading."; }, 1000), "event '%s'",
+         lobby.status().event.c_str());
+  CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] host refused: An update is downloading.") == 1; }, 1000));
+  CHECK(lobby.status().state == State::kOffline);
+  lobby.Join(Addr(DeadPort()));  // a valid address: without the gate the lobby would be Connecting
+  CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] join refused: An update is downloading.") == 1; }, 1000));
+  CHECK(lobby.status().state == State::kOffline);
+  s.upd.busy = false;
+  s.upd.pending = true;
+  WriteCtl(s.test_dir, "host 0\n");  // the request file takes the same path
+  CHECKF(WaitFor([&] { return lobby.status().event == "Restart the game to finish the update."; }, 1000), "event '%s'",
+         lobby.status().event.c_str());
+  CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] host refused: Restart the game to finish the update.") == 1; }, 1000));
+  WriteCtl(s.test_dir, "join " + Addr(DeadPort()) + "\n");
+  CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] join refused: Restart the game to finish the update.") == 1; }, 1000));
+  CHECK(lobby.status().state == State::kOffline);
+  s.upd.pending = false;
+  lobby.Host(0);
+  CHECK(WaitState(lobby, State::kHosting, 1000));
 }
 
 // I-3: refusals of strangers cannot flood the event line, game.log or events.txt: one per refusal kind per 10 s.
@@ -2149,6 +2201,7 @@ int main(int argc, char** argv) {
   TestLateYesBySessionHello();
   TestSessionRefused();
   TestUpdateRequest();
+  TestUpdateGate();
   TestStrangerEvents();
   TestJoinerCancel();
   TestUpnpCalls();

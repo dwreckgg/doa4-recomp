@@ -107,6 +107,15 @@ struct Providers {
                                                 // DOA4_NP_DELAY, DOA4_NP_TEST_BUILD_SALT, DOA4_NP_TEST_FILES_SALT
                                                 // (the app fills it from the environment; host tests fill it directly)
   std::function<void(const std::string&)> log;  // game.log ([doa4][NET] ...)
+  // The in-game updater (plan 1b Task 4; the app wires doa4_updater, the host test fakes; an empty member = no updater).
+  // Called on the I/O thread with the lobby mutex held, so none of them may call back into the lobby.
+  struct Updater {
+    std::function<bool(bool confirm)> start;        // np_ctl.on "update" / "update confirm"; false = one already runs
+    std::function<void(const std::string&)> refuse;  // the request was refused (online play): the updater's message
+    std::function<std::string()> message;           // status.txt update=
+    std::function<bool()> busy;                     // a check runs: Host and Join are refused (fix round I-1)
+    std::function<bool()> restart_pending;          // this process swapped a release in: Host and Join are refused
+  } updater;
 };
 
 // Timing constants (DOA2U netplay.c 57-64 where it has them).

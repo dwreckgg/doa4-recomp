@@ -1,16 +1,24 @@
 // Host test for src/doa4_updater (netplay plan 1b, Task 4): the SHA-256 of a file, the SHA256SUMS.txt parser, the
 // verify-then-swap with its rollback at every one of the six rename steps (simulated with fail_at, and two real
-// failures: a leftover .old and a staged file another handle holds without delete sharing), DeleteOldFiles, and the
-// release decision (Choose) over fixed release JSON. Built and run by run_updater_test.bat.
-// No network: nothing here calls CheckAndUpdate or Start. Files go under %TEMP%\doa4_updater_<pid>\ and only that
-// folder is removed at the end.
+// failures: a leftover .old and a staged file another handle holds without delete sharing), the .dev backup of a
+// self-built game, DeleteOldFiles and CleanUpAtStart, the host rule, the release decision (Choose) over fixed release
+// JSON, and (fix round 1) the whole check through Env with a fake HTTP source and a temp game folder: Start/Busy with an
+// injected check, the self-built confirm, may_swap, the caps, the swap latch (RestartPending) and Shutdown.
+// Built and run by run_updater_test.bat. No network: GameEnv (WinHTTP) is never called; every Start gets an injected
+// check. Files go under %TEMP%\doa4_updater_<pid>\ and only that folder is removed at the end.
 // SHA-256 oracles (never this code): "abc" and the 448-bit message are the FIPS 180-2 examples; the 200,003-byte
 // pattern file (byte i = (i*7+3) & 0xFF) was hashed by Windows' certutil -hashfile and by Python's hashlib (both
 // aaa1137a...329d); the empty file by hashlib (certutil refuses an empty file).
 
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -295,6 +303,8 @@ static void TestRealFailures() {
     const auto dir0 = Snapshot(c.dir);
     const std::string why = up::VerifyAndSwap(c.dir, c.staging, SumsText());
     CHECK(!why.empty() && Has(why, "rexruntime.dll"));
+    // review M-5: the player is told what to do (CheckAndUpdate deletes the .old files nobody uses first)
+    CHECK(Has(why, "an old copy of rexruntime.dll is still in use: close other copies of the game and try again"));
     const auto dir1 = Snapshot(c.dir);
     CHECK(dir1 == dir0);
     if (dir1 != dir0) std::printf("  before: %s\n  after:  %s\n", Describe(dir0).c_str(), Describe(dir1).c_str());
@@ -340,7 +350,9 @@ static void TestDeleteOldFiles() {
     Write(d / up::kFiles[i], kOld[i]);
     Write(d / (std::string(up::kFiles[i]) + ".old"), "old " + std::to_string(i));
   }
-  // never touched: other .old names, near-miss names, the config, the files themselves, an .old in a subfolder
+  // never touched: other .old names, near-miss names, the config, the files themselves, an .old in a subfolder, and the
+  // .dev copies of a self-built game (review I-2)
+  for (int i = 0; i < 3; ++i) Write(d / (std::string(up::kFiles[i]) + ".dev"), "dev " + std::to_string(i));
   Write(d / "other.dll.old", "x");
   Write(d / "dead_or_alive_4.exe.old2", "y");
   Write(d / "rexruntime.old", "z");
@@ -350,7 +362,8 @@ static void TestDeleteOldFiles() {
   Write(d / "logs" / "dead_or_alive_4.exe.old", "in a subfolder");
   auto expect = Snapshot(d);
   for (int i = 0; i < 3; ++i) expect.erase(std::string(up::kFiles[i]) + ".old");
-  CHECK(expect.size() == 9);
+  CHECK(expect.size() == 12);
+  CHECK(expect.count("rexruntime.dll.dev") == 1);
   up::DeleteOldFiles(d);
   const auto after = Snapshot(d);
   CHECK(after == expect);
@@ -428,7 +441,9 @@ static void TestChoose() {
   }
   CHECK_EQ(up::UpdatedText("netplay-v1.0.6", false), "Updated to netplay-v1.0.6. Restart the game to use it.");
   CHECK_EQ(up::UpdatedText("netplay-v1.0.6", true),
-           "Updated to netplay-v1.0.6 (it replaces the self-built game). Restart the game to use it.");
+           "Updated to netplay-v1.0.6 (your self-built files are kept as .dev). Restart the game to use it.");
+  CHECK_EQ(up::OfferText("netplay-v1.0.6"),
+           "Release netplay-v1.0.6 replaces your self-built game. Press again to install.");
 }
 
 static void TestMessages() {
@@ -444,6 +459,426 @@ static void TestExeDir() {
   GetModuleFileNameW(nullptr, buf, MAX_PATH);
   CHECK(up::ExeDir() == fs::path(buf).parent_path());
   CHECK(Exists(up::ExeDir() / "updater_host_test.exe"));
+}
+
+// =====================================================================================================
+// Fix round 1
+// =====================================================================================================
+
+template <class F>
+static bool WaitFor(F f, int ms) {
+  const auto t0 = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(ms)) {
+    if (f()) return true;
+    Sleep(5);
+  }
+  return f();
+}
+static long long MsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// I-2: a self-built game's files are kept as <name>.dev; an existing .dev is never replaced.
+static void TestDevBackup() {
+  {
+    const Case c = MakeCase("dev");
+    CHECK_EQ(up::VerifyAndSwap(c.dir, c.staging, SumsText(), -1, ".dev"), "");
+    for (int i = 0; i < 3; ++i) {
+      std::string now, kept;
+      CHECK(Read(c.dir / up::kFiles[i], &now) && now == NewContent(i));
+      CHECK(Read(c.dir / (std::string(up::kFiles[i]) + ".dev"), &kept) && kept == kOld[i]);
+      CHECK(!Exists(c.dir / (std::string(up::kFiles[i]) + ".old")));
+    }
+  }
+  {
+    const Case c = MakeCase("dev_inway");
+    Write(c.dir / "TracyClient.dll.dev", "an earlier self-built copy");
+    const auto dir0 = Snapshot(c.dir);
+    const std::string why = up::VerifyAndSwap(c.dir, c.staging, SumsText(), -1, ".dev");
+    CHECK(Has(why, "TracyClient.dll.dev") && Has(why, "move it out of the game's folder"));
+    CHECK(Snapshot(c.dir) == dir0);
+  }
+  for (int n : {1, 3, 5}) {  // the rollback puts .dev renames back too
+    const Case c = MakeCase("dev_fail" + std::to_string(n));
+    const auto dir0 = Snapshot(c.dir);
+    CHECK(!up::VerifyAndSwap(c.dir, c.staging, SumsText(), n, ".dev").empty());
+    CHECK(Snapshot(c.dir) == dir0);
+  }
+}
+
+// M-2: at start, a leftover update_new goes with the .old files; .dev files and everything else stay.
+static void TestCleanUpAtStart() {
+  const fs::path d = NewDir("cleanup");
+  for (int i = 0; i < 3; ++i) {
+    Write(d / up::kFiles[i], kOld[i]);
+    Write(d / (std::string(up::kFiles[i]) + ".old"), "old");
+    Write(d / (std::string(up::kFiles[i]) + ".dev"), "dev");
+  }
+  std::error_code ec;
+  fs::create_directories(d / "update_new" / "sub", ec);
+  Write(d / "update_new" / "dead_or_alive_4.exe", "half a download");
+  Write(d / "update_new" / "sub" / "x", "x");
+  Write(d / "dead_or_alive_4.toml", "t");
+  up::CleanUpAtStart(d);
+  CHECK(!Exists(d / "update_new"));
+  for (int i = 0; i < 3; ++i) {
+    CHECK(!Exists(d / (std::string(up::kFiles[i]) + ".old")));
+    CHECK(Exists(d / (std::string(up::kFiles[i]) + ".dev")));
+    CHECK(Exists(d / up::kFiles[i]));
+  }
+  CHECK(Exists(d / "dead_or_alive_4.toml"));
+  // an empty or relative folder: nothing happens (never the current directory's update_new)
+  const fs::path here = NewDir("cleanup_cwd");
+  fs::create_directories(here / "update_new", ec);
+  Write(here / "update_new" / "keep", "k");
+  wchar_t old_cwd[MAX_PATH];
+  GetCurrentDirectoryW(MAX_PATH, old_cwd);
+  CHECK(SetCurrentDirectoryW(here.c_str()) != 0);
+  up::CleanUpAtStart(fs::path());
+  up::CleanUpAtStart(fs::path("."));
+  SetCurrentDirectoryW(old_cwd);
+  CHECK(Exists(here / "update_new" / "keep"));
+}
+
+// M-3: the hosts a request may go to or end at.
+static void ExpectHost(const char* host, bool want) {
+  ++g_checks;
+  if (up::HostAllowed(host) != want) {
+    std::printf("FAIL host '%s': HostAllowed %s, want %s\n", host, want ? "false" : "true", want ? "true" : "false");
+    ++g_failures;
+  }
+}
+static void TestHostAllowed() {
+  for (const char* h : {"github.com", "api.github.com", "GitHub.com", "API.GITHUB.COM", "objects.githubusercontent.com",
+                        "release-assets.githubusercontent.com", "Objects.GitHubUserContent.COM"})
+    ExpectHost(h, true);
+  for (const char* h : {"", "githubusercontent.com", ".githubusercontent.com", "evilgithubusercontent.com",
+                        "objects.githubusercontent.com.evil.net", "github.com.", "objects.githubusercontent.com.",
+                        "evilgithub.com", "github.com.evil.com", "uploads.github.com", "codeload.github.com",
+                        "raw.github.io", "a.b.githubusercontent.com", "ob jects.githubusercontent.com",
+                        "objects_x.githubusercontent.com", "api.github.com.evil.com", "xgithub.com"})
+    ExpectHost(h, false);
+}
+
+// I-3: one check at a time; Busy clears afterwards; the log comes from the check's own thread; an exception ends it.
+static void TestStartBusy() {
+  up::ResetForTest();
+  std::atomic<bool> release{false}, saw_confirm{false}, saw_predicate{false};
+  std::atomic<int> runs{0};
+  std::atomic<DWORD> tid{0};
+  std::mutex lmu;
+  std::vector<std::pair<DWORD, std::string>> lines;
+  up::Request req;
+  req.log = [&](const std::string& l) {
+    std::lock_guard<std::mutex> g(lmu);
+    lines.emplace_back(GetCurrentThreadId(), l);
+  };
+  req.confirm = true;
+  req.may_swap = [] { return false; };
+  auto check = [&](const up::Request& r) {
+    ++runs;
+    tid = GetCurrentThreadId();
+    saw_confirm = r.confirm;
+    saw_predicate = r.may_swap && !r.may_swap();
+    for (int i = 0; i < 500 && !release.load(); ++i) Sleep(10);
+    up::Result res;
+    res.message = "fake check done";
+    return res;
+  };
+  CHECK(up::Start(req, check));
+  CHECK(up::Busy());
+  CHECK_EQ(up::Message(), "Checking for updates...");
+  CHECK(!up::Start(req, check));  // one at a time
+  up::Refuse(up::kOnlineText);     // a refusal does not overwrite a running check's message
+  CHECK_EQ(up::Message(), "Checking for updates...");
+  release = true;
+  CHECK(WaitFor([] { return !up::Busy(); }, 3000));
+  CHECK(runs.load() == 1);
+  CHECK_EQ(up::Message(), "fake check done");
+  CHECK(saw_confirm.load() && saw_predicate.load());  // the request reaches the check as given
+  {
+    std::lock_guard<std::mutex> g(lmu);
+    CHECK(lines.size() == 2);
+    if (lines.size() == 2) {
+      CHECK_EQ(lines[0].second, "[doa4][UPDATE] Checking for updates...");
+      CHECK_EQ(lines[1].second, "[doa4][UPDATE] fake check done");
+      CHECK(lines[0].first == tid.load() && lines[1].first == tid.load() && tid.load() != GetCurrentThreadId());
+    }
+  }
+  // an exception out of the check: Busy clears and the message says so; the next check starts
+  CHECK(up::Start(up::Request{}, [](const up::Request&) -> up::Result { throw std::runtime_error("boom"); }));
+  CHECK(WaitFor([] { return !up::Busy(); }, 3000));
+  CHECK_EQ(up::Message(), "The update check stopped unexpectedly");
+  CHECK(up::Start(up::Request{}, [](const up::Request&) {
+    up::Result r;
+    r.message = "again";
+    return r;
+  }));
+  CHECK(WaitFor([] { return !up::Busy(); }, 3000));
+  CHECK_EQ(up::Message(), "again");
+}
+
+// ---- the whole check through Env: a fake HTTP source and a temp game folder ----
+struct FakeHttp {
+  std::map<std::string, std::string> bodies;
+  std::map<std::string, std::string> fail;  // url -> the error text
+  std::vector<std::string> asked;
+  std::function<void(const std::string& url, size_t chunk)> on_chunk;  // called before each 4 KiB chunk
+  bool Get(const std::string& url, bool, const up::Sink& sink, std::string* error) {
+    asked.push_back(url);
+    const auto f = fail.find(url);
+    if (f != fail.end()) {
+      *error = f->second;
+      return false;
+    }
+    const auto it = bodies.find(url);
+    if (it == bodies.end()) {
+      *error = "HTTP 404";
+      return false;
+    }
+    const std::string& b = it->second;
+    for (size_t at = 0, n = 0; at < b.size(); at += 4096, ++n) {
+      if (on_chunk) on_chunk(url, n);
+      if (!sink(b.data() + at, std::min<size_t>(4096, b.size() - at))) {
+        *error = "stopped by the sink";
+        return false;
+      }
+    }
+    return true;
+  }
+};
+static const std::string kApi = "https://api.github.com/repos/o/r/releases?per_page=30";
+static const std::string kTag = "netplay-v1.0.6";
+static std::string Url(const std::string& name) { return "https://github.com/o/r/releases/download/" + kTag + "/" + name; }
+static void Serve(FakeHttp& h, const std::string& sums) {
+  h.bodies[kApi] = "[" + Release(kTag, kAll) + "]";
+  for (int i = 0; i < 3; ++i) h.bodies[Url(up::kFiles[i])] = NewContent(i);
+  h.bodies[Url("SHA256SUMS.txt")] = sums;
+}
+static up::Env MakeEnv(FakeHttp& h, const fs::path& dir, const std::string& current) {
+  up::Env e;
+  e.get = [&h](const std::string& u, bool api, const up::Sink& s, std::string* err) { return h.Get(u, api, s, err); };
+  e.dir = dir;
+  e.repo = "o/r";
+  e.channel = "netplay";
+  e.current = current;
+  return e;
+}
+static fs::path GameDir(const std::string& tag) {  // the three old files and a toml
+  const fs::path d = NewDir(tag);
+  for (int i = 0; i < 3; ++i) Write(d / up::kFiles[i], kOld[i]);
+  Write(d / "dead_or_alive_4.toml", "t");
+  return d;
+}
+// A check that must change nothing: the folder (no update_new left either) and the latch.
+static void ExpectUnchanged(const char* what, const fs::path& d, const std::map<std::string, std::string>& d0) {
+  const auto d1 = Snapshot(d);
+  ++g_checks;
+  if (d1 != d0 || up::RestartPending()) {
+    std::printf("FAIL %s: changed (restart pending %d)\n  before: %s\n  after:  %s\n", what, int(up::RestartPending()),
+                Describe(d0).c_str(), Describe(d1).c_str());
+    ++g_failures;
+  }
+}
+
+static void TestCheckAndUpdate() {
+  up::ResetForTest();
+  {  // no release yet: only the list is asked for
+    FakeHttp h;
+    h.bodies[kApi] = "[]";
+    const fs::path d = GameDir("cau_none");
+    const auto d0 = Snapshot(d);
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(!r.ok);
+    CHECK_EQ(r.message, "No netplay release found yet");
+    CHECK(h.asked.size() == 1 && h.asked[0] == kApi);
+    ExpectUnchanged("no release", d, d0);
+  }
+  {  // GitHub not reachable
+    FakeHttp h;
+    h.fail[kApi] = "no answer (error 12007)";
+    const fs::path d = GameDir("cau_unreachable");
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK_EQ(r.message, "Could not reach GitHub (no answer (error 12007))");
+  }
+  {  // a wrong sum for the last file: all four downloaded, nothing changed, update_new removed
+    FakeHttp h;
+    Serve(h, SumsText(2));
+    const fs::path d = GameDir("cau_badsum");
+    const auto d0 = Snapshot(d);
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(!r.ok && Has(r.message, "TracyClient.dll") && Has(r.message, "does not match"));
+    CHECK(h.asked.size() == 5);
+    ExpectUnchanged("bad sum", d, d0);
+  }
+  {  // may_swap says no (online play began during the download): asked once, nothing changed
+    FakeHttp h;
+    Serve(h, SumsText());
+    const fs::path d = GameDir("cau_mayswap");
+    const auto d0 = Snapshot(d);
+    std::atomic<int> asked{0};
+    up::Request q;
+    q.may_swap = [&] {
+      ++asked;
+      return false;
+    };
+    const up::Result r = up::CheckAndUpdate(q, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(!r.ok && Has(r.message, "online play"));
+    CHECK(asked.load() == 1);
+    ExpectUnchanged("may_swap no", d, d0);
+  }
+  {  // a game file over the cap
+    FakeHttp h;
+    Serve(h, SumsText());
+    const fs::path d = GameDir("cau_cap");
+    const auto d0 = Snapshot(d);
+    up::Env e = MakeEnv(h, d, "netplay-v1.0.5");
+    e.max_file_bytes = 100000;  // the exe fixture has 200,003 bytes, the DLL fixtures 3 and 56
+    const up::Result r = up::CheckAndUpdate(up::Request{}, e);
+    CHECK(!r.ok && Has(r.message, "dead_or_alive_4.exe") && Has(r.message, "larger than"));
+    ExpectUnchanged("cap", d, d0);
+  }
+  {  // a download that fails
+    FakeHttp h;
+    Serve(h, SumsText());
+    h.fail[Url("rexruntime.dll")] = "HTTP 503";
+    const fs::path d = GameDir("cau_dlfail");
+    const auto d0 = Snapshot(d);
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(!r.ok && Has(r.message, "rexruntime.dll") && Has(r.message, "HTTP 503"));
+    ExpectUnchanged("download fails", d, d0);
+  }
+  {  // a SHA256SUMS.txt over 1 MB
+    FakeHttp h;
+    Serve(h, SumsText() + std::string(size_t(1) << 20, '#'));
+    const fs::path d = GameDir("cau_bigsums");
+    const auto d0 = Snapshot(d);
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(!r.ok && Has(r.message, "SHA256SUMS.txt"));
+    ExpectUnchanged("big sums", d, d0);
+  }
+  {  // I-2: a self-built game; confirm with nothing offered yet only offers
+    FakeHttp h;
+    Serve(h, SumsText());
+    const fs::path d = GameDir("cau_devconfirm0");
+    const auto d0 = Snapshot(d);
+    up::Request c;
+    c.confirm = true;
+    const up::Result r = up::CheckAndUpdate(c, MakeEnv(h, d, "dev"));
+    CHECK(!r.ok);
+    CHECK_EQ(r.message, up::OfferText(kTag));
+    CHECK(h.asked.size() == 1);
+    ExpectUnchanged("dev confirm without an offer", d, d0);
+    CHECK(up::OfferPending());
+  }
+  up::ResetForTest();
+  CHECK(!up::OfferPending());
+  {  // I-2: the first press only offers; the confirmed second press installs and keeps the self-built files as .dev
+    FakeHttp h;
+    Serve(h, SumsText());
+    const fs::path d = GameDir("cau_dev");
+    const auto d0 = Snapshot(d);
+    const up::Result r1 = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "dev"));
+    CHECK(!r1.ok);
+    CHECK_EQ(r1.message, up::OfferText(kTag));
+    CHECK(h.asked.size() == 1 && up::OfferPending());
+    ExpectUnchanged("dev offer", d, d0);
+    up::Request c;
+    c.confirm = true;
+    const up::Result r2 = up::CheckAndUpdate(c, MakeEnv(h, d, "dev"));
+    CHECK(r2.ok);
+    CHECK_EQ(r2.message, up::UpdatedText(kTag, true));
+    for (int i = 0; i < 3; ++i) {
+      std::string now, kept;
+      CHECK(Read(d / up::kFiles[i], &now) && now == NewContent(i));
+      CHECK(Read(d / (std::string(up::kFiles[i]) + ".dev"), &kept) && kept == kOld[i]);
+      CHECK(!Exists(d / (std::string(up::kFiles[i]) + ".old")));
+    }
+    CHECK(!Exists(d / "update_new"));
+    CHECK(up::RestartPending() && !up::OfferPending());
+    // the latch: a later check downloads nothing
+    const size_t n = h.asked.size();
+    const up::Result r3 = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "dev"));
+    CHECK(!r3.ok && h.asked.size() == n);
+    CHECK_EQ(r3.message, up::UpdatedText(kTag, false));
+  }
+  up::ResetForTest();
+  CHECK(!up::RestartPending());
+  {  // a release game installs at the first press: .old kept; a stale .old nobody uses is deleted first; a leftover
+     // update_new of an interrupted check is replaced and removed
+    FakeHttp h;
+    Serve(h, SumsText());
+    const fs::path d = GameDir("cau_release");
+    Write(d / "rexruntime.dll.old", "stale, not in use");
+    std::error_code ec;
+    fs::create_directories(d / "update_new", ec);
+    Write(d / "update_new" / "junk", "j");
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(r.ok);
+    CHECK_EQ(r.message, up::UpdatedText(kTag, false));
+    for (int i = 0; i < 3; ++i) {
+      std::string now, old;
+      CHECK(Read(d / up::kFiles[i], &now) && now == NewContent(i));
+      CHECK(Read(d / (std::string(up::kFiles[i]) + ".old"), &old) && old == kOld[i]);
+      CHECK(!Exists(d / (std::string(up::kFiles[i]) + ".dev")));
+    }
+    CHECK(!Exists(d / "update_new"));
+    CHECK(up::RestartPending());
+  }
+  up::ResetForTest();
+}
+
+// M-1 (last: Shutdown is for good): a download stops at its next chunk; Shutdown waits at most its limit for the swap
+// step and a cancel there swaps nothing; after Shutdown nothing starts.
+static void TestShutdown() {
+  up::ResetForTest();
+  {
+    FakeHttp h;
+    Serve(h, SumsText());
+    h.on_chunk = [](const std::string& url, size_t n) {
+      if (url.find("dead_or_alive_4.exe") != std::string::npos && n == 1) up::Shutdown(0);
+    };
+    const fs::path d = GameDir("shut_download");
+    const auto d0 = Snapshot(d);
+    const up::Result r = up::CheckAndUpdate(up::Request{}, MakeEnv(h, d, "netplay-v1.0.5"));
+    CHECK(!r.ok);
+    ExpectUnchanged("shutdown during a download", d, d0);
+    // the download stopped there: nothing after the exe was asked for (the swap step's own cancel check would leave the
+    // folder unchanged even if the downloads had gone on)
+    CHECK(h.asked.size() == 2);
+    CHECK(!up::Start(up::Request{}, [](const up::Request&) { return up::Result{}; }));
+    CHECK(!up::Busy());
+  }
+  up::ResetForTest();
+  {
+    FakeHttp h;
+    Serve(h, SumsText());
+    const fs::path d = GameDir("shut_swap");
+    const auto d0 = Snapshot(d);
+    std::atomic<bool> in_predicate{false};
+    up::Request q;
+    q.may_swap = [&] {
+      in_predicate = true;
+      Sleep(3000);
+      return true;
+    };
+    const up::Env env = MakeEnv(h, d, "netplay-v1.0.5");
+    CHECK(up::Start(q, [env](const up::Request& r) { return up::CheckAndUpdate(r, env); }));
+    CHECK(WaitFor([&] { return in_predicate.load(); }, 5000));
+    const auto t0 = std::chrono::steady_clock::now();
+    up::Shutdown(1000);
+    const long long ms = MsSince(t0);
+    std::printf("info: Shutdown(1000) during the swap step returned after %lld ms\n", ms);
+    CHECK(ms >= 900 && ms < 2500);
+    CHECK(WaitFor([] { return !up::Busy(); }, 6000));
+    ExpectUnchanged("shutdown during the swap step", d, d0);
+  }
+  up::ResetForTest();
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    up::Shutdown(1000);  // nothing in progress: at once
+    CHECK(MsSince(t0) < 300);
+  }
 }
 
 int main() {
@@ -464,6 +899,12 @@ int main() {
   TestChoose();
   TestMessages();
   TestExeDir();
+  TestDevBackup();
+  TestCleanUpAtStart();
+  TestHostAllowed();
+  TestStartBusy();
+  TestCheckAndUpdate();
+  TestShutdown();  // last: the cancel flag stays set
   fs::remove_all(g_root, ec);
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
