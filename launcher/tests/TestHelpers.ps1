@@ -52,6 +52,8 @@ function New-FakeCmd {
     [pscustomobject]@{ Invoke = $invoke; State = $state }
 }
 
+# DefaultSource 'source': the tests written before the release mode test the build-from-source
+# path on fresh folders; Release.Tests.ps1 uses New-TReleaseConfig ('release', as config.ps1).
 function New-TestConfig {
     @{
         GameRepoUrl = 'https://github.com/parkerallan/doa4-recomp'; GameRef = 'main'
@@ -60,7 +62,140 @@ function New-TestConfig {
         WingetVsId = 'Microsoft.VisualStudio.BuildTools'; VsWorkload = 'Microsoft.VisualStudio.Workload.VCTools'
         VsVersionRange = '[18,19)'; RequiredFreeGB = 6
         GitSize = 'about 70 MB download'; LlvmSize = 'about 400 MB download'; VsSize = 'about 2 GB download'
+        ReleaseRepo = 'Dwreckgg/doa4-recomp'; ReleaseChannel = 'netplay'
+        ReleaseAssets = @('dead_or_alive_4.exe', 'rexruntime.dll', 'TracyClient.dll'); ReleaseTag = ''
+        DefaultSource = 'source'
     }
+}
+
+function New-TReleaseConfig {
+    param([string]$Tag = '')
+    $c = New-TestConfig
+    $c.DefaultSource = 'release'
+    $c.ReleaseTag = $Tag
+    return $c
+}
+
+# ---- release mode fakes: the GitHub API and downloads, the process query, folder renames ----
+
+$script:TReleaseListUrl = 'https://api.github.com/repos/Dwreckgg/doa4-recomp/releases?per_page=30'
+
+function Get-TAssetUrl {
+    param([string]$Tag, [string]$Name)
+    return ('https://github.com/Dwreckgg/doa4-recomp/releases/download/{0}/{1}' -f $Tag, $Name)
+}
+
+# The bytes a fixture release serves for one file: different for every tag and name.
+function Get-TAssetBytes {
+    param([string]$Tag, [string]$Name)
+    return , [Text.Encoding]::ASCII.GetBytes("$Tag $Name fixture bytes`r`n")
+}
+
+# The test's SHA-256 oracle: .NET's SHA256 class directly (checked against the FIPS 180-2 "abc"
+# vector in Release.Tests.ps1), lower-case hex as tools/release_stage.py writes it.
+function Get-TSha256Hex {
+    param([byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (-join ($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') })) } finally { $sha.Dispose() }
+}
+
+# A release list and the files behind it. Each spec: @{ Tag; Draft = $false; Omit = names not
+# published; Corrupt = names served with other bytes than SHA256SUMS.txt says (a broken
+# download); NoSum = names without a SHA256SUMS.txt line; Missing = names that answer HTTP 404 }.
+# Every release also carries the zip and the launcher zip, as the real ones do.
+function New-TReleaseSet {
+    param([object[]]$Specs)
+    $three = @('dead_or_alive_4.exe', 'rexruntime.dll', 'TracyClient.dll')
+    $files = @{}
+    $list = New-Object System.Collections.ArrayList
+    $id = 1000
+    foreach ($s in $Specs) {
+        $tag = [string]$s.Tag
+        $omit = @(); if ($s.ContainsKey('Omit')) { $omit = @($s.Omit) }
+        $corrupt = @(); if ($s.ContainsKey('Corrupt')) { $corrupt = @($s.Corrupt) }
+        $noSum = @(); if ($s.ContainsKey('NoSum')) { $noSum = @($s.NoSum) }
+        $missing = @(); if ($s.ContainsKey('Missing')) { $missing = @($s.Missing) }
+        $sums = ''
+        foreach ($n in $three) {
+            if ($noSum -notcontains $n) { $sums += ('{0}  {1}' -f (Get-TSha256Hex (Get-TAssetBytes $tag $n)), $n) + "`n" }
+        }
+        $assets = New-Object System.Collections.ArrayList
+        foreach ($n in ($three + @('SHA256SUMS.txt', "DOA4-$tag-win64.zip", 'DOA4-launcher.zip'))) {
+            if ($omit -contains $n) { continue }
+            $url = Get-TAssetUrl $tag $n
+            if ($missing -contains $n) { $files[$url] = 404 }
+            elseif ($n -eq 'SHA256SUMS.txt') { $files[$url] = [Text.Encoding]::ASCII.GetBytes($sums) }
+            elseif ($corrupt -contains $n) { $files[$url] = [Text.Encoding]::ASCII.GetBytes("$tag $n CORRUPTED`r`n") }
+            else { $files[$url] = Get-TAssetBytes $tag $n }
+            $id++
+            [void]$assets.Add([ordered]@{
+                    url = "https://api.github.com/repos/Dwreckgg/doa4-recomp/releases/assets/$id"; id = $id; name = $n
+                    content_type = 'application/octet-stream'; state = 'uploaded'; browser_download_url = $url
+                })
+        }
+        $draft = $false; if ($s.ContainsKey('Draft')) { $draft = [bool]$s.Draft }
+        [void]$list.Add([ordered]@{
+                url = 'https://api.github.com/repos/Dwreckgg/doa4-recomp/releases/1'; tag_name = $tag; name = $tag
+                draft = $draft; prerelease = $true; assets = $assets.ToArray()
+            })
+    }
+    $json = ConvertTo-Json -InputObject $list.ToArray() -Depth 6
+    if ($list.Count -eq 0) { $json = '[]' }
+    [pscustomobject]@{ Json = $json; Files = $files }
+}
+
+# The fake http entry of the command table: the release list URL answers ListJson (or ListStatus
+# with ListText); a file URL in Files writes its bytes to OutFile (an int answers that status).
+# Records every call; throws on any other URL.
+function New-FakeHttp {
+    param([string]$ListJson, [hashtable]$Files = @{}, [int]$ListStatus = 200, [string]$ListText = '')
+    $state = @{ Calls = (New-Object System.Collections.ArrayList) }
+    $listUrl = $script:TReleaseListUrl   # a closure does not see this file's script scope
+    $invoke = {
+        param([string]$Url, [string]$OutFile)
+        [void]$state.Calls.Add([pscustomobject]@{ Url = $Url; OutFile = $OutFile })
+        if ($Url -ceq $listUrl) {
+            if ($OutFile) { throw "fake http: the release list was asked for as a file ($OutFile)" }
+            if ($ListStatus -ne 200) { return @{ Status = $ListStatus; Text = $ListText } }
+            return @{ Status = 200; Text = $ListJson }
+        }
+        if ($Files.ContainsKey($Url)) {
+            if (-not $OutFile) { throw "fake http: a release file was asked for as text ($Url)" }
+            $f = $Files[$Url]
+            if ($f -is [int]) { return @{ Status = $f; Text = 'Not Found' } }
+            [IO.File]::WriteAllBytes($OutFile, [byte[]]$f)
+            return @{ Status = 200; Text = $null }
+        }
+        throw "fake http: unexpected request: $Url"
+    }.GetNewClosure()
+    [pscustomobject]@{ Invoke = $invoke; State = $state }
+}
+
+# A command table for release mode: http (a New-FakeHttp), processPaths (the paths of the
+# running dead_or_alive_4 processes), rename (the real folder move, or one that throws when its
+# source matches -FailRename). Every build tool throws: release mode never runs one.
+function New-TReleaseTable {
+    param($Http, [string[]]$Running = @(), [string]$FailRename = '')
+    $renames = New-Object System.Collections.ArrayList
+    $running = @($Running)
+    $t = @{
+        http = $Http.Invoke
+        processPaths = { param([string]$Name) if ($Name -cne 'dead_or_alive_4') { throw "fake processPaths: unexpected name $Name" }; $running }.GetNewClosure()
+        rename = {
+            param([string]$From, [string]$To)
+            [void]$renames.Add(('{0} -> {1}' -f (Split-Path -Leaf $From), (Split-Path -Leaf $To)))
+            if ($FailRename -and (Split-Path -Leaf $From) -ceq $FailRename) { throw "fake rename: refused to move $From" }
+            [IO.Directory]::Move($From, $To)
+        }.GetNewClosure()
+        git = { throw 'fake git: release mode runs no git' }
+        cmd = { throw 'fake cmd: release mode builds nothing' }
+        winget = { throw 'fake winget: release mode installs no tools' }
+        clang = { throw 'fake clang: release mode runs no clang' }
+        vswhere = { throw 'fake vswhere: release mode runs no vswhere' }
+        freeSpace = { param($p) 500GB }
+    }
+    $t.Renames = $renames
+    return $t
 }
 
 # Fake tool set: everything present unless named in -Missing; -ClangVersion for a wrong
