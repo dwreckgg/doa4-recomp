@@ -26,6 +26,7 @@ struct OnlineHost {
   std::function<void()> leave_session;
   std::function<void(bool automatic, int frames)> set_delay;
   std::function<void()> shown_changed;                       // the F9 setting changed (the overlay follows it)
+  std::function<void()> check_updates;                       // Check for Updates (plan 1b Task 4): the app starts it
 };
 
 class OnlineTab {

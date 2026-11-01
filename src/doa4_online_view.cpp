@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "doa4_updater.h"  // kOnlineText only (the view links no updater code)
 #include "net/np_rules.h"
 
 namespace doa4::online_view {
@@ -15,6 +16,8 @@ constexpr const char* kSessionRefusedText = "The other player's game did not sta
 constexpr const char* kDisplayNote = "The host's display settings are used during the session";
 constexpr const char* kSessionNote = "Settings changed during a session are restored when it ends.";
 constexpr const char* kJoinerHint = "The host starts the online session; both games then restart.";
+constexpr const char* kJoinerCodeNote =
+    "Taking long? Send this code to the host; they type it under Strict router? and press Reach out.";
 
 // The names status.txt uses (np_online StateName); the pure view cannot link the lobby.
 const char* StateText(State s) {
@@ -111,11 +114,23 @@ View Describe(const In& in) {
 
   v.delay_enabled = !SessionLocks(in);  // locked while starting and in a session (one notion, fix round M2)
 
-  // the code: shown while hosting or connected as the host, when the lobby has one
-  if (!session && (state == State::kHosting || (state == State::kConnected && st.is_host)) && !st.my_code.empty()) {
+  // Check for Updates (plan 1b Task 4): only offline. The swap renames this exe, and a restart into a session relaunches
+  // that path (DOA2U's reason, doa2u_ui.cpp 435-437); `open` is true in every lobby state but Offline and in a session.
+  v.update_enabled = !open && !in.update_busy;
+  if (open) v.update_note = updater::kOnlineText;
+  // Review fix round I-1: no online play while a check downloads or once it swapped files in this process (the
+  // relaunch into a session would start the new exe, whose hand-off build check refuses the session).
+  v.join_host_enabled = !in.update_busy && !in.restart_pending;
+  v.join_host_note = in.restart_pending ? updater::kRestartText : in.update_busy ? updater::kBusyText : "";
+
+  // the code: shown while hosting or connected as the host, when the lobby has one; and (review fix round G-R) to a
+  // joiner still connecting, so that the host can "Reach out" to it through a strict router
+  const bool joiner_waiting = !session && state == State::kConnecting;
+  if (!session && (state == State::kHosting || (state == State::kConnected && st.is_host) || joiner_waiting) &&
+      !st.my_code.empty()) {
     v.show_code = true;
   }
-  v.code_note = st.code_note;
+  v.code_note = joiner_waiting ? kJoinerCodeNote : st.code_note;
   v.hint = (state == State::kConnected && !st.is_host && !session) ? kJoinerHint : st.hint;
 
   v.event_line = !st.event.empty() ? st.event : (st.session_refused ? kSessionRefusedText : "");

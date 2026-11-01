@@ -23,6 +23,8 @@ struct In {
   std::string release;      // DOA4_RELEASE_TAG
   uint64_t build = 0;       // np::BuildIdValue() (0 = unreadable)
   bool show_stats = false;  // netplay_show_stats (the F9 box)
+  bool update_busy = false;      // updater::Busy(): a check runs
+  bool restart_pending = false;  // updater::RestartPending(): this process swapped a release in
 };
 
 struct View {
@@ -36,6 +38,14 @@ struct View {
   std::string diagnostics_line;                        // "Dropped packets: N" (spec 7); empty when Offline
   std::string display_note;                            // "The host's display settings are used during the session" or empty
   std::string session_note;                            // "Settings changed during a session are restored when it ends." in a session
+  // Check for Updates (plan 1b Task 4; spec 3.1 "disabled while online"): enabled only when the lobby is Offline (or
+  // was never opened), no session runs and no check is running; update_note is updater::kOnlineText when online.
+  bool update_enabled = false;
+  std::string update_note;
+  // Join and Host (review fix round I-1): disabled while a check downloads (updater::kBusyText) and once a check swapped
+  // files in this process (updater::kRestartText, which wins); join_host_note says which, else "".
+  bool join_host_enabled = false;
+  std::string join_host_note;
 };
 
 View Describe(const In& in);

@@ -33,6 +33,7 @@
 #include <thread>
 #include <utility>
 
+#include "../doa4_updater.h"  // its texts only: the updater itself is reached through Providers::updater
 #include "np_upnp.h"
 
 namespace doa4::np::online {
@@ -368,6 +369,18 @@ struct Lobby::Impl {
     return rules::DelayFromRtt(rtt_n ? int(std::lround(rtt)) : -1);
   }
   void Drop(wire::Drop why) { ++drops[size_t(why)]; }
+  // Fix round I-1: Host and Join are refused while a check downloads and once one swapped files in this process (the
+  // relaunch into a session would start the new exe, whose hand-off build check refuses the session). True = refused:
+  // the event line says why, the lobby stays as it was.
+  bool UpdateRefuses(const char* action) {
+    const char* why = (p.updater.restart_pending && p.updater.restart_pending()) ? updater::kRestartText
+                      : (p.updater.busy && p.updater.busy())                    ? updater::kBusyText
+                                                                                : nullptr;
+    if (!why) return false;
+    Log(std::string("[doa4][NET] ") + action + " refused: " + why);
+    SetEvent(why);
+    return true;
+  }
   void SetEvent(const std::string& text, const char* refusal_kind = "none");
   Status SnapshotLocked() const;
   void WriteStatus(uint32_t now);
@@ -496,6 +509,7 @@ void Lobby::Impl::WriteStatus(uint32_t now) {
                            "\npeer_port=" + std::to_string(s.peer_port) + "\nping=" + ping + "\ndelay=" + std::to_string(s.delay) +
                            "\ncan_start=" + (s.can_start ? "1" : "0") + "\nevent=" + Sanitize(s.event, 1000) +
                            "\ncode=" + Sanitize(s.my_code, 64) + "\nnat=" + NatKey(s.nat) +  // Task 15 close-out (b)
+                           "\nupdate=" + Sanitize(p.updater.message ? p.updater.message() : "", 1000) +  // plan 1b Task 4
                            "\nrefusal=" + s.refusal + "\n";
   status_dirty = false;
   status_last = now;
@@ -558,6 +572,22 @@ void Lobby::Impl::ApplyRequests(const std::string& text, uint32_t now) {
       c.flag = false;
       c.n = int(v);
     } else if (verb == "status" && arg.empty()) {
+      WriteStatus(now);
+      continue;
+    } else if (verb == "update" && (arg.empty() || arg == "confirm")) {
+      // Plan 1b Task 4: the Online tab's Check for Updates, under the same rule as its button (online_view: only when
+      // the lobby is Offline and this is no session process); "update confirm" is the second press that installs over a
+      // self-built game (fix round I-2). The updater's start logs nothing on this thread (M-1).
+      if (!p.updater.start) {
+        Log("[doa4][NET] update: this game has no updater");
+      } else if (session || state != State::kOffline) {
+        if (p.updater.refuse) p.updater.refuse(updater::kOnlineText);
+        Log(std::string("[doa4][NET] update refused: ") + (session ? "a session process" : StateName(state)));
+      } else if (p.updater.start(arg == "confirm")) {
+        Log("[doa4][NET] update: Check for Updates started (np_ctl.on)");
+      } else {
+        Log("[doa4][NET] update: a check is already running");
+      }
       WriteStatus(now);
       continue;
     } else {
@@ -1220,7 +1250,7 @@ void Lobby::Impl::Apply(const Command& c, uint32_t now) {
   status_dirty = true;
   switch (c.cmd) {
     case Cmd::kHost:
-      if (session) return;
+      if (session || UpdateRefuses("host")) return;
       if (c.port != 0 && c.port != t.port())
         Log("[doa4][NET] host on port " + std::to_string(c.port) + " asked; this lobby's socket is on " + std::to_string(t.port()) +
             " (a new port takes a new lobby)");
@@ -1234,7 +1264,7 @@ void Lobby::Impl::Apply(const Command& c, uint32_t now) {
       SetEvent("Hosting: give the other player your code.");
       return;
     case Cmd::kJoin: {
-      if (session) return;
+      if (session || UpdateRefuses("join")) return;
       rules::Endpoint ep;
       GoOffline();
       if (!rules::ParseJoinCode(c.text, &ep)) {

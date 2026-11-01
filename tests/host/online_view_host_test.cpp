@@ -385,6 +385,90 @@ static void TestTabLogLine() {
   CHECK_EQ(TabLogLine(e, Describe(e)), "[doa4][NET] tab: in_session start=0 leave=1");
 }
 
+// Plan 1b Task 4: Check for Updates is enabled only when the lobby is Offline (or was never opened) and no session runs
+// (spec 3.1 "disabled while online"); the note beside the disabled button is the updater's kOnlineText.
+static void TestUpdateButton() {
+  const View none = Describe(In{});  // no lobby yet
+  CHECK(none.update_enabled);
+  CHECK_EQ(none.update_note, "");
+  const View off = Describe(Open(State::kOffline, false));  // a lobby that is Offline again (after Disconnect)
+  CHECK(off.update_enabled);
+  CHECK_EQ(off.update_note, "");
+  int disabled = 0;
+  for (State s : {State::kHosting, State::kConnecting, State::kConnected, State::kStarting, State::kRestarting,
+                  State::kInSession}) {
+    for (bool host : {false, true}) {
+      const View v = Describe(Open(s, host));
+      CHECK(!v.update_enabled);
+      CHECK_EQ(v.update_note, "Disconnect from online play first.");
+      disabled += v.update_enabled ? 0 : 1;
+    }
+  }
+  CHECK(disabled == 12);
+  // a session process: disabled whatever its lobby says (no lobby, an Offline one, one still connecting)
+  In a;
+  a.in_session = true;
+  CHECK(!Describe(a).update_enabled);
+  In b = Open(State::kOffline, false);
+  b.in_session = true;
+  CHECK(!Describe(b).update_enabled);
+  CHECK_EQ(Describe(b).update_note, "Disconnect from online play first.");
+  In c = Open(State::kConnecting, true);
+  c.in_session = true;
+  CHECK(!Describe(c).update_enabled);
+}
+
+// Review fix round I-1: while a check downloads, and after it swapped files in this process, Host and Join are disabled
+// with the reason beside them; a download also disables the button itself (one check at a time).
+static void TestUpdateLocksJoinHost() {
+  const View none = Describe(In{});
+  CHECK(none.join_host_enabled);
+  CHECK_EQ(none.join_host_note, "");
+  In busy;
+  busy.update_busy = true;
+  const View b = Describe(busy);
+  CHECK(!b.join_host_enabled);
+  CHECK_EQ(b.join_host_note, "An update is downloading.");
+  CHECK(!b.update_enabled);
+  CHECK(b.show_join && b.show_host);  // still shown, disabled
+  In pending;
+  pending.restart_pending = true;
+  const View p = Describe(pending);
+  CHECK(!p.join_host_enabled);
+  CHECK_EQ(p.join_host_note, "Restart the game to finish the update.");
+  CHECK(p.update_enabled);  // pressing again only says to restart
+  In both = busy;
+  both.restart_pending = true;
+  CHECK(!Describe(both).join_host_enabled);
+  CHECK_EQ(Describe(both).join_host_note, "Restart the game to finish the update.");
+  // an Offline lobby (after Disconnect) is gated the same way
+  In off = Open(State::kOffline, false);
+  off.update_busy = true;
+  CHECK(!Describe(off).join_host_enabled);
+}
+
+// Review fix round G-R: a joiner that is still connecting shows its own code, so that the host can use "Reach out"
+// (strict routers); only when the lobby has one, and never in a session process.
+static void TestJoinerCodeWhileConnecting() {
+  In in = Open(State::kConnecting, false);
+  in.lobby.my_code = "AbCdEfG";
+  in.lobby.code_note = "Public address found";
+  const View v = Describe(in);
+  CHECK(v.show_code);
+  CHECK_EQ(v.code_note, "Taking long? Send this code to the host; they type it under Strict router? and press Reach out.");
+  In none = Open(State::kConnecting, false);  // no STUN answer and no LAN address: nothing to show
+  CHECK(!Describe(none).show_code);
+  In session = in;  // a session process reconnecting is not a joiner looking for a host
+  session.in_session = true;
+  CHECK(!Describe(session).show_code);
+  // the host's code and note while hosting are as before
+  In host = Open(State::kHosting, true);
+  host.lobby.my_code = "AbCdEfG";
+  host.lobby.code_note = "Public address found";
+  CHECK(Describe(host).show_code);
+  CHECK_EQ(Describe(host).code_note, "Public address found");
+}
+
 int main() {
   TestOffline();
   TestHosting();
@@ -402,6 +486,9 @@ int main() {
   TestSessionNote();
   TestBanner();
   TestTabLogLine();
+  TestUpdateButton();
+  TestUpdateLocksJoinHost();
+  TestJoinerCodeWhileConnecting();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }
