@@ -583,6 +583,16 @@ def test_gate_good(root):
           f"gate, all runs good: every pair prints its sweep line\n{out}")
 
 
+def test_gate_needs_a_comparison(root):
+    # R4-10: a gate that compares nothing (a record and no replay: 1 run, 0 pairs) proves nothing and must not pass
+    code, out, runs = gate(root, "v", "--script", SCRIPT, "--replays", "0")
+    check(code == 1, f"gate, 0 comparisons: exit {code}\n{out}")
+    check("gate FAILED" in out and "0 pairs" in out and "at least 1 comparison" in out, f"gate, 0 comparisons: message\n{out}")
+    check(result(runs, "v_rec") == REC_OK, f"gate, 0 comparisons: the record run itself was fine {result(runs, 'v_rec')!r}")
+    code, out, runs = gate(root, "w", "--script", SCRIPT, "--replays", "1")
+    check(code == 0 and "gate PASSED: 2 runs (0 failed), 1 pairs, 0 differ" in out, f"gate, exactly 1 comparison still passes: exit {code}\n{out}")
+
+
 def test_gate_record_fails(root):
     code, out, runs = gate(root, "r", "--script", SCRIPT, "--replays", "1", FAKE_GAME_FAIL="_rec")
     check(code == 1, f"gate, record run fails: exit {code}\n{out}")

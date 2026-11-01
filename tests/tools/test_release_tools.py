@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import zipfile
 
@@ -38,6 +39,7 @@ PORT = "0123456789abcdef0123456789abcdef01234567"
 SDK = "b643ea14b38f8475382840a5eb360b0d4090ae5e"
 TAG = "netplay-v1.0.7"
 ZIP = "DOA4-netplay-v1.0.7-win64.zip"
+NOTICES = "THIRD_PARTY_NOTICES.md"
 checks = 0
 failures = 0
 
@@ -117,7 +119,7 @@ def test_stage_exact_set(root):
     build = make_build(root)
     code, text, out = stage(root, build)
     check(code == 0, f"stage: exit {code}\n{text}")
-    want = sorted(GAME_FILES + ["SHA256SUMS.txt", ZIP, "DOA4-launcher.zip"])
+    want = sorted(GAME_FILES + ["SHA256SUMS.txt", NOTICES, ZIP, "DOA4-launcher.zip"])
     check(staged_names(out) == want, f"stage: the staging set is exactly {want}: {staged_names(out)}")
     for name, data in contents().items():
         p = os.path.join(out, name)
@@ -133,12 +135,20 @@ def test_stage_exact_set(root):
     if os.path.isfile(zp):
         with zipfile.ZipFile(zp) as z:
             members = {i.filename: z.read(i) for i in z.infolist()}
-    want_members = sorted(GAME_FILES + ["SHA256SUMS.txt", "README-netplay.txt"])
+    want_members = sorted(GAME_FILES + ["SHA256SUMS.txt", NOTICES, "README-netplay.txt"])
     check(sorted(members) == want_members, f"stage: zip members exactly {want_members}: {sorted(members)}")
     for name in GAME_FILES + ["SHA256SUMS.txt"]:
         p = os.path.join(out, name)
         check(name in members and os.path.isfile(p) and members[name] == read(p), f"stage: zip member {name} equals the staged file")
+    # R4-2: the BSD notice duty: THIRD_PARTY_NOTICES.md (the repository's own file) is staged and is in the zip, byte for byte
+    notices = read(os.path.join(REPO, NOTICES))
+    check(len(notices) > 100, f"stage: the repository's {NOTICES} is a real file ({len(notices)} bytes)")
+    check(os.path.isfile(os.path.join(out, NOTICES)) and read(os.path.join(out, NOTICES)) == notices, f"stage: staged {NOTICES} is the repository's file")
+    check(members.get(NOTICES) == notices, f"stage: zip member {NOTICES} is the repository's file")
     readme = members.get("README-netplay.txt", b"").decode("utf-8", "replace")
+    # R4-1: the firewall advice (both players, Private AND Public, Alt+Tab, UPnP or forward UDP 7200) and the R1-2 line
+    for needle in ("first time you host or join", "both players", "Private", "Public", "Alt+Tab", "UPnP", "UDP 7200"):
+        check(needle in readme, f"stage: README-netplay.txt says {needle!r}\n{readme}")
     for needle in (TAG, PORT, SDK, "SHA256SUMS.txt", "no game data"):
         check(needle.lower() in readme.lower(), f"stage: README-netplay.txt names {needle!r}\n{readme}")
     lp = os.path.join(out, "DOA4-launcher.zip")
@@ -148,7 +158,7 @@ def test_stage_exact_set(root):
 def test_stage_without_launcher(root):
     build = make_build(root, decoys=False)
     code, text, out = stage(root, build, launcher=False)
-    want = sorted(GAME_FILES + ["SHA256SUMS.txt", ZIP])
+    want = sorted(GAME_FILES + ["SHA256SUMS.txt", NOTICES, ZIP])
     check(code == 0 and staged_names(out) == want, f"stage without --launcher-zip: exit {code}, {staged_names(out)}\n{text}")
 
 
@@ -285,6 +295,25 @@ def test_runner_older_shapes(root):
     check((line_for(text, "speakers") or "").startswith("speakers: FAILED"), f"older shape: speakers FAILED\n{text}")
     check((line_for(text, "toml_upsert") or "").startswith("toml_upsert: did not run"),
           f"older shape: a line that is not the runner's own is no summary\n{text}")
+
+
+def test_runner_timeout(root):
+    # R4-5: a runner that hangs is "did not run (timed out ...)", fails the run, and does not stop the others
+    d = os.path.join(root, "host")
+    write_bat(d, "hang", ["echo PASSED: 3 checks, 0 failures", "ping -n 60 127.0.0.1 >nul", "exit /b 0"])  # a summary line, then a sleep
+    write_bat(d, "zok", ["echo PASSED: 3 checks, 0 failures", "exit /b 0"])
+    t0 = time.time()
+    code, text = host_run("--dir", d, "--timeout", "3")
+    took = time.time() - t0
+    check(code == 1, f"run_host_tests timeout: exit {code}\n{text}")
+    check((line_for(text, "hang") or "").startswith("hang: did not run (timed out"), f"run_host_tests timeout: 'hang: did not run (timed out': {line_for(text, 'hang')!r}\n{text}")
+    check(line_for(text, "zok") == "zok: passed 3", f"run_host_tests timeout: the next runner still runs: {line_for(text, 'zok')!r}\n{text}")
+    check("1 passed, 0 failed, 1 did not run" in text, f"run_host_tests timeout: the count line\n{text}")
+    check(took < 40, f"run_host_tests timeout: the hung runner was stopped after the limit, not after its sleep ({took:.0f} s)")
+    # the default is 600 s, and a runner within its limit is judged as before
+    check(load("run_host_tests").DEFAULT_TIMEOUT == 600, "run_host_tests: the default per-runner timeout is 600 s")
+    code, text = host_run("--dir", d, "--only", "zok", "--timeout", "30")
+    check(code == 0 and line_for(text, "zok") == "zok: passed 3", f"run_host_tests, within the limit: exit {code}\n{text}")
 
 
 def test_table_matches_sources(root):

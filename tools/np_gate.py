@@ -132,9 +132,12 @@ def main():
                     print("   ", l.strip())
     for n in names:
         print(f"{n} final progress: {final_progress(a.runs, n)}")
-    ok = bad == 0 and not failed
+    npairs = len(names) * (len(names) - 1) // 2
+    if npairs < 1:  # a gate that compared nothing proves nothing: it must not pass
+        print("a gate needs at least 1 comparison (2 runs or more: record + --replays 1, or --rec + --replays 2)")
+    ok = bad == 0 and not failed and npairs >= 1
     print(f"gate {'PASSED' if ok else 'FAILED'}: {len(names)} runs ({len(failed)} failed), "
-          f"{len(names) * (len(names) - 1) // 2} pairs, {bad} differ")
+          f"{npairs} pairs, {bad} differ")
     sys.exit(0 if ok else 1)
 
 
