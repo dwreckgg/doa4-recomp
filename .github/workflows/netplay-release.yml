@@ -1,0 +1,112 @@
+name: Netplay release
+# Builds the netplay branch and publishes a pre-release netplay-v<major>.<minor>.<run> that both online players
+# download: the online handshake compares the compiled code, so players need the same exe. Only code changes
+# publish (paths). A tag netplay-publish-<n> publishes the same code again (a new run number).
+on:
+  push:
+    branches: [netplay]
+    paths: ['src/**', 'generated/**', 'third_party/**', 'tests/host/**', 'tools/release_stage.py',
+            'tools/run_host_tests.py', 'CMakeLists.txt', 'CMakePresets.json', 'hints.toml',
+            'dead_or_alive_4_manifest.toml', 'netplay_sdk.txt', 'launcher/**', '.github/workflows/netplay-release.yml']
+    tags: ['netplay-publish-*']
+permissions:
+  contents: write
+concurrency:
+  group: netplay-release
+  cancel-in-progress: false
+jobs:
+  release:
+    # forks of this fork publish nothing unless they opt in (repository variable PUBLISH_RELEASES = true)
+    if: github.repository == 'Dwreckgg/doa4-recomp' || vars.PUBLISH_RELEASES == 'true'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: doa4-recomp, persist-credentials: false }   # the build never sees the write token
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content -Raw doa4-recomp/CMakeLists.txt
+          $m = [regex]::Match($text, 'set\(DOA4_NETPLAY_VERSION "([0-9]+\.[0-9]+)"')
+          if (-not $m.Success) { throw 'DOA4_NETPLAY_VERSION not found in CMakeLists.txt' }
+          $tag = "netplay-v$($m.Groups[1].Value).$env:GITHUB_RUN_NUMBER"
+          "tag=$tag" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "tag $tag"
+      - name: SDK at the pinned commit
+        shell: pwsh
+        run: |
+          $pin = Get-Content doa4-recomp/netplay_sdk.txt | ConvertFrom-StringData
+          git clone --filter=blob:none $pin.repo rexglue-sdk
+          git -C rexglue-sdk checkout $pin.commit
+          if ($LASTEXITCODE -ne 0) { throw "SDK commit $($pin.commit) not found" }
+          git -C rexglue-sdk submodule update --init --recursive
+          python doa4-recomp/tools/fix_git_symlinks.py rexglue-sdk
+      - name: LLVM 23.1.4
+        shell: pwsh
+        run: |
+          # LLVM publishes Windows builds as an .msi and a .tar.xz (no .exe installer); the archive is unpacked into
+          # C:\LLVM so it cannot clash with the image's own LLVM in Program Files.
+          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.xz'
+          $want = '854BFFCFC84528E0EE92490FF5C178920ABD358A79C3E98F053E41E3E8E4C6D2'
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest $url -OutFile llvm.tar.xz
+          $got = (Get-FileHash llvm.tar.xz -Algorithm SHA256).Hash
+          if ($got -ne $want) { throw "LLVM archive SHA-256 $got, expected $want" }
+          New-Item -ItemType Directory -Force C:\LLVM | Out-Null
+          $t = Measure-Command { tar -xf llvm.tar.xz -C C:\LLVM --strip-components 1 }
+          if ($LASTEXITCODE -ne 0) { throw "tar failed ($LASTEXITCODE)" }
+          Write-Host "unpacked in $([int]$t.TotalSeconds) s"
+          Remove-Item llvm.tar.xz
+          & C:\LLVM\bin\clang.exe --version
+          & C:\LLVM\bin\clang-cl.exe --version
+          & C:\LLVM\bin\lld-link.exe --version
+      - name: Page file
+        shell: pwsh
+        run: ./doa4-recomp/.github/scripts/SetPageFileSize.ps1 -MinimumSize 16GB -MaximumSize 32GB -DiskRoot "D:"
+      - name: Configure, build, host tests
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VS=%%i"
+          set "DOA4_VSDEVCMD=%VS%\Common7\Tools\VsDevCmd.bat"
+          set "DOA4_LLVM_BIN=C:\LLVM\bin"
+          call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64
+          set "PATH=%DOA4_LLVM_BIN%;%PATH%"
+          cd doa4-recomp
+          cmake --preset win-amd64-release -DREXSDK_DIR=%GITHUB_WORKSPACE:\=/%/rexglue-sdk "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3" -DDOA4_RELEASE_TAG=${{ steps.version.outputs.tag }} -DDOA4_RELEASE_REPO=${{ github.repository }} -DDOA4_RELEASE_CHANNEL=netplay
+          if errorlevel 1 exit /b 1
+          cmake --build --preset win-amd64-release -- -j 2
+          if errorlevel 1 exit /b 1
+          set "REXSDK_DIR=%GITHUB_WORKSPACE%\rexglue-sdk"
+          set "DOA4_CI=1"
+          python -I tools/run_host_tests.py
+          if errorlevel 1 exit /b 1
+      - name: Launcher zip
+        shell: pwsh
+        run: ./doa4-recomp/launcher/make_zip.ps1 -Destination launcher_pkg -ZipPath DOA4-launcher.zip
+      - name: Stage
+        shell: pwsh
+        run: |
+          $pin = Get-Content doa4-recomp/netplay_sdk.txt | ConvertFrom-StringData
+          python -I doa4-recomp/tools/release_stage.py --build doa4-recomp/out/build/win-amd64-release --out staging `
+            --tag ${{ steps.version.outputs.tag }} --port-commit $env:GITHUB_SHA --sdk-commit $pin.commit `
+            --launcher-zip DOA4-launcher.zip
+          if ($LASTEXITCODE -ne 0) { throw 'staging refused' }
+          Get-ChildItem staging | ForEach-Object { "$($_.Name)  $($_.Length) bytes" }
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $pin = Get-Content doa4-recomp/netplay_sdk.txt | ConvertFrom-StringData
+          $notes = @"
+          DOA4 netplay build from commit $env:GITHUB_SHA (SDK $($pin.repo) $($pin.commit), LLVM 23.1.4).
+
+          Both players need this same release. Download the zip (or use the DOA4 launcher, or Check for Updates in the game's Online tab). No game data is included: you need your own Dead or Alive 4 (USA, Europe) (Rev 1) files.
+          Needs Windows 10/11 64-bit, a CPU with AVX2 and at least two cores, and the Microsoft Visual C++ 2015-2022 x64 runtime.
+          The first time you host, Windows may ask whether to allow the game through the firewall: allow it.
+          "@
+          Set-Content notes.md $notes -Encoding utf8
+          gh release create ${{ steps.version.outputs.tag }} (Get-ChildItem staging).FullName --repo $env:GITHUB_REPOSITORY `
+            --prerelease --target $env:GITHUB_SHA --title "DOA4 netplay ${{ steps.version.outputs.tag }}" --notes-file notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
