@@ -1648,8 +1648,39 @@ function Invoke-DOA4Update {
 # ------------------------------------------------------------------------------------------
 
 $script:SumsName = 'SHA256SUMS.txt'
-# What the game itself keeps beside its exe; carried from the old release\ into the new one.
-$script:CarriedNames = @('dead_or_alive_4.toml', 'logs')
+# Left behind by the in-game updater's swap (the files it replaced); never carried over.
+$script:OldPattern = '*.old'
+
+# What an update carries from the old release\ into the new one: every entry that is not a
+# release file (the ReleaseAssets, SHA256SUMS.txt) and not *.old - the game's toml and logs\,
+# imgui.ini, anything the player added. Returns @{ Carry; Drop } (entry names).
+function Get-DOA4CarryOver {
+    param([Parameter(Mandatory = $true)][string]$Dir, [Parameter(Mandatory = $true)][string[]]$ReleaseFiles)
+    $carry = New-Object System.Collections.Generic.List[string]
+    $drop = New-Object System.Collections.Generic.List[string]
+    foreach ($e in @(Get-ChildItem -LiteralPath $Dir -Force)) {
+        if ($ReleaseFiles -contains $e.Name) { continue }
+        if ($e.Name -like $script:OldPattern) { $drop.Add($e.Name) } else { $carry.Add($e.Name) }
+    }
+    [pscustomobject]@{ Carry = $carry.ToArray(); Drop = $drop.ToArray() }
+}
+
+# Why release\ does not hold an intact copy of its release, or $null: every ReleaseAsset must
+# be there with the SHA-256 the SHA256SUMS.txt kept beside it names (exactly one line each).
+function Get-DOA4ReleaseDamage {
+    param([Parameter(Mandatory = $true)][string]$Dir, [Parameter(Mandatory = $true)][string[]]$Assets)
+    $sumsPath = Join-Path $Dir $script:SumsName
+    if (-not (Test-Path -LiteralPath $sumsPath -PathType Leaf)) { return "the release folder has no $($script:SumsName) to check against" }
+    $sums = Read-DOA4Sums $sumsPath
+    foreach ($n in $Assets) {
+        $p = Join-Path $Dir $n
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return "$n is missing" }
+        if (-not $sums.Count.ContainsKey($n) -or $sums.Count[$n] -ne 1) { return "$n has no single line in $($script:SumsName)" }
+        $got = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -cne $sums.Hex[$n]) { return "$n does not match $($script:SumsName) (a damaged file)" }
+    }
+    return $null
+}
 
 # config.ps1's release keys; throws a readable message when one is missing.
 function Get-DOA4ReleaseConfig {
@@ -1795,10 +1826,12 @@ function Get-DOA4RunningRelease {
 # Install and Update in release mode. Refuses while the game runs from release\. Puts back what
 # an earlier run that was cut off left (release_old\ without release\ is the last good release;
 # release_new\ is an unchecked download). Asks GitHub for the release (Get-DOA4Release); when
-# settings.json's lastRelease is that tag and release\ has its files: "nothing new". Else
-# downloads every file and SHA256SUMS.txt into release_new\, checks each file's SHA-256 (a file
-# without exactly one line, or another hash: release_new\ is deleted, release\ untouched),
-# copies the game's toml and logs\ from release\, then renames release -> release_old and
+# settings.json's lastRelease is that tag and every file in release\ still matches the
+# SHA256SUMS.txt kept there: "nothing new" (else the same tag is reinstalled, the log says
+# why). Else downloads every file and SHA256SUMS.txt into release_new\, checks each file's
+# SHA-256 (a file without exactly one line, or another hash: release_new\ is deleted, release\
+# untouched), copies everything else in release\ but *.old (Get-DOA4CarryOver) into
+# release_new\, then renames release -> release_old and
 # release_new -> release (when the second rename fails, release_old goes back), deletes
 # release_old and records source and lastRelease in settings.json.
 # Returns @{ Tag; Changed; Message }; throws on failure, the step in the exception's
@@ -1837,11 +1870,15 @@ function Install-DOA4Release {
         $s = Get-DOA4Settings $Ctx.SettingsPath
         $installed = ''
         if ($s.lastRelease) { $installed = [string]$s.lastRelease.tag }
-        $missing = @($rc.Assets | Where-Object { -not (Test-Path -LiteralPath (Join-Path $rel $_) -PathType Leaf) })
-        if ($installed -ceq $pick.Tag -and $missing.Count -eq 0) {
-            $msg = "nothing new: $($pick.Tag) is installed"
-            Set-DOA4Step $Ctx $step 'done' $msg
-            return [pscustomobject]@{ Tag = $pick.Tag; Changed = $false; Message = $msg }
+        if ($installed -ceq $pick.Tag) {
+            # The same release: nothing new only while every installed file still matches.
+            $damage = Get-DOA4ReleaseDamage -Dir $rel -Assets $rc.Assets
+            if (-not $damage) {
+                $msg = "nothing new: $($pick.Tag) is installed"
+                Set-DOA4Step $Ctx $step 'done' $msg
+                return [pscustomobject]@{ Tag = $pick.Tag; Changed = $false; Message = $msg }
+            }
+            Write-DOA4Log $Ctx ("  reinstalling {0}: {1}" -f $pick.Tag, $damage)
         }
         $from = 'nothing installed'
         if ($installed) { $from = "installed: $installed" }
@@ -1877,12 +1914,12 @@ function Install-DOA4Release {
             $step = 'Swap'
             Set-DOA4Step $Ctx $step 'running'
             if (Test-Path -LiteralPath $rel) {
-                foreach ($n in $script:CarriedNames) {
-                    $p = Join-Path $rel $n
-                    if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $n) -Recurse -Force }
+                $co = Get-DOA4CarryOver -Dir $rel -ReleaseFiles $required
+                foreach ($n in $co.Carry) {
+                    Copy-Item -LiteralPath (Join-Path $rel $n) -Destination (Join-Path $new $n) -Recurse -Force
                 }
-                $dropped = @(Get-ChildItem -LiteralPath $rel -Force | Where-Object { $script:CarriedNames -notcontains $_.Name -and $required -notcontains $_.Name } | ForEach-Object { $_.Name })
-                if ($dropped.Count -gt 0) { Write-DOA4Log $Ctx ('  not carried over from the old release folder: ' + ($dropped -join ', ')) }
+                if ($co.Carry.Count -gt 0) { Write-DOA4Log $Ctx ('  carried over from the old release folder: ' + ($co.Carry -join ', ')) }
+                if ($co.Drop.Count -gt 0) { Write-DOA4Log $Ctx ('  not carried over (the in-game updater''s old files): ' + ($co.Drop -join ', ')) }
             }
         } catch {
             Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue

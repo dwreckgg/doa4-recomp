@@ -221,8 +221,14 @@ Describe 'Update over an installed release' {
     Write-TFile (Join-Path $r.Release 'logs\doa4 session.log') "old session`r`n"
     Write-TFile (Join-Path $r.Release 'logs\np\peer.txt') "peer`n"
     Write-TFile (Join-Path $r.Release 'imgui.ini') "[Window][x]`n"
+    # A file and a folder the player added, and the in-game updater's leftovers (*.old).
+    Write-TFile (Join-Path $r.Release 'my notes.txt') "combo list`r`n"
+    Write-TFile (Join-Path $r.Release 'mods\readme.txt') "mine`n"
+    Write-TFile (Join-Path $r.Release 'dead_or_alive_4.exe.old') 'the exe before an in-game update'
+    Write-TFile (Join-Path $r.Release 'rexruntime.dll.old') 'the dll before an in-game update'
     $tomlHash = Get-TBytesHash $toml
     $logsBefore = Get-TTree (Join-Path $r.Release 'logs')
+    $keptBefore = @('imgui.ini', 'my notes.txt', 'mods\readme.txt') | ForEach-Object { $_ + '|' + (Get-TBytesHash (Join-Path $r.Release $_)) }
     $u = New-TRelCtx $r
     $res = Invoke-DOA4Update -Ctx $u.Ctx
 
@@ -242,8 +248,18 @@ Describe 'Update over an installed release' {
         Get-TTree (Join-Path $r.Release 'logs') | Should BeExactly $logsBefore
         $logsBefore | Should Match 'peer\.txt'
     }
-    It 'names in the log what it does not carry over (imgui.ini)' {
-        [IO.File]::ReadAllText($res.LogPath) | Should Match 'imgui\.ini'
+    It 'keeps imgui.ini and what the player added (a file, a folder) byte for byte' {
+        $after = @('imgui.ini', 'my notes.txt', 'mods\readme.txt') | ForEach-Object {
+            if (Test-Path -LiteralPath (Join-Path $r.Release $_)) { $_ + '|' + (Get-TBytesHash (Join-Path $r.Release $_)) } else { $_ + '|<absent>' }
+        }
+        ($after -join ';') | Should BeExactly ($keptBefore -join ';')
+    }
+    It 'does not carry the in-game updater''s *.old files, and the log names them' {
+        Test-Path -LiteralPath (Join-Path $r.Release 'dead_or_alive_4.exe.old') | Should Be $false
+        Test-Path -LiteralPath (Join-Path $r.Release 'rexruntime.dll.old') | Should Be $false
+        $log = [IO.File]::ReadAllText($res.LogPath)
+        $log | Should Match 'dead_or_alive_4\.exe\.old'
+        $log | Should Match 'rexruntime\.dll\.old'
     }
     It 'leaves no release_new or release_old' {
         Test-Path -LiteralPath (Join-Path $r.Root 'release_new') | Should Be $false
@@ -266,6 +282,27 @@ Describe 'Update over an installed release' {
         $again.Message | Should BeExactly 'Updated to netplay-v1.0.7.'
         Get-TFileHex (Join-Path $r.Release 'TracyClient.dll') | Should BeExactly (Get-TSha256Hex (Get-TAssetBytes 'netplay-v1.0.7' 'TracyClient.dll'))
         Get-TBytesHash $toml | Should BeExactly $tomlHash
+        [IO.File]::ReadAllText($again.LogPath) | Should Match 'TracyClient\.dll is missing'
+    }
+    It 'the same tag with a damaged rexruntime.dll is reinstalled, and the log says why' {
+        $dll = Join-Path $r.Release 'rexruntime.dll'
+        [IO.File]::WriteAllBytes($dll, [Text.Encoding]::ASCII.GetBytes('damaged on disk'))
+        $n = $r.Http.State.Calls.Count
+        $again = Invoke-DOA4Update -Ctx (New-TRelCtx $r).Ctx
+        $again.Ok | Should Be $true
+        $again.Message | Should BeExactly 'Updated to netplay-v1.0.7.'
+        Get-TFileHex $dll | Should BeExactly (Get-TSha256Hex (Get-TAssetBytes 'netplay-v1.0.7' 'rexruntime.dll'))
+        $r.Http.State.Calls.Count - $n | Should Be 5
+        [IO.File]::ReadAllText($again.LogPath) | Should Match 'rexruntime\.dll does not match SHA256SUMS\.txt'
+        Get-TBytesHash $toml | Should BeExactly $tomlHash
+        Test-Path -LiteralPath (Join-Path $r.Release 'my notes.txt') | Should Be $true
+    }
+    It 'the same tag without the SHA256SUMS.txt kept in release\ is reinstalled (nothing to check against)' {
+        Remove-Item -LiteralPath (Join-Path $r.Release 'SHA256SUMS.txt')
+        $again = Invoke-DOA4Update -Ctx (New-TRelCtx $r).Ctx
+        $again.Message | Should BeExactly 'Updated to netplay-v1.0.7.'
+        Test-Path -LiteralPath (Join-Path $r.Release 'SHA256SUMS.txt') | Should Be $true
+        [IO.File]::ReadAllText($again.LogPath) | Should Match 'has no SHA256SUMS\.txt to check against'
     }
     It 'Update with nothing installed says to run Install, and asks GitHub nothing' {
         $e = New-TRel 'upd-empty'
