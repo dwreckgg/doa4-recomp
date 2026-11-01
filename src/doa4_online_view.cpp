@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "doa4_updater.h"  // kOnlineText only (the view links no updater code)
 #include "net/np_rules.h"
 
 namespace doa4::online_view {
@@ -110,6 +111,11 @@ View Describe(const In& in) {
   }
 
   v.delay_enabled = !SessionLocks(in);  // locked while starting and in a session (one notion, fix round M2)
+
+  // Check for Updates (plan 1b Task 4): only offline. The swap renames this exe, and a restart into a session relaunches
+  // that path (DOA2U's reason, doa2u_ui.cpp 435-437); `open` is true in every lobby state but Offline and in a session.
+  v.update_enabled = !open;
+  if (!v.update_enabled) v.update_note = updater::kOnlineText;
 
   // the code: shown while hosting or connected as the host, when the lobby has one
   if (!session && (state == State::kHosting || (state == State::kConnected && st.is_host)) && !st.my_code.empty()) {

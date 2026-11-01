@@ -33,6 +33,7 @@
 #include <thread>
 #include <utility>
 
+#include "../doa4_updater.h"  // Start, Refuse, Message (the np_ctl.on "update" request; the host test stands in for them)
 #include "np_upnp.h"
 
 namespace doa4::np::online {
@@ -496,6 +497,7 @@ void Lobby::Impl::WriteStatus(uint32_t now) {
                            "\npeer_port=" + std::to_string(s.peer_port) + "\nping=" + ping + "\ndelay=" + std::to_string(s.delay) +
                            "\ncan_start=" + (s.can_start ? "1" : "0") + "\nevent=" + Sanitize(s.event, 1000) +
                            "\ncode=" + Sanitize(s.my_code, 64) + "\nnat=" + NatKey(s.nat) +  // Task 15 close-out (b)
+                           "\nupdate=" + Sanitize(updater::Message(), 1000) +  // plan 1b Task 4 ("" before any check)
                            "\nrefusal=" + s.refusal + "\n";
   status_dirty = false;
   status_last = now;
@@ -558,6 +560,19 @@ void Lobby::Impl::ApplyRequests(const std::string& text, uint32_t now) {
       c.flag = false;
       c.n = int(v);
     } else if (verb == "status" && arg.empty()) {
+      WriteStatus(now);
+      continue;
+    } else if (verb == "update" && arg.empty()) {
+      // Plan 1b Task 4: the Online tab's Check for Updates, under the same rule as its button (online_view: only when
+      // the lobby is Offline and this is no session process). updater::Start logs nothing on this thread (M-1).
+      if (session || state != State::kOffline) {
+        updater::Refuse(updater::kOnlineText);
+        Log(std::string("[doa4][NET] update refused: ") + (session ? "a session process" : StateName(state)));
+      } else if (updater::Start(p.log)) {
+        Log("[doa4][NET] update: Check for Updates started (np_ctl.on)");
+      } else {
+        Log("[doa4][NET] update: a check is already running");
+      }
       WriteStatus(now);
       continue;
     } else {

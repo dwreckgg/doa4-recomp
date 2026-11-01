@@ -385,6 +385,39 @@ static void TestTabLogLine() {
   CHECK_EQ(TabLogLine(e, Describe(e)), "[doa4][NET] tab: in_session start=0 leave=1");
 }
 
+// Plan 1b Task 4: Check for Updates is enabled only when the lobby is Offline (or was never opened) and no session runs
+// (spec 3.1 "disabled while online"); the note beside the disabled button is the updater's kOnlineText.
+static void TestUpdateButton() {
+  const View none = Describe(In{});  // no lobby yet
+  CHECK(none.update_enabled);
+  CHECK_EQ(none.update_note, "");
+  const View off = Describe(Open(State::kOffline, false));  // a lobby that is Offline again (after Disconnect)
+  CHECK(off.update_enabled);
+  CHECK_EQ(off.update_note, "");
+  int disabled = 0;
+  for (State s : {State::kHosting, State::kConnecting, State::kConnected, State::kStarting, State::kRestarting,
+                  State::kInSession}) {
+    for (bool host : {false, true}) {
+      const View v = Describe(Open(s, host));
+      CHECK(!v.update_enabled);
+      CHECK_EQ(v.update_note, "Disconnect from online play first.");
+      disabled += v.update_enabled ? 0 : 1;
+    }
+  }
+  CHECK(disabled == 12);
+  // a session process: disabled whatever its lobby says (no lobby, an Offline one, one still connecting)
+  In a;
+  a.in_session = true;
+  CHECK(!Describe(a).update_enabled);
+  In b = Open(State::kOffline, false);
+  b.in_session = true;
+  CHECK(!Describe(b).update_enabled);
+  CHECK_EQ(Describe(b).update_note, "Disconnect from online play first.");
+  In c = Open(State::kConnecting, true);
+  c.in_session = true;
+  CHECK(!Describe(c).update_enabled);
+}
+
 int main() {
   TestOffline();
   TestHosting();
@@ -402,6 +435,7 @@ int main() {
   TestSessionNote();
   TestBanner();
   TestTabLogLine();
+  TestUpdateButton();
   std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

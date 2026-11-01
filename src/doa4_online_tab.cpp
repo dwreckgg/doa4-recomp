@@ -7,7 +7,9 @@
 #include <cstdio>
 
 #include <rex/cvar.h>
+#include <rex/logging.h>
 
+#include "doa4_updater.h"
 #include "net/np_rules.h"
 
 namespace doa4 {
@@ -142,6 +144,18 @@ void OnlineTab::Draw(const OnlineHost& host, const online_view::In& in, const on
 
   ImGui::SeparatorText("About");
   ImGui::TextWrapped("%s", view.version_line.c_str());
+  // Check for Updates (plan 1b Task 4; DOA2U DrawUpdateButton, doa2u_ui.cpp 433-454): disabled while online (the view
+  // decides) and while a check runs; the check runs on its own thread and its message shows below.
+  ImGui::BeginDisabled(!view.update_enabled || updater::Busy());
+  if (ImGui::Button("Check for Updates")) {
+    updater::Start([](const std::string& line) { REXLOG_INFO("{}", line); });
+  }
+  ImGui::EndDisabled();
+  if (!view.update_note.empty()) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", view.update_note.c_str());
+  }
+  if (const std::string msg = updater::Message(); !msg.empty()) ImGui::TextWrapped("%s", msg.c_str());
   if (open_logs && ImGui::Button("Open session logs")) open_logs();
 }
 

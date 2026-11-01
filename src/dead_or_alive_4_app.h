@@ -59,6 +59,7 @@
 #include "doa4_setup_dialog.h"
 #include "doa4_tweaks.h"
 #include "doa4_unlocks.h"
+#include "doa4_updater.h"
 #include "doa4_utf8.h"
 #include "net/np_files.h"
 #include "net/np_handoff.h"
@@ -377,6 +378,9 @@ class DeadOrAlive4App : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
     doa4_wait_for_previous_instance();  // after "Restart now" in the menu
+    // Plan 1b Task 4: the game files Check for Updates renamed away (<name>.old) are no longer in use once the instance
+    // that ran from them has exited; one still in use (another instance) stays for the next start.
+    doa4::updater::DeleteOldFiles(doa4::updater::ExeDir());
   }
   // void OnLoadXexImage(std::string& xex_image) override {}
   void OnPostSetup() override {

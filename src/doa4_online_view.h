@@ -36,6 +36,10 @@ struct View {
   std::string diagnostics_line;                        // "Dropped packets: N" (spec 7); empty when Offline
   std::string display_note;                            // "The host's display settings are used during the session" or empty
   std::string session_note;                            // "Settings changed during a session are restored when it ends." in a session
+  // Check for Updates (plan 1b Task 4; spec 3.1 "disabled while online"): enabled only when the lobby is Offline (or
+  // was never opened) and no session runs; update_note is updater::kOnlineText when it is disabled, else "".
+  bool update_enabled = false;
+  std::string update_note;
 };
 
 View Describe(const In& in);

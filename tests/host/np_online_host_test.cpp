@@ -38,6 +38,7 @@
 #include "../../src/net/np_transport.h"
 #include "../../src/net/np_upnp.h"
 #include "../../src/net/np_wire.h"
+#include "../../src/doa4_updater.h"
 
 using namespace doa4::np;
 namespace fs = std::filesystem;
@@ -116,6 +117,33 @@ Result Get() {
 void Unmap() { ++g_upnp_unmap; }
 void Shutdown(uint32_t) { ++g_upnp_shutdown; }
 }  // namespace doa4::np::upnp
+
+// ---- doa4_updater is not linked (plan 1b Task 4): these stand-ins count the calls the lobby's "update" request makes
+// and hold the message status.txt shows; nothing reaches the network ----
+static std::atomic<int> g_upd_starts{0}, g_upd_refusals{0}, g_upd_start_log{0};
+static std::mutex g_upd_mu;
+static std::string g_upd_msg;
+static void SetUpdMsg(const std::string& m) {
+  std::lock_guard<std::mutex> lock(g_upd_mu);
+  g_upd_msg = m;
+}
+namespace doa4::updater {
+bool Start(std::function<void(const std::string&)> log) {
+  ++g_upd_starts;
+  if (log) ++g_upd_start_log;
+  SetUpdMsg("Checking for updates...");
+  return true;
+}
+void Refuse(std::string_view why) {
+  ++g_upd_refusals;
+  SetUpdMsg(std::string(why));
+}
+bool Busy() { return false; }
+std::string Message() {
+  std::lock_guard<std::mutex> lock(g_upd_mu);
+  return g_upd_msg;
+}
+}  // namespace doa4::updater
 
 // ---- per-run folder ----
 static fs::path g_root;
@@ -1293,8 +1321,10 @@ static void TestSessionSpoof() {
 // =====================================================================================================
 
 static std::map<std::string, std::string> ParseStatus(const std::string& text, bool* ok) {
-  // Task 15 close-out (b): code= and nat= before refusal= (refusal stays the last line)
-  static const char* const kKeys[] = {"state", "port", "peer_port", "ping", "delay", "can_start", "event", "code", "nat", "refusal"};
+  // Task 15 close-out (b): code= and nat= before refusal= (refusal stays the last line); plan 1b Task 4: update= too
+  static const char* const kKeys[] = {"state", "port", "peer_port", "ping", "delay", "can_start", "event", "code", "nat",
+                                      "update", "refusal"};
+  constexpr size_t kCount = sizeof kKeys / sizeof kKeys[0];
   std::map<std::string, std::string> m;
   *ok = !text.empty() && text.back() == '\n';
   std::istringstream in(text);
@@ -1302,15 +1332,21 @@ static std::map<std::string, std::string> ParseStatus(const std::string& text, b
   size_t i = 0;
   while (std::getline(in, line)) {
     const size_t eq = line.find('=');
-    if (i >= 10 || eq == std::string::npos || line.substr(0, eq) != kKeys[i]) {
+    if (i >= kCount || eq == std::string::npos || line.substr(0, eq) != kKeys[i]) {
       *ok = false;
       break;
     }
     m[line.substr(0, eq)] = line.substr(eq + 1);
     ++i;
   }
-  *ok = *ok && i == 10;
+  *ok = *ok && i == kCount;
   return m;
+}
+static std::string StatusKey(const fs::path& st, const char* key) {  // "" when status.txt does not parse
+  bool p = false;
+  const auto m = ParseStatus(ReadText(st), &p);
+  const auto it = m.find(key);
+  return p && it != m.end() ? it->second : std::string();
 }
 static void WriteCtl(const fs::path& dir, const std::string& text) {
   const fs::path tmp = dir / "np_ctl.tmp", on = dir / "np_ctl.on";
@@ -1786,6 +1822,71 @@ static void TestSessionRefused() {
   CHECK(WaitFor([&] { return q.status().session_refused; }, 1000));
 }
 
+// Plan 1b Task 4: the "update" request is the Online tab's Check for Updates: started only when the lobby is Offline and
+// this is not a session process, refused (updater::Refuse(kOnlineText)) otherwise; status.txt's update= is the
+// updater's message, read again at every rewrite (it moves on by itself while a check runs).
+static void TestUpdateRequest() {
+  if (!Group("request files: update starts Check for Updates only offline; status.txt update= follows the updater")) return;
+  SetUpdMsg("");
+  const int s0 = g_upd_starts, r0 = g_upd_refusals, l0 = g_upd_start_log;
+  Side s("upd");
+  s.test_dir = s.dir / "ctl";
+  fs::create_directories(s.test_dir);
+  online::Lobby lobby;
+  if (!StartLobby(lobby, s)) return;
+  const fs::path st = s.test_dir / "status.txt";
+  CHECKF(WaitFor([&] { return StatusKey(st, "state") == "offline"; }, 1500), "status.txt: '%s'", ReadText(st).c_str());
+  CHECKF(StatusKey(st, "update").empty(), "update= before any request: '%s'", StatusKey(st, "update").c_str());
+  // a lobby that never hosted is Offline: the check starts, once, with the lobby's log
+  WriteCtl(s.test_dir, "update\n");
+  CHECKF(WaitFor([&] { return g_upd_starts == s0 + 1; }, 1000), "%d starts", g_upd_starts - s0);
+  CHECK(g_upd_refusals == r0 && g_upd_start_log == l0 + 1);
+  CHECKF(WaitFor([&] { return StatusKey(st, "update") == "Checking for updates..."; }, 1500), "update= '%s'",
+         StatusKey(st, "update").c_str());
+  CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] update: Check for Updates started") == 1; }, 1000));
+  // the updater's message moves on without a request: status.txt follows within its 1 s rewrite
+  SetUpdMsg("Updated to netplay-v9.9.9. Restart the game to use it.");
+  CHECKF(WaitFor([&] { return StatusKey(st, "update") == "Updated to netplay-v9.9.9. Restart the game to use it."; }, 2500),
+         "update= '%s'", StatusKey(st, "update").c_str());
+  // hosting: refused, nothing starts, the lobby stays as it was
+  WriteCtl(s.test_dir, "host 0\n");
+  CHECK(WaitState(lobby, State::kHosting, 1000));
+  WriteCtl(s.test_dir, "update\n");
+  CHECKF(WaitFor([&] { return g_upd_refusals == r0 + 1; }, 1000), "%d refusals", g_upd_refusals - r0);
+  CHECK(g_upd_starts == s0 + 1);
+  CHECKF(WaitFor([&] { return StatusKey(st, "update") == "Disconnect from online play first."; }, 1500), "update= '%s'",
+         StatusKey(st, "update").c_str());
+  CHECK(WaitFor([&] { return s.log.Count("[doa4][NET] update refused") == 1; }, 1000));
+  CHECK(lobby.status().state == State::kHosting);
+  // Offline again after Disconnect: it starts again
+  WriteCtl(s.test_dir, "disconnect\n");
+  CHECK(WaitState(lobby, State::kOffline, 1000));
+  WriteCtl(s.test_dir, "update\n");
+  CHECKF(WaitFor([&] { return g_upd_starts == s0 + 2; }, 1000), "%d starts", g_upd_starts - s0);
+  // "update" takes no argument: an unknown request, nothing starts
+  WriteCtl(s.test_dir, "update now\n");
+  CHECK(WaitFor([&] { return s.log.Count("unknown request 'update now'") == 1; }, 1000));
+  CHECK(g_upd_starts == s0 + 2 && g_upd_refusals == r0 + 1);
+  // a session process: refused even once its lobby is Offline (the host answered the session Hello as a lobby, I-1a)
+  Side hs("upd_host"), ss("upd_sess");
+  ss.test_dir = ss.dir / "ctl";
+  fs::create_directories(ss.test_dir);
+  online::Lobby host;
+  if (!StartLobby(host, hs)) return;
+  host.Host(0);
+  CHECK(WaitState(host, State::kHosting, 1000));
+  online::Lobby sess;
+  std::string e;
+  CHECKF(sess.StartInSession(ss.P(), LoopCfg(), SessionHandoff(host.status().port, 0x5E55BEEFu), nullptr, &e),
+         "StartInSession: %s", e.c_str());
+  CHECK(WaitFor([&] { return sess.status().session_refused; }, 1000));
+  CHECK(sess.status().state == State::kOffline);
+  WriteCtl(ss.test_dir, "update\n");
+  CHECKF(WaitFor([&] { return g_upd_refusals == r0 + 2; }, 1000), "%d refusals", g_upd_refusals - r0);
+  CHECK(g_upd_starts == s0 + 2);
+  CHECK(WaitFor([&] { return ss.log.Count("[doa4][NET] update refused") == 1; }, 1000));
+}
+
 // I-3: refusals of strangers cannot flood the event line, game.log or events.txt: one per refusal kind per 10 s.
 static void TestStrangerEvents() {
   if (!Group("fix I-3: a flood of refused Hellos and foreign datagrams gives at most one event per kind")) return;
@@ -2047,6 +2148,7 @@ int main(int argc, char** argv) {
   TestLateBootReply();
   TestLateYesBySessionHello();
   TestSessionRefused();
+  TestUpdateRequest();
   TestStrangerEvents();
   TestJoinerCancel();
   TestUpnpCalls();
