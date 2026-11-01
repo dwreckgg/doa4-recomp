@@ -170,7 +170,7 @@ Describe 'CMake include fix' {
     }
 }
 
-Describe 'Repair-DOA4SymlinkStubs (real git, core.symlinks false)' {
+Describe 'Repair-DOA4SymlinkStubs (real git, core.symlinks false)' -Tag 'SymlinkStubs' {
     $o = New-TOrigins -Base (Join-Path $TestDrive 'st')
     $sdk = Join-Path $TestDrive ('st\' + $script:Odd + '\rexglue-sdk')
     Invoke-TGit $TestDrive @('clone', '-q', '-c', 'core.symlinks=false', $o.Sdk, $sdk) | Out-Null
@@ -216,7 +216,7 @@ Describe 'Repair-DOA4SymlinkStubs (real git, core.symlinks false)' {
     }
 }
 
-Describe 'Get-DOA4StubChanges (what an update may undo)' {
+Describe 'Get-DOA4StubChanges (what an update may undo)' -Tag 'SymlinkStubs' {
     $o = New-TOrigins -Base (Join-Path $TestDrive 'sc')
     $sdk = Join-Path $TestDrive 'sc\with space\rexglue-sdk'
     Invoke-TGit $TestDrive @('clone', '-q', $o.Sdk, $sdk) | Out-Null

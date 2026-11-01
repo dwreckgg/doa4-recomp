@@ -80,7 +80,7 @@ Describe 'New-DOA4Shortcut (judged by the shell that opens it)' {
     }
 }
 
-Describe 'Update with nothing new' {
+Describe 'Update with nothing new' -Tag 'SymlinkStubs' {
     $t = New-TInstalled -Base (Join-Path $TestDrive 'u1')
     $game = Join-Path $t.Root 'doa4-recomp'
     $sdk = Join-Path $t.Root 'rexglue-sdk'
@@ -113,7 +113,7 @@ Describe 'Update with nothing new' {
     }
 }
 
-Describe 'Update with a new upstream commit' {
+Describe 'Update with a new upstream commit' -Tag 'SymlinkStubs' {
     $t = New-TInstalled -Base (Join-Path $TestDrive 'u2')
     $game = Join-Path $t.Root 'doa4-recomp'
     Write-TFile (Join-Path $t.Origins.Game 'src\new.cpp') "// new`n"

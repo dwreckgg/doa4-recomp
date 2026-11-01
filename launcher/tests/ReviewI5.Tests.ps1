@@ -6,7 +6,7 @@
 $script:Src = Join-Path $PSScriptRoot '..'
 $script:PsExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
-Describe 'I5: a hand edit to a copied file symlink is a foreign change' {
+Describe 'I5: a hand edit to a copied file symlink is a foreign change' -Tag 'SymlinkStubs' {
     It 'P1: Update refuses and keeps the edit' {
         $t = New-TInstalled -Base (Join-Path $TestDrive 'p1')
         $copy = Join-Path $t.Root 'rexglue-sdk\thirdparty\lib\link\a.c'

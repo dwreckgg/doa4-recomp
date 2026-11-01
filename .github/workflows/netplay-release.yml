@@ -87,16 +87,14 @@ jobs:
       - name: Launcher tests (Pester)
         # Windows PowerShell 5.1 ships Pester 3.4, the version the launcher's tests are written for
         shell: powershell
-        # A player's Windows (no Developer Mode) checks symlinks out as small stub files, which the launcher repairs;
-        # the runner can create real symlinks, so every git call in these tests is told what a player's git does.
-        env:
-          GIT_CONFIG_COUNT: '1'
-          GIT_CONFIG_KEY_0: core.symlinks
-          GIT_CONFIG_VALUE_0: 'false'
         run: |
           # the runner image also has a newer Pester whose syntax the 3.4 tests do not use: load the inbox 3.4.0 explicitly
           Import-Module Pester -RequiredVersion 3.4.0 -Force
-          $r = Invoke-Pester -Path doa4-recomp/launcher/tests -PassThru
+          # Tag SymlinkStubs: the source-build path's symlink-stub tests. They need git to check symlinks out as stub files
+          # (a player's Windows without Developer Mode); the runner's git makes real symlinks even with core.symlinks=false.
+          # They run on a developer PC only; the release channel does not use that path.
+          Write-Host 'Skipped here (run locally): tests tagged SymlinkStubs'
+          $r = Invoke-Pester -Path doa4-recomp/launcher/tests -ExcludeTag SymlinkStubs -PassThru
           Write-Host "Pester: $($r.PassedCount) passed, $($r.FailedCount) failed, $($r.PendingCount) pending, $($r.SkippedCount) skipped"
           if ($r.FailedCount -gt 0 -or $r.PassedCount -lt 1) { throw 'launcher tests failed' }
       - name: Release tool tests
