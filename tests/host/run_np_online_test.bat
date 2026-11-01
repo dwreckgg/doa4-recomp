@@ -7,8 +7,10 @@ rem header's pure renewal schedule is tested).
 rem _MSVC_STL_HARDENING makes an out-of-range index fast-fail. Pass -v to print each group, -only <text> for some groups.
 rem NP_ONLINE_OUT (optional) names the output folder; the mutation probes use it so that they never share one.
 setlocal
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 if not defined NP_ONLINE_OUT set "NP_ONLINE_OUT=%TEMP%\doa4_np_online_test"
 set "OUT=%NP_ONLINE_OUT%"
 set "N=%~dp0..\..\src\net"

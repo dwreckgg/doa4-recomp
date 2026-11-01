@@ -3,8 +3,10 @@ rem Builds and runs the session restart host test with clang-cl (no CMake): np_r
 rem np_rules.cpp, np_wire.cpp and doa4_tweaks.cpp. Files only under %TEMP%\doa4_np_restart_<pid>\ (removed at the end).
 rem NP_RESTART_OUT (optional) names the output folder; the mutation probes use it so that they never share one.
 setlocal
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 if not defined NP_RESTART_OUT set "NP_RESTART_OUT=%TEMP%\doa4_np_restart_test"
 set "OUT=%NP_RESTART_OUT%"
 if not exist "%OUT%" mkdir "%OUT%"

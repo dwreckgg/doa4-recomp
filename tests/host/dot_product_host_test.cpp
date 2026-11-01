@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -47,6 +48,24 @@ int g_payload_differs = 0;  // set by TestFixtures: NaN results the hardware giv
       ++g_failures;                                                     \
       std::printf("FAIL line %d: %s\n", __LINE__, #cond);               \
     }                                                                   \
+  } while (0)
+
+// DOA4_CI (set, non-empty, by the release workflow): a CI runner's CPU may return the canonical NaN out of the raw
+// DPPS, which says nothing about the redirect. So the checks on the raw hardware payloads (TestFixtures'
+// payload_differs > 0, and TestRandom's noncanon > 0 in class "nan", once per MXCSR mode: 3 checks) are printed
+// there, not checked (phase 0 progress.md:177). The redirect checks stay CHECKs everywhere, and so does
+// nan_cases >= 40, which counts the pinned table's NaN cases and cannot depend on the CPU.
+const bool g_ci = [] {
+  const char* v = std::getenv("DOA4_CI");
+  return v != nullptr && *v != '\0';
+}();
+#define CPU_CHECK(cond)                                                                       \
+  do {                                                                                        \
+    if (g_ci)                                                                                 \
+      std::printf("INFO line %d (DOA4_CI: printed, not checked): %s is %s\n", __LINE__, #cond, \
+                  (cond) ? "true" : "false");                                                 \
+    else                                                                                      \
+      CHECK(cond);                                                                            \
   } while (0)
 
 constexpr uint32_t kCanonicalNaN = 0xFFC00000u;  // pinned: x86's "real indefinite" QNaN, per the ruling
@@ -202,7 +221,7 @@ void TestFixtures() {
   }
   g_payload_differs = payload_differs;
   CHECK(nan_cases >= 40);
-  CHECK(payload_differs > 0);  // else no fixture separates "redirect" from "no redirect" on this CPU
+  CPU_CHECK(payload_differs > 0);  // else no fixture separates "redirect" from "no redirect" on this CPU
   std::printf("fixtures: %d cases x 2 masks x 2 MXCSR modes; %d NaN results, %d of them with a non-canonical hardware payload\n",
               n, nan_cases, payload_differs);
 
@@ -365,7 +384,7 @@ void TestRandom() {
                   kClass[cls], mxcsr, (unsigned long long)nans, (unsigned long long)noncanon, (unsigned long long)bad);
       CHECK(bad == 0);
       if (cls <= 2) CHECK(nans == 0);       // non-vacuity: these classes make no NaN
-      if (cls == 4) CHECK(noncanon > 0);    // the class the friend's PC differed on does carry payloads here
+      if (cls == 4) CPU_CHECK(noncanon > 0);  // the class the friend's PC differed on does carry payloads here
       if (cls >= 3) CHECK(nans > 0);
     }
   }

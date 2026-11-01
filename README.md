@@ -46,6 +46,61 @@ desktop shortcut; afterwards it plays, updates and rebuilds. It is a small folde
 
 The rest of this README is the same process by hand.
 
+## Online play (netplay releases)
+
+Both players need the **same** netplay release: the online handshake compares the compiled code, so
+two different builds refuse each other. The releases are built by GitHub Actions from the `netplay`
+branch and published as pre-releases named `netplay-v<major>.<minor>.<run>` on
+[the Releases page](https://github.com/Dwreckgg/doa4-recomp/releases). A release holds the game's
+exe and its two DLLs, never game data: you still need your own Dead or Alive 4 (USA, Europe) (Rev 1)
+([step 5](#5-the-game-files)). It needs Windows 10/11 64-bit, a CPU with AVX2 and at least two cores,
+and the Microsoft Visual C++ 2015-2022 x64 runtime.
+
+**Getting the release** (any one of these):
+
+- **Zip:** download `DOA4-netplay-vX.Y.Z-win64.zip`, unzip it into a folder of its own and start
+  `dead_or_alive_4.exe`. On the first start it asks for your disc image or extracted folder.
+  `SHA256SUMS.txt` (in the zip and on the page) holds the SHA-256 of the three files.
+- **Launcher:** `DOA4-launcher.zip` (on the same page) installs and updates the newest release
+  instead of building from source.
+- **In the game:** **Check for Updates** in the Esc menu's **Online** tab downloads the newest
+  release's three files, checks each against its `SHA256SUMS.txt` and swaps them in; restart the
+  game afterwards. It is off while you are online.
+
+**Playing:**
+
+1. Press **Esc** and open the **Online** tab. One player presses **Host**; the tab shows **Your code**
+   (**Copy** puts it on the clipboard). Send it to the other player.
+2. The other player types it and presses **Join**. Both tabs then show the connection, the ping and
+   the input delay (**Auto**, or **Manual**; the host decides the delay for both players).
+3. The host presses **Start online session**. Both games restart into the session: P1 is the host,
+   P2 the joiner, and everything from the title screen on (menus, character select, stage select)
+   runs in lockstep on both PCs. The session plays on a separate copy of the save with everything
+   unlocked; neither player's own save is written. **F9** shows the ping and input delay over the game.
+4. **Leave online session** ends it; both games restart offline.
+
+The first time you host, Windows may ask whether to allow the game through the firewall: allow it.
+
+**What the messages mean:**
+
+| Message | Meaning |
+|---|---|
+| "You have an older release (...): press Check for Updates, then restart the game." / "The other player has an older release (...): they need to press Check for Updates." | Two different releases: refused at the handshake. The older side updates. |
+| "You run a self-built exe ..." / "The other player runs a self-built exe ..." | One game was built from source: both should use the latest release. |
+| "The game files differ (...): both players need the same game files." | The named file groups of the two games' data differ. |
+| "A direct connection is not possible between your networks; relay arrives with lobbies." | The routers change the port per destination (symmetric NAT), or every attempt to connect failed: the two PCs cannot reach each other directly yet. |
+| "Waiting for the other player..." | The other player's input is late and the game holds. After 10 s: "The other player stopped responding. The session ended; both games restart." |
+| "The games went out of sync. The session ended; both games restart." | A desync. Both games wrote diagnostics: send the session logs (below). |
+
+**When the code does not connect:** the host's game asks the router to open its port (UPnP). If the
+router does not, the host's tab offers **Strict router?** ("If the other player cannot connect, type
+the code they show and press Reach out."); failing that, forward UDP port 7200 (DOA4 uses 7200-7215:
+7200 unless another program holds it) on the host's router to the host PC.
+
+**Session logs:** **Open session logs** in the Online tab opens `<saves folder>\netplay\sessions`
+(the saves folder is the one the Game tab shows, [step 7](#7-run)). After a desync, send the newest
+session's folder.
+
 ## Contents
 
 1. [The game version](#1-the-game-version)
@@ -268,7 +323,11 @@ CMake or the game:
 tests\host\run_photo_test.bat
 ```
 
-One `run_<name>_test.bat` per module in `tests\host\`; each prints `<name>: all checks passed`.
+One `run_<name>_test.bat` per module in `tests\host\`; each prints its own summary line (`PASSED: N
+checks, 0 failures` or `<name>: all checks passed`). `py -3 -I tools\run_host_tests.py` runs them all
+and judges each by that line and its exit code (`--only <name>` for some). The runners take Visual
+Studio's `VsDevCmd.bat` from `DOA4_VSDEVCMD` and LLVM's `bin` folder from `DOA4_LLVM_BIN` when set
+(the release workflow sets both).
 
 ## 10. Troubleshooting
 

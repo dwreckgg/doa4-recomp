@@ -4,8 +4,10 @@ rem np_core, every third_party\GekkoNet\src\*.cpp) over two real transports (np_
 rem 127.0.0.1, paced by wall clock. Nothing reaches the internet. Flags as run_np_exec_test.bat plus Winsock.
 rem NP_LINK_OUT (optional) names the output folder; the mutation probes use it so that they never share one.
 setlocal enabledelayedexpansion
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 if not defined NP_LINK_OUT set "NP_LINK_OUT=%TEMP%\doa4_np_link_test"
 set "OUT=%NP_LINK_OUT%"
 set "G=%~dp0..\..\third_party\GekkoNet"

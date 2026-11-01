@@ -8,8 +8,10 @@ rem default sdk-np0 beside this worktree), so the include paths are that SDK's i
 rem Optional first argument: an include folder searched BEFORE the SDK's (the mutation probe's copies).
 setlocal
 if "%REXSDK_DIR%"=="" set "REXSDK_DIR=%~dp0..\..\..\sdk-np0"
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 if "%OUT%"=="" set "OUT=%TEMP%\doa4_dpps_test"
 if not exist "%OUT%" mkdir "%OUT%"
 set EXTRA=

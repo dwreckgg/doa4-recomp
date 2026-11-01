@@ -5,8 +5,10 @@ rem GEKKONET_NO_ASIO, C++20, _MSVC_STL_HARDENING). No SDK headers, no socket, no
 rem Pass -v to print each check group before it runs.
 rem NP_EXEC_OUT (optional) names the output folder; the mutation probes use it so that they never share one.
 setlocal enabledelayedexpansion
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 if not defined NP_EXEC_OUT set "NP_EXEC_OUT=%TEMP%\doa4_np_exec_test"
 set "OUT=%NP_EXEC_OUT%"
 set "G=%~dp0..\..\third_party\GekkoNet"

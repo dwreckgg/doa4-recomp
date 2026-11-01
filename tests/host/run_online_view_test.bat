@@ -4,8 +4,10 @@ rem and np_wire.cpp (the view reads the lobby's Status and the release-tag rules
 rem No files and no sockets. ONLINE_VIEW_OUT (optional) names the output folder; the mutation probes use it so that
 rem they never share one.
 setlocal
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 if not defined ONLINE_VIEW_OUT set "ONLINE_VIEW_OUT=%TEMP%\doa4_online_view_test"
 set "OUT=%ONLINE_VIEW_OUT%"
 if not exist "%OUT%" mkdir "%OUT%"

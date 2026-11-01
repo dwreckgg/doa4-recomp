@@ -1,8 +1,10 @@
 @echo off
 rem Builds and runs the unlocks host test with clang-cl (no CMake).
 setlocal
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 >nul 2>&1
-set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+if not defined DOA4_VSDEVCMD set "DOA4_VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
+call "%DOA4_VSDEVCMD%" -arch=amd64 -host_arch=amd64 >nul 2>&1
+if not defined DOA4_LLVM_BIN set "DOA4_LLVM_BIN=C:\Program Files\LLVM\bin"
+set "PATH=%DOA4_LLVM_BIN%;%PATH%"
 set "OUT=%TEMP%\doa4_unlocks_test"
 if not exist "%OUT%" mkdir "%OUT%"
 clang-cl /nologo /std:c++latest /EHsc /O2 "%~dp0unlocks_host_test.cpp" "%~dp0..\..\src\doa4_unlocks.cpp" /Fo"%OUT%\\" /Fe"%OUT%\unlocks_host_test.exe"
